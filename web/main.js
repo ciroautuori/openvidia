@@ -456,27 +456,26 @@ async function loadNews() {
     const list = $('newsList')
     $('newsCount').textContent = news.length
     if (!news.length) {
-      list.innerHTML = '<div class="empty-state"><div class="empty-ttl">No updates</div></div>'
+      list.innerHTML = '<div class="empty-state"><div class="empty-ttl">No updates</div><div class="empty-desc">Check back later</div></div>'
       return
     }
     list.innerHTML = ''
     news.forEach(n => {
       const item = document.createElement('div')
-      item.style.cssText = 'padding:8px 0;border-bottom:1px solid var(--border);font-size:.68rem'
+      item.className = 'news-item'
       const title = document.createElement('a')
       title.href = n.url
       title.target = '_blank'
       title.textContent = n.title
-      title.style.cssText = 'color:var(--accent);font-weight:600;text-decoration:none;display:block;margin-bottom:2px'
       item.appendChild(title)
       if (n.excerpt) {
         const exc = document.createElement('div')
-        exc.style.cssText = 'color:var(--text3);line-height:1.5'
+        exc.className = 'news-excerpt'
         exc.textContent = n.excerpt.replace(/<[^>]+>/g, '').slice(0, 200)
         item.appendChild(exc)
       }
       const meta = document.createElement('div')
-      meta.style.cssText = 'font-size:.6rem;color:var(--text3);margin-top:3px'
+      meta.className = 'news-meta'
       meta.textContent = [n.author, n.time.slice(0, 10)].filter(Boolean).join(' · ')
       item.appendChild(meta)
       list.appendChild(item)
