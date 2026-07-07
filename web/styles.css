@@ -62,9 +62,8 @@ body{
 /* ── Header ─────────────────────────────────── */
 header{display:flex;align-items:center;gap:12px}
 .logo{display:flex;align-items:center;gap:8px;flex-shrink:0}
-.logo-icon{font-size:1.3rem;font-weight:700;color:var(--accent)}
+.logo-img{height:24px;width:auto;display:block}
 .logo-text{font-size:.95rem;font-weight:700;letter-spacing:-.01em;color:var(--text)}
-.logo-badge{font-size:.55rem;font-weight:600;padding:1px 6px;border-radius:100px;background:var(--accent-soft);color:var(--accent);border:1px solid rgba(118,185,0,.2)}
 
 .tabs{display:flex;gap:2px;margin-left:auto;background:rgba(255,255,255,.03);border-radius:8px;padding:3px;border:1px solid var(--border)}
 [data-theme="light"] .tabs{background:rgba(0,0,0,.03)}
