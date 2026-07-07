@@ -76,8 +76,7 @@ async function savePresets() {
 
 function renderPresets() {
   $('quickSwitch').innerHTML = ''
-  const all = [{ id: '', label: 'Passthrough' }, ...presets.map(id => ({ id, label: labelForModel(id) }))]
-  all.forEach(p => {
+  presets.map(id => ({ id, label: labelForModel(id) })).forEach(p => {
     const btn = document.createElement('button')
     btn.textContent = p.label
     btn.className = p.id === activeModel ? 'active' : ''
@@ -111,10 +110,11 @@ async function setModel(id) {
     const r = await fetch('/api/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: id }) })
     if (r.ok) {
       activeModel = id
-      $('modelStatusS').textContent = id || 'passthrough'
+      $('modelStatusS').textContent = id || 'none'
       renderPresets()
       renderModelList()
-      toast(id ? `Model: ${id}` : 'Passthrough mode', 'ok')
+      renderUsage()
+      toast(`Model: ${id || 'none'}`, 'ok')
     }
   } catch (_) {}
 }
@@ -123,7 +123,7 @@ async function loadModel() {
   try {
     const r = await api('GET', '/api/model')
     activeModel = r.model || ''
-    $('modelStatusS').textContent = activeModel || 'passthrough'
+    $('modelStatusS').textContent = activeModel || 'none'
     renderPresets()
   } catch (_) {}
 }
@@ -174,24 +174,28 @@ function renderModelList() {
 $('modelSearch').addEventListener('input', renderModelList)
 
 /* ── Usage Example ──────────────────────────── */
-const EXAMPLES = {
-  curl: `curl http://localhost:3940/v1/chat/completions \\
+function renderUsage() {
+  const m = activeModel || 'minimaxai/minimax-m3'
+  const examples = {
+    curl: `curl http://localhost:3940/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"minimaxai/minimax-m3","messages":[{"role":"user","content":"Hello!"}]}'`,
-  python: `from openai import OpenAI
+  -d '{"model":"${m}","messages":[{"role":"user","content":"Hello!"}]}'`,
+    python: `from openai import OpenAI
 client = OpenAI(base_url="http://localhost:3940/v1", api_key="ignored")
 r = client.chat.completions.create(
-    model="minimaxai/minimax-m3",
+    model="${m}",
     messages=[{"role":"user","content":"Hello!"}]
 )
 print(r.choices[0].message.content)`,
-  js: `const r = await fetch("http://localhost:3940/v1/chat/completions", {
+    js: `const r = await fetch("http://localhost:3940/v1/chat/completions", {
   method:"POST", headers:{"Content-Type":"application/json"},
-  body: JSON.stringify({model:"minimaxai/minimax-m3",
+  body: JSON.stringify({model:"${m}",
     messages:[{role:"user",content:"Hello!"}]})
 })
 const d = await r.json()
 console.log(d.choices[0].message.content)`,
+  }
+  $('usageCode').innerHTML = `<code>${examples[currentLang]}</code>`
 }
 let currentLang = 'curl'
 document.querySelectorAll('.usage-tab').forEach(tab => {
@@ -199,7 +203,7 @@ document.querySelectorAll('.usage-tab').forEach(tab => {
     document.querySelectorAll('.usage-tab').forEach(t => t.classList.remove('active'))
     tab.classList.add('active')
     currentLang = tab.dataset.usage
-    $('usageCode').innerHTML = `<code>${EXAMPLES[currentLang]}</code>`
+    renderUsage()
   })
 })
 
@@ -307,7 +311,7 @@ new EventSource('/api/logs/stream').onmessage = e => {
 /* ── Init ───────────────────────────────────── */
 ;(async () => {
   renderKeys()
-  $('usageCode').innerHTML = `<code>${EXAMPLES.curl}</code>`
+  renderUsage()
   try {
     const data = await api('GET', '/api/keys')
     keys = data.keys; renderKeys()

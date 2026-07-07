@@ -104,7 +104,8 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         body = await request.json()
         presets = body.get("presets", [])
         config.save_presets_file(presets)
-        return {"ok": True}
+        config.sync_opencode_provider()
+        return {"ok": True, "synced_opencode": True}
 
     @app.get("/api/logs/stream")
     async def log_stream(request: Request):
