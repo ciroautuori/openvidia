@@ -30,6 +30,9 @@ const newKeyInput = $('newKeyInput')
 const confirmAddKeyBtn = $('confirmAddKeyBtn')
 const cancelAddKeyBtn = $('cancelAddKeyBtn')
 
+const quickSwitch = $('quickSwitch')
+const modelStatus = $('modelStatus')
+
 /* ── API helper ─────────────────────────────── */
 async function api(method, path, body) {
   const opts = { method, headers: {} }
@@ -78,6 +81,51 @@ async function pollStats() {
     statReqs.textContent = s.requests
     statRots.textContent = s.rotations
     statOk.textContent = s.success
+  } catch (_) {}
+}
+
+/* ── Model Presets ──────────────────────────── */
+const PRESETS = [
+  { id: '', label: 'Passthrough' },
+  { id: 'deepseek-ai/deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
+  { id: 'deepseek-ai/deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
+  { id: 'google/gemma-4-31b-it', label: 'Gemma 4 31B' },
+  { id: 'mistralai/mistral-large-3-675b-instruct-2512', label: 'Mistral Large 3' },
+  { id: 'nvidia/llama-3.1-nemotron-ultra-253b-v1', label: 'Nemotron Ultra' },
+]
+
+let activeModel = ''
+
+function renderPresets() {
+  if (!quickSwitch) return
+  quickSwitch.innerHTML = ''
+  PRESETS.forEach(p => {
+    const btn = document.createElement('button')
+    btn.textContent = p.label
+    btn.className = p.id === activeModel ? 'active' : ''
+    btn.addEventListener('click', () => setModel(p.id))
+    quickSwitch.appendChild(btn)
+  })
+}
+
+async function setModel(id) {
+  try {
+    const r = await fetch('/api/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: id }) })
+    if (r.ok) {
+      activeModel = id
+      modelStatus.textContent = id || 'passthrough'
+      renderPresets()
+      toast(id ? `Model: ${id}` : 'Passthrough mode', 'ok')
+    }
+  } catch (_) {}
+}
+
+async function loadModel() {
+  try {
+    const r = await api('GET', '/api/model')
+    activeModel = r.model || ''
+    modelStatus.textContent = activeModel || 'passthrough'
+    renderPresets()
   } catch (_) {}
 }
 

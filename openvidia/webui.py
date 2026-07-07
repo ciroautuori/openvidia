@@ -1,7 +1,9 @@
 import asyncio
 import json
+import threading
 import webbrowser
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -9,16 +11,9 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from . import config
 from .proxy_state import ProxyState
 
-# Optional — imported lazily so the app works without account_manager
-_account_manager = None
-
-
-def set_account_manager(am):
-    global _account_manager
-    _account_manager = am
-
 
 def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
+
     @app.get("/")
     async def index():
         p = web_dir / "index.html"
@@ -38,10 +33,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
 
     @app.get("/api/status")
     async def api_status():
-        return {
-            "running": True,
-            "port": state.port,
-        }
+        return {"running": True, "port": state.port}
 
     @app.get("/api/stats")
     async def api_stats():
@@ -65,77 +57,15 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         config.save_keys_file(keys)
         return {"ok": True}
 
-    # ── Account management endpoints ──────────────────────────────────
+    @app.get("/api/model")
+    async def api_get_model():
+        return {"model": state.active_model or ""}
 
-    @app.get("/api/accounts")
-    async def api_get_accounts():
-        am = _account_manager
-        if am is None:
-            return {"accounts": []}
-        return {"accounts": am.get_accounts_info()}
-
-    @app.post("/api/accounts")
-    async def api_add_account(request: Request):
-        am = _account_manager
-        if am is None:
-            return {"ok": False, "error": "account manager not loaded"}
+    @app.post("/api/model")
+    async def api_set_model(request: Request):
         body = await request.json()
-        name = body.get("name", "").strip()
-        email = body.get("email", "").strip()
-        password = body.get("password", "").strip()
-        cookie_json = body.get("cookies", "").strip()
-        if not name:
-            return {"ok": False, "error": "name required"}
-        if not email and not cookie_json:
-            return {"ok": False, "error": "email+password or cookies required"}
-        try:
-            am.add_account(name, email=email, password=password, cookie_json=cookie_json)
-            return {"ok": True}
-        except ValueError as e:
-            return {"ok": False, "error": str(e)}
-
-    @app.delete("/api/accounts/{name}")
-    async def api_remove_account(name: str):
-        am = _account_manager
-        if am is None:
-            return {"ok": False, "error": "account manager not loaded"}
-        try:
-            am.remove_account(name)
-            return {"ok": True}
-        except ValueError as e:
-            return {"ok": False, "error": str(e)}
-
-    @app.put("/api/accounts/{name}")
-    async def api_update_account(name: str, request: Request):
-        am = _account_manager
-        if am is None:
-            return {"ok": False, "error": "account manager not loaded"}
-        body = await request.json()
-        try:
-            am.update_account(
-                name,
-                email=body.get("email", ""),
-                password=body.get("password", ""),
-                cookie_json=body.get("cookies", ""),
-            )
-            return {"ok": True}
-        except ValueError as e:
-            return {"ok": False, "error": str(e)}
-
-    @app.post("/api/accounts/{name}/replenish")
-    async def api_trigger_replenish(name: str):
-        """Manually trigger key replenishment for an account (for testing)."""
-        am = _account_manager
-        if am is None:
-            return {"ok": False, "error": "account manager not loaded"}
-        acct = next((a for a in am.accounts if a.name == name), None)
-        if acct is None:
-            return {"ok": False, "error": f"account {name!r} not found"}
-        if not acct.keys:
-            return {"ok": False, "error": "account has no keys to replenish"}
-        old_key = acct.keys[0]
-        am.on_key_failed(old_key)
-        return {"ok": True, "message": f"replenish triggered for {old_key[:12]}…"}
+        state.active_model = body.get("model", "") or None
+        return {"ok": True, "model": state.active_model or ""}
 
     @app.get("/api/logs/stream")
     async def log_stream(request: Request):
@@ -156,12 +86,5 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-def open_browser(port: int = 3940) -> None:
-    import threading
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{port}")).start()
-
-
 def auto_open(port: int = 3940) -> None:
-    """Open browser when proxy starts, with a small delay."""
-    import threading
     threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{port}")).start()

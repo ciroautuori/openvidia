@@ -87,7 +87,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 payload = None
 
         if isinstance(payload, dict):
-            m = payload.get("model")
+            m = state.active_model or payload.get("model")
             if isinstance(m, str):
                 payload["model"] = m
                 body = json.dumps(payload).encode()

@@ -11,7 +11,7 @@ these counters stop being shared and this assumption breaks.
 import asyncio
 from collections import deque
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 from .config import atomic_write
 
@@ -43,6 +43,7 @@ class ProxyState:
         # Optional callback fired when a key returns 401/403/404 in the proxy.
         # Receives the failed key value. Used by account_manager to replenish.
         self.on_key_failed: Optional[Callable[[str], None]] = None
+        self.active_model: Optional[str] = None
 
     def log_cb(self, msg: str) -> None:
         self._log_cb(msg)
