@@ -31,6 +31,10 @@ def should_rotate(status: int) -> bool:
 
 
 STRIPPED_RESPONSE_HEADERS = {"content-encoding", "transfer-encoding", "content-length", "connection"}
+DEGRADED_MODELS = {
+    "z-ai/glm-5.2": "deepseek-ai/deepseek-v4-pro",
+    "moonshotai/kimi-k2.6": "deepseek-ai/deepseek-v4-flash",
+}
 
 
 class BodyLimitMiddleware(BaseHTTPMiddleware):
@@ -162,6 +166,23 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             state.log_cb(f"key[{i}] HTTP {status}")
 
             last_status = status
+
+            # Detect DEGRADED upstream — short-circuit before key rotation
+            if status == 400 and not getattr(resp, '_degraded_checked', False):
+                resp._degraded_checked = True
+                try:
+                    body_bytes = await resp.aread()
+                    if b"DEGRADED" in body_bytes:
+                        model_name = payload.get("model", "unknown") if isinstance(payload, dict) else "unknown"
+                        fallback = DEGRADED_MODELS.get(model_name, "")
+                        msg = f"✗ {model_name} is DEGRADED on NVIDIA (server-side)"
+                        if fallback:
+                            msg += f" — additive {fallback} via UI presets"
+                        state.log_cb(msg)
+                        await resp.aclose()
+                        return JSONResponse({"error": msg}, status_code=503)
+                except Exception:
+                    pass
 
             if should_rotate(status):
                 state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
