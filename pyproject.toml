@@ -1,0 +1,9 @@
+[project]
+name = "openvidia"
+version = "1.0.0"
+description = "Minimal multi-key NVIDIA API proxy"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27"]
+
+[project.scripts]
+openvidia = "openvidia.__main__:main"
