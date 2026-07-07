@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""OpenVidia keygen via Playwright (bundled Chromium, no Chrome 150 CDP bug)."""
+
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+from playwright.async_api import async_playwright
+
+HOME = Path.home()
+ACCOUNTS_PATH = HOME / ".config" / "openvidia" / "accounts.json"
+KEYS_PATH = HOME / ".config" / "openvidia" / "keys.json"
+
+
+def load_accounts():
+    try:
+        return json.loads(ACCOUNTS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def load_keys():
+    try:
+        return json.loads(KEYS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_keys(keys):
+    KEYS_PATH.write_text(json.dumps(keys, indent=2))
+    print(f"  💾 keys.json: {len(keys)} keys")
+
+
+def save_accounts(accts):
+    ACCOUNTS_PATH.write_text(json.dumps(accts, indent=2))
+    print(f"  💾 accounts.json updated")
+
+
+_SAMESITE_MAP = {
+    "no_restriction": "None",
+    "lax": "Lax",
+    "strict": "Strict",
+    "unspecified": "Lax",
+    None: "Lax",
+}
+
+def parse_cookies(raw):
+    parsed = []
+    for c in raw:
+        ss = c.get("sameSite")
+        same_site = _SAMESITE_MAP.get(ss, ss) or "Lax"
+        pc = {
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c.get("domain", ""),
+            "path": c.get("path", "/"),
+            "secure": c.get("secure", True),
+            "httpOnly": c.get("httpOnly", False),
+            "sameSite": same_site,
+        }
+        exp = c.get("expirationDate")
+        if exp:
+            pc["expires"] = exp
+        parsed.append(pc)
+    return parsed
+
+
+async def generate_for_account(page, ctx, acct, key_name=""):
+    """Generate a key for one account using the given page in its context."""
+    name = acct["name"]
+    raw_cookies = json.loads(acct.get("cookie_json", "[]") or "[]")
+    if not raw_cookies:
+        return (name, "No cookies", False)
+
+    nv_cookies = [c for c in raw_cookies if "nvidia.com" in c.get("domain", "")]
+    google_cookies = [c for c in raw_cookies if "google.com" in c.get("domain", "")]
+    cookies = parse_cookies(nv_cookies)
+    print(f"  🔑 {name}: {len(cookies)} nv + {len(google_cookies)} google cookies")
+
+    if nv_cookies:
+        await ctx.add_cookies(cookies)
+
+    await page.goto("https://build.nvidia.com/settings/api-keys", wait_until="domcontentloaded")
+    await page.wait_for_timeout(4000)
+
+    text = await page.evaluate("document.body?.innerText || ''")
+    preview = text[:300].replace("\n", " ")
+    print(f"    📄 {preview}...")
+
+    authed = not ("Sign In" in text and "API Keys" not in text)
+
+    if not authed and google_cookies:
+        print(f"    → trying Google SSO...")
+        await ctx.add_cookies(parse_cookies(google_cookies))
+        sign_in = page.locator("button", has_text="Sign In").first
+        if await sign_in.is_visible(timeout=3000):
+            await sign_in.click()
+            await page.wait_for_timeout(3000)
+            more = page.locator("text=Più opzioni").first
+            if await more.is_visible(timeout=2000):
+                await more.click()
+                await page.wait_for_timeout(2000)
+            google_btn = page.locator("button", has_text="Accedi con Google").first
+            if await google_btn.is_visible(timeout=2000):
+                await google_btn.click()
+                await page.wait_for_timeout(8000)
+            elif await page.locator("text=Accedi con Google").first.is_visible(timeout=1000):
+                await page.locator("text=Accedi con Google").first.click()
+                await page.wait_for_timeout(8000)
+
+        text = await page.evaluate("document.body?.innerText || ''")
+        authed = not ("Sign In" in text and "API Keys" not in text)
+        preview = text[:300].replace("\n", " ")
+        print(f"    📄 after SSO: {preview}...")
+
+    if not authed:
+        print(f"    ❌ Not authenticated")
+        return (name, "Not authenticated", False)
+
+    print(f"    ✅ Authenticated!")
+
+    btn = page.locator("button", has_text="Generate API Key").first
+    if not await btn.is_visible(timeout=8000):
+        print(f"    ❌ Can't find 'Generate API Key'")
+        return (name, "No button", False)
+
+    await btn.click()
+    await page.wait_for_timeout(3000)
+
+    if key_name:
+        inp = page.locator(".nv-modal-overlay input[type='text']").first
+        if await inp.is_visible(timeout=3000):
+            await inp.fill(key_name)
+            await page.wait_for_timeout(500)
+
+    key = None
+    for _ in range(40):
+        val = await page.evaluate("""
+        () => {
+            const all = document.querySelectorAll('input, textarea');
+            for (const el of all) {
+                const v = el.value || '';
+                if (v.startsWith('nvapi-')) return v;
+            }
+            const m = document.body.innerText.match(/nvapi-[A-Za-z0-9_-]{40,}/);
+            return m ? m[0] : null;
+        }
+        """)
+        if val and str(val).startswith("nvapi-"):
+            key = str(val)
+            break
+        gen_btn = page.locator("button", has_text="Generate Key").first
+        if await gen_btn.is_visible(timeout=1000):
+            try:
+                await gen_btn.click(force=True, timeout=3000)
+            except Exception:
+                pass
+        await page.wait_for_timeout(1000)
+
+    if not key:
+        print(f"    ❌ Key not generated")
+        return (name, "Key generation failed", False)
+
+    close_btn = page.locator("button", has_text="Close Modal").first
+    if await close_btn.is_visible(timeout=2000):
+        await close_btn.click()
+
+    print(f"    ✅ {key[:50]}...")
+    return (name, key, True)
+
+
+async def main():
+    all_flag = "--all" in sys.argv or "-a" in sys.argv
+    account_name = ""
+    for i, a in enumerate(sys.argv):
+        if a in ("-n", "--account") and i + 1 < len(sys.argv):
+            account_name = sys.argv[i + 1]
+    key_name = ""
+    for i, a in enumerate(sys.argv):
+        if a in ("-m", "--name") and i + 1 < len(sys.argv):
+            key_name = sys.argv[i + 1]
+
+    accounts = load_accounts()
+    if not accounts:
+        print("No accounts found in ~/.config/openvidia/accounts.json")
+        sys.exit(1)
+
+    if account_name:
+        targets = [a for a in accounts if a["name"] == account_name]
+    elif all_flag:
+        targets = [a for a in accounts if a.get("cookie_json")]
+    else:
+        targets = [a for a in accounts if a.get("cookie_json")]
+
+    print(f"Processing {len(targets)}/{len(accounts)} accounts with cookies")
+
+    existing = load_keys()
+    new_keys = list(existing)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36",
+        )
+        page = await context.new_page()
+
+        try:
+            for acct in targets:
+                print(f"\n─── {acct['name']} ───")
+                name, key_or_err, ok = await generate_for_account(page, context, acct, key_name)
+                if ok and key_or_err not in new_keys:
+                    new_keys.append(key_or_err)
+                print(f"  {'✅' if ok else '❌'} {name}: {key_or_err[:55]}")
+        finally:
+            await browser.close()
+
+    save_keys(new_keys)
+    save_accounts(accounts)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,49 +1,37 @@
-/* ═══════════════════════════════════════════════
-   OpenVidia — Frontend Controller
-   SOTA 2026 · Glassmorphism · Login Auth · Log in Home
-   ═══════════════════════════════════════════════ */
-
-let statsInterval = null
+let theme = localStorage.getItem('openvidia-theme') || 'dark'
 let keys = []
-let accounts = []
+let activeModel = ''
+let allModels = []
+let presets = []
+let _logEntries = 0
+let statsInterval, keyStatsInterval
+let modelFilter = 'popular'
 
-/* ── DOM refs ────────────────────────────────── */
-const $ = (id) => document.getElementById(id)
+const POPULAR_MODELS = new Set([
+  'deepseek-ai/deepseek-v4-pro',
+  'deepseek-ai/deepseek-v4-flash',
+  'meta/llama-4.1-maverick-8b-instruct',
+  'meta/llama-3.3-70b-instruct',
+  'mistralai/mistral-large-2411',
+  'microsoft/phi-4-mini-instruct',
+  'google/gemma-3-27b-it',
+  'nvidia/llama-3.1-nemotron-70b-instruct',
+  'nvidia/nemotron-4-340b-reward',
+  'minimaxai/minimax-m3',
+  'z-ai/glm-5.2',
+  'moonshotai/kimi-k2.6',
+  '01-ai/yi-large',
+  'bytedance/seed-oss-36b-instruct',
+  'ai21labs/jamba-1.5-large-instruct',
+  'openai/gpt-4o',
+  'openai/gpt-4o-mini',
+  'google/gemma-3-12b-it',
+  'mistralai/mixtral-8x22b-instruct',
+])
 
-const statusDot = $('statusDot')
-const statusText = $('statusText')
-const portDisplay = $('portDisplay')
-const statReqs = $('statReqs')
-const statRots = $('statRots')
-const statOk = $('statOk')
+const $ = id => document.getElementById(id)
 
-const logArea = $('logArea')
-const logCount = $('logCount')
-const logDot = $('logDot')
-const clearLogBtn = $('clearLogBtn')
-
-const keysList = $('keysList')
-const keyCount = $('keyCount')
-const keysEmpty = $('keysEmpty')
-const addKeyBtn = $('addKeyBtn')
-const keyAddForm = $('keyAddForm')
-const newKeyInput = $('newKeyInput')
-const confirmAddKeyBtn = $('confirmAddKeyBtn')
-const cancelAddKeyBtn = $('cancelAddKeyBtn')
-
-const accountsList = $('accountsList')
-const accountsEmpty = $('accountsEmpty')
-const accountCount = $('accountCount')
-const addAccountBtn = $('addAccountBtn')
-const accountAddForm = $('accountAddForm')
-const accountNameInput = $('accountNameInput')
-const accountEmailInput = $('accountEmailInput')
-const accountPasswordInput = $('accountPasswordInput')
-const accountCookiesInput = $('accountCookiesInput')
-const confirmAddAccountBtn = $('confirmAddAccountBtn')
-const cancelAddAccountBtn = $('cancelAddAccountBtn')
-
-/* ── API helper ─────────────────────────────── */
+/* ── API ────────────────────────────────────── */
 async function api(method, path, body) {
   const opts = { method, headers: {} }
   if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body) }
@@ -52,20 +40,14 @@ async function api(method, path, body) {
   return r.json()
 }
 
-/* ── Toast system ───────────────────────────── */
+/* ── Toast ──────────────────────────────────── */
 function toast(msg, level = 'info') {
-  const container = $('toast-container')
   const icons = { ok: '✓', error: '✕', warn: '⚠', info: 'ℹ' }
   const el = document.createElement('div')
-  el.className = `toast`
-  el.innerHTML = `
-    <div class="toast-icon ${level}">${icons[level] || icons.info}</div>
-    <div class="toast-msg">${msg}</div>`
-  container.appendChild(el)
-  setTimeout(() => {
-    el.classList.add('toast-out')
-    setTimeout(() => el.remove(), 260)
-  }, 3500)
+  el.className = 'toast'
+  el.innerHTML = `<span class="toast-icon ${level}">${icons[level] || icons.info}</span><span>${msg}</span>`
+  $('toast-container').appendChild(el)
+  setTimeout(() => { el.classList.add('toast-out'); setTimeout(() => el.remove(), 260) }, 3500)
 }
 
 /* ── Tabs ───────────────────────────────────── */
@@ -79,215 +61,346 @@ document.querySelectorAll('.tab').forEach(tab => {
   })
 })
 
+/* ── Theme ──────────────────────────────────── */
+function applyTheme(t) {
+  theme = t
+  document.documentElement.setAttribute('data-theme', t)
+  $('themeToggle').textContent = t === 'dark' ? '🌙' : '☀️'
+  localStorage.setItem('openvidia-theme', t)
+}
+$('themeToggle').addEventListener('click', () => applyTheme(theme === 'dark' ? 'light' : 'dark'))
+applyTheme(theme)
+
 /* ── Stats ──────────────────────────────────── */
-statusDot.innerHTML = '<span class="pulse-dot running"></span>'
-statusText.textContent = 'Running'
-portDisplay.textContent = '3940'
-
-if (statsInterval) clearInterval(statsInterval)
-statsInterval = setInterval(pollStats, 1000)
-
-async function pollStats() {
+$('statusText').textContent = 'Running'
+$('portDisplay').textContent = '3940'
+statsInterval = setInterval(async () => {
   try {
     const s = await api('GET', '/api/stats')
-    statReqs.textContent = s.requests
-    statRots.textContent = s.rotations
-    statOk.textContent = s.success
+    $('statReqs').textContent = s.requests
+    $('statRots').textContent = s.rotations
+    $('statOk').textContent = s.success
+  } catch (_) {}
+}, 1000)
+
+/* ── Model Presets (Home) ───────────────────── */
+async function loadPresets() {
+  try {
+    const r = await api('GET', '/api/presets')
+    presets = r.presets || []
+  } catch (_) { presets = [] }
+  renderPresets()
+}
+
+async function savePresets() {
+  try { await api('POST', '/api/presets', { presets }) } catch (_) {}
+  renderPresets()
+}
+
+function renderPresets() {
+  const grid = $('quickSwitch')
+  grid.innerHTML = ''
+  $('presetCount').textContent = presets.length
+  presets.map(id => ({ id, label: labelForModel(id) })).forEach(p => {
+    const btn = document.createElement('button')
+    btn.textContent = p.label
+    btn.className = p.id === activeModel ? 'active' : ''
+    btn.onclick = () => setModel(p.id)
+    grid.appendChild(btn)
+    if (p.id) {
+      const rm = document.createElement('span')
+      rm.className = 'preset-rm'
+      rm.textContent = '×'
+      rm.title = 'Remove preset'
+      rm.onclick = e => { e.stopPropagation(); presets = presets.filter(x => x !== p.id); savePresets() }
+      btn.appendChild(rm)
+    }
+  })
+  if (!presets.length) {
+    grid.innerHTML = '<div style="font-size:.65rem;color:var(--text3);padding:4px 0">Add models from Settings → Available Models</div>'
+  }
+}
+
+function labelForModel(id) {
+  const m = allModels.find(x => x.id === id)
+  return m ? shortLabel(m.id) : id
+}
+
+function shortLabel(id) {
+  const known = { 'z-ai/glm-5.2': 'GLM 5.2', 'deepseek-ai/deepseek-v4-pro': 'DeepSeek V4 Pro', 'minimaxai/minimax-m3': 'MiniMax M3' }
+  if (known[id]) return known[id]
+  const parts = id.split('/')
+  return parts[parts.length - 1]
+}
+
+async function setModel(id) {
+  try {
+    const r = await fetch('/api/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: id }) })
+    if (r.ok) {
+      activeModel = id
+      $('activeModelDisplay').textContent = id || 'none'
+      renderPresets()
+      renderModelList()
+      renderUsage()
+      toast(`Model: ${id || 'none'}`, 'ok')
+    }
   } catch (_) {}
 }
 
-/* ── Key helpers ────────────────────────────── */
-function maskKey(k) {
-  return k.length <= 14 ? k : `${k.slice(0, 8)}…${k.slice(-4)}`
+async function loadModel() {
+  try {
+    const r = await api('GET', '/api/model')
+    activeModel = r.model || ''
+    $('activeModelDisplay').textContent = activeModel || 'none'
+    renderPresets()
+  } catch (_) {}
 }
 
-function copyToClipboard(text) {
-  navigator.clipboard.writeText(text).then(() => toast('Key copied to clipboard', 'ok')).catch(() => {})
-}
+/* ── Model Browser (Settings) ────────────────── */
+const FILTERS = ['popular', 'all']
 
-/* ── Render keys ────────────────────────────── */
-function renderKeys() {
-  keysList.innerHTML = ''
-  if (!keys.length) {
-    keysEmpty.style.display = 'flex'
-    keyCount.textContent = '0'
-    return
+function getFilteredModels() {
+  let list = allModels
+  if (modelFilter === 'popular') {
+    list = allModels.filter(m => POPULAR_MODELS.has(m.id))
   }
-  keysEmpty.style.display = 'none'
-  keyCount.textContent = String(keys.length)
-  keys.forEach((k, i) => {
-    const row = document.createElement('div'); row.className = 'key-row'
-    const val = document.createElement('span'); val.className = 'key-value'
-    val.textContent = maskKey(k); val.title = k
-    val.addEventListener('click', () => copyToClipboard(k))
-    const group = document.createElement('div'); group.className = 'key-actions-group'
-    const copyBtn = document.createElement('button'); copyBtn.className = 'key-action-btn'
-    copyBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
-    copyBtn.title = 'Copy key'; copyBtn.addEventListener('click', () => copyToClipboard(k))
-    group.appendChild(copyBtn)
-    const delBtn = document.createElement('button'); delBtn.className = 'key-action-btn danger'
-    delBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'
-    delBtn.title = 'Remove key'; delBtn.addEventListener('click', () => { keys.splice(i, 1); persistKeys(); toast('Key removed', 'warn') })
-    group.appendChild(delBtn)
-    row.appendChild(val); row.appendChild(group)
-    keysList.appendChild(row)
+  const q = ($('modelSearch').value || '').toLowerCase()
+  if (q) list = list.filter(m => m.id.toLowerCase().includes(q))
+  return list
+}
+
+function renderFilters() {
+  const cont = $('modelFilters')
+  cont.innerHTML = ''
+  FILTERS.forEach(f => {
+    const btn = document.createElement('button')
+    btn.className = `browser-filter ${f === modelFilter ? 'active' : ''}`
+    btn.textContent = f === 'popular' ? '★ Popular' : 'All'
+    btn.onclick = () => { modelFilter = f; renderFilters(); renderModelList() }
+    cont.appendChild(btn)
   })
+}
+
+async function fetchModels() {
+  try {
+    const r = await fetch('/v1/models')
+    const d = await r.json()
+    allModels = (d.data || []).map(m => ({ id: m.id, owned_by: m.owned_by || '' }))
+    renderFilters()
+    renderModelList()
+  } catch (_) {
+    $('modelList').innerHTML = '<div class="browser-empty">Failed to load</div>'
+  }
+}
+
+async function testModel(id, btn) {
+  btn.className = 'browser-test testing'
+  btn.textContent = '…'
+  const resultEl = document.createElement('div')
+  resultEl.className = 'test-result'
+  btn.parentElement.parentElement.after(resultEl)
+  try {
+    const r = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer test' },
+      body: JSON.stringify({ model: id, messages: [{ role: 'user', content: 'say ok' }], max_tokens: 10 })
+    })
+    if (r.ok) {
+      const d = await r.json()
+      const txt = d.choices?.[0]?.message?.content || ''
+      resultEl.className = 'test-result ok'
+      resultEl.textContent = `✓ ${txt.slice(0, 80)}`
+      btn.className = 'browser-test done'
+      btn.textContent = '✓'
+    } else {
+      const txt = await r.text()
+      const detail = (() => { try { return JSON.parse(txt).detail || txt } catch { return txt } })()
+      resultEl.className = 'test-result fail'
+      resultEl.textContent = `✗ ${detail.slice(0, 120)}`
+      btn.className = 'browser-test fail'
+      btn.textContent = '✗'
+    }
+  } catch (e) {
+    resultEl.className = 'test-result fail'
+    resultEl.textContent = `✗ ${e.message.slice(0, 80)}`
+    btn.className = 'browser-test fail'
+    btn.textContent = '✗'
+  }
+  setTimeout(() => resultEl.remove(), 6000)
+  setTimeout(() => { btn.className = 'browser-test'; btn.textContent = '▶' }, 4000)
+}
+
+function renderModelList() {
+  const f = getFilteredModels()
+  $('modelCount').textContent = `${f.length} / ${allModels.length}`
+  if (!f.length) { $('modelList').innerHTML = '<div class="browser-empty">No models found</div>'; return }
+  $('modelList').innerHTML = ''
+  f.forEach(m => {
+    const item = document.createElement('div')
+    item.className = `browser-item ${m.id === activeModel ? 'active' : ''}`
+    const inPreset = presets.includes(m.id)
+    item.innerHTML = `<span class="browser-name">${m.id}</span>${m.owned_by ? `<span class="browser-owner">${m.owned_by}</span>` : ''}`
+    const acts = document.createElement('div')
+    acts.className = 'browser-acts'
+
+    const testBtn = document.createElement('button')
+    testBtn.className = 'browser-test'
+    testBtn.textContent = '▶'
+    testBtn.title = 'Test model'
+    testBtn.onclick = e => { e.stopPropagation(); testModel(m.id, testBtn) }
+    acts.appendChild(testBtn)
+
+    if (!inPreset) {
+      const addBtn = document.createElement('button')
+      addBtn.className = 'browser-add'
+      addBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
+      addBtn.title = 'Add to presets'
+      addBtn.onclick = e => { e.stopPropagation(); presets.push(m.id); savePresets(); toast(`Added ${shortLabel(m.id)}`, 'ok') }
+      acts.appendChild(addBtn)
+    } else {
+      const chk = document.createElement('span')
+      chk.className = 'browser-check'
+      chk.textContent = '✓'
+      acts.appendChild(chk)
+    }
+    item.appendChild(acts)
+    item.onclick = () => setModel(m.id)
+    $('modelList').appendChild(item)
+  })
+}
+$('modelSearch').addEventListener('input', renderModelList)
+
+/* ── Usage Example ──────────────────────────── */
+function renderUsage() {
+  const m = activeModel || 'openvidia'
+  const examples = {
+    curl: `curl http://localhost:3940/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${m}","messages":[{"role":"user","content":"Hello!"}]}'`,
+    python: `from openai import OpenAI
+client = OpenAI(base_url="http://localhost:3940/v1", api_key="ignored")
+r = client.chat.completions.create(
+    model="${m}",
+    messages=[{"role":"user","content":"Hello!"}]
+)
+print(r.choices[0].message.content)`,
+    js: `const r = await fetch("http://localhost:3940/v1/chat/completions", {
+  method:"POST", headers:{"Content-Type":"application/json"},
+  body: JSON.stringify({model:"${m}",
+    messages:[{role:"user",content:"Hello!"}]})
+})
+const d = await r.json()
+console.log(d.choices[0].message.content)`,
+  }
+  $('usageCode').innerHTML = `<code>${examples[currentLang]}</code>`
+}
+let currentLang = 'curl'
+document.querySelectorAll('.usage-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.usage-tab').forEach(t => t.classList.remove('active'))
+    tab.classList.add('active')
+    currentLang = tab.dataset.usage
+    renderUsage()
+  })
+})
+
+/* ── Keys ───────────────────────────────────── */
+function maskKey(k) { return k.length <= 14 ? k : `${k.slice(0, 8)}…${k.slice(-4)}` }
+function copyToClipboard(t) { navigator.clipboard.writeText(t).then(() => toast('Key copied', 'ok')).catch(() => {}) }
+function timeAgo(ts) {
+  if (!ts) return ''
+  const sec = Math.floor(Date.now() / 1000 - ts)
+  if (sec < 60) return `${sec}s`
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`
+  return `${Math.floor(sec / 3600)}h`
+}
+
+function renderKeys(data) {
+  const list = $('keysList')
+  list.innerHTML = ''
+  if (!keys.length) { $('keysEmpty').style.display = 'flex'; $('keyCount').textContent = '0'; return }
+  $('keysEmpty').style.display = 'none'
+  $('keyCount').textContent = String(keys.length)
+  const ai = data ? data.active_index : -1
+  const sm = data ? data.key_stats || {} : {}
+  keys.forEach((k, i) => {
+    const s = sm[String(i)]
+    const row = document.createElement('div')
+    row.className = `key-row ${i === ai ? 'active' : ''}`
+    const dot = document.createElement('span')
+    dot.className = `key-dot key-${s ? s.freshness : 'unused'}`
+    row.appendChild(dot)
+    const val = document.createElement('span')
+    val.className = 'key-val'
+    val.textContent = maskKey(k)
+    val.title = k
+    val.onclick = () => copyToClipboard(k)
+    row.appendChild(val)
+    const acts = document.createElement('div')
+    acts.className = 'key-acts'
+    if (i === ai) { const b = document.createElement('span'); b.className = 'key-badge'; b.textContent = 'active'; acts.appendChild(b) }
+    if (s && s.requests > 0) {
+      const info = document.createElement('span')
+      info.className = 'key-info'
+      info.textContent = `${s.success}✓ ${s.failed > 0 ? s.failed + '✗ ' : ''}${timeAgo(s.last_used)}`
+      info.title = s.last_error || ''
+      acts.appendChild(info)
+    }
+    const copyB = document.createElement('button'); copyB.className = 'key-act'; copyB.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'; copyB.title = 'Copy'; copyB.onclick = () => copyToClipboard(k)
+    acts.appendChild(copyB)
+    const delB = document.createElement('button'); delB.className = 'key-act danger'; delB.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'; delB.title = 'Remove'; delB.onclick = () => { keys.splice(i, 1); persistKeys(); toast('Key removed', 'warn') }
+    acts.appendChild(delB)
+    row.appendChild(acts)
+    list.appendChild(row)
+  })
+}
+
+async function pollKeyStats() {
+  try { renderKeys(await api('GET', '/api/keys/stats')) } catch (_) {}
 }
 
 async function persistKeys() {
-  renderKeys()
+  renderKeys(await api('GET', '/api/keys/stats').catch(() => null))
   try { await api('POST', '/api/keys', { keys }) } catch (e) { toast(`Save failed: ${e.message}`, 'error') }
 }
 
-/* ── Key add form ──────────────────────────── */
-addKeyBtn.addEventListener('click', () => {
-  keyAddForm.classList.remove('hidden'); newKeyInput.value = ''; newKeyInput.focus()
+$('addKeyBtn').addEventListener('click', () => { $('keyAddForm').classList.remove('hidden'); $('newKeyInput').value = ''; $('newKeyInput').focus() })
+$('cancelAddKeyBtn').addEventListener('click', () => $('keyAddForm').classList.add('hidden'))
+$('confirmAddKeyBtn').addEventListener('click', async () => {
+  const v = $('newKeyInput').value.trim()
+  if (!v) { toast('Enter a key', 'warn'); return }
+  if (keys.includes(v)) { toast('Key already exists', 'warn'); return }
+  keys.push(v); $('keyAddForm').classList.add('hidden'); await persistKeys(); toast('Key added', 'ok')
 })
-cancelAddKeyBtn.addEventListener('click', () => keyAddForm.classList.add('hidden'))
-confirmAddKeyBtn.addEventListener('click', async () => {
-  const v = newKeyInput.value.trim()
-  if (!v) { toast('Enter a key value', 'warn'); return }
-  if (keys.includes(v)) { toast('Key already in list', 'warn'); return }
-  keys.push(v)
-  keyAddForm.classList.add('hidden')
-  await persistKeys()
-  toast('Key added', 'ok')
+$('newKeyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('confirmAddKeyBtn').click() })
+
+/* ── Log ────────────────────────────────────── */
+$('clearLogBtn').addEventListener('click', () => {
+  $('logArea').innerHTML = '<div class="log-empty">Cleared</div>'; _logEntries = 0; $('logCount').textContent = '0'
 })
-newKeyInput.addEventListener('keydown', e => { if (e.key === 'Enter') confirmAddKeyBtn.click() })
-
-/* ── Accounts ───────────────────────────────── */
-function renderAccounts() {
-  if (!accountsList) return
-  accountsList.innerHTML = ''
-  if (!accounts.length) {
-    accountsEmpty.style.display = 'flex'
-    accountCount.textContent = '0'
-    return
-  }
-  accountsEmpty.style.display = 'none'
-  accountCount.textContent = String(accounts.length)
-  accounts.forEach(a => {
-    const card = document.createElement('div'); card.className = 'account-card'
-    const header = document.createElement('div'); header.className = 'account-header'
-    const nameEl = document.createElement('div'); nameEl.className = 'account-name'
-    const icon = document.createElement('div'); icon.className = 'account-name-icon'
-    icon.textContent = a.name.charAt(0).toUpperCase()
-    const txt = document.createElement('span'); txt.textContent = a.name
-    nameEl.appendChild(icon); nameEl.appendChild(txt)
-    const badge = document.createElement('div'); badge.className = 'account-key-badge'
-    badge.textContent = `${a.key_count} key${a.key_count !== 1 ? 's' : ''}`
-    header.appendChild(nameEl); header.appendChild(badge)
-    card.appendChild(header)
-
-    // Auth type indicator
-    const authRow = document.createElement('div'); authRow.className = 'account-auth-row'
-    if (a.has_credentials) {
-      authRow.innerHTML = `<span class="auth-badge auth-email">🔑 ${a.email}</span>`
-    } else if (a.cookies_preview) {
-      authRow.innerHTML = `<span class="auth-badge auth-cookie">🍪 cookies</span>`
-    } else {
-      authRow.innerHTML = `<span class="auth-badge auth-none">⚠ no auth</span>`
-    }
-    card.appendChild(authRow)
-
-    const actions = document.createElement('div'); actions.className = 'account-actions'
-    const renewBtn = document.createElement('button'); renewBtn.className = 'btn btn-sm'
-    renewBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Replenish`
-    renewBtn.title = 'Generate a fresh key to replace the oldest one'
-    renewBtn.addEventListener('click', async () => {
-      renewBtn.disabled = true; renewBtn.textContent = '…'
-      try {
-        await api('POST', `/api/accounts/${encodeURIComponent(a.name)}/replenish`)
-        toast(`Replenish triggered for ${a.name}`, 'ok')
-      } catch (e) { toast(`Replenish failed: ${e.message}`, 'error') }
-      setTimeout(() => { renewBtn.disabled = false; renewBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Replenish` }, 2000)
-    })
-    actions.appendChild(renewBtn)
-    const delBtn = document.createElement('button'); delBtn.className = 'btn btn-sm btn-danger'
-    delBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Remove`
-    delBtn.addEventListener('click', async () => {
-      if (!confirm(`Remove "${a.name}" and all its keys?`)) return
-      try {
-        await api('DELETE', `/api/accounts/${encodeURIComponent(a.name)}`)
-        toast(`Account ${a.name} removed`, 'ok')
-        await loadAccounts()
-      } catch (e) { toast(`Remove failed: ${e.message}`, 'error') }
-    })
-    actions.appendChild(delBtn)
-    card.appendChild(actions)
-    accountsList.appendChild(card)
-  })
-}
-
-async function loadAccounts() {
-  try {
-    const data = await api('GET', '/api/accounts')
-    accounts = data.accounts
-    renderAccounts()
-  } catch (_) {}
-}
-
-/* ── Account add form ──────────────────────── */
-addAccountBtn.addEventListener('click', () => {
-  accountAddForm.classList.remove('hidden')
-  accountNameInput.value = ''; accountEmailInput.value = ''; accountPasswordInput.value = ''; accountCookiesInput.value = ''
-  accountNameInput.focus()
-})
-cancelAddAccountBtn.addEventListener('click', () => accountAddForm.classList.add('hidden'))
-confirmAddAccountBtn.addEventListener('click', async () => {
-  const name = accountNameInput.value.trim()
-  const email = accountEmailInput.value.trim()
-  const password = accountPasswordInput.value
-  const cookies = accountCookiesInput.value.trim()
-  if (!name) { toast('Account name required', 'warn'); return }
-  if (!email && !cookies) { toast('Email+password or cookies required', 'warn'); return }
-  if (email && !password) { toast('Password required for email login', 'warn'); return }
-
-  confirmAddAccountBtn.disabled = true; confirmAddAccountBtn.textContent = 'Saving…'
-  try {
-    const res = await api('POST', '/api/accounts', { name, email, password, cookies })
-    if (!res.ok) { toast(res.error || 'Add failed', 'error'); return }
-    accountAddForm.classList.add('hidden')
-    toast(`Account ${name} added`, 'ok')
-    await loadAccounts()
-  } catch (e) { toast(`Add failed: ${e.message}`, 'error') }
-  finally { confirmAddAccountBtn.disabled = false; confirmAddAccountBtn.textContent = 'Save Account' }
-})
-
-/* ── Log (now on Home tab) ──────────────────── */
-let _logEntries = 0
 
 function appendLog(level, msg) {
   const t = new Date().toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-  const el = document.createElement('div'); el.className = `log-entry ${level}`
+  const el = document.createElement('div')
+  el.className = `log-entry ${level}`
   el.textContent = `${t}  ${msg}`
-  const empty = logArea.querySelector('.log-empty')
-  if (empty) empty.remove()
-  logArea.appendChild(el)
-  logArea.scrollTop = logArea.scrollHeight
+  const e = $('logArea').querySelector('.log-empty')
+  if (e) e.remove()
+  $('logArea').appendChild(el)
+  $('logArea').scrollTop = $('logArea').scrollHeight
   _logEntries++
-  if (logCount) logCount.textContent = _logEntries
-  if (logDot) {
-    logDot.className = 'log-dot active'
-    clearTimeout(logDot._timer)
-    logDot._timer = setTimeout(() => { if (logDot) logDot.className = 'log-dot' }, 2000)
-  }
+  $('logCount').textContent = _logEntries
+  $('logDot').className = 'log-dot active'
+  clearTimeout($('logDot')._timer)
+  $('logDot')._timer = setTimeout(() => { $('logDot').className = 'log-dot' }, 2000)
 }
 
-clearLogBtn.addEventListener('click', () => {
-  logArea.innerHTML = '<div class="log-empty">Cleared</div>'
-  _logEntries = 0
-  if (logCount) logCount.textContent = '0'
-})
-
-const evtSource = new EventSource('/api/logs/stream')
-evtSource.onmessage = (e) => {
+new EventSource('/api/logs/stream').onmessage = e => {
   try {
     const { msg } = JSON.parse(e.data)
     let level = 'info'
     if (/error|Error|✗/.test(msg)) level = 'error'
     else if (/OK|✔|✓/.test(msg)) level = 'ok'
-    else if (/warn|⚠/.test(msg)) level = 'warn'
     appendLog(level, msg)
   } catch (_) {}
 }
@@ -295,6 +408,7 @@ evtSource.onmessage = (e) => {
 /* ── Init ───────────────────────────────────── */
 ;(async () => {
   renderKeys()
+  renderUsage()
   try {
     const data = await api('GET', '/api/keys')
     keys = data.keys; renderKeys()
@@ -302,7 +416,10 @@ evtSource.onmessage = (e) => {
   } catch (_) {}
   try {
     const st = await api('GET', '/api/status')
-    toast(`Proxy running on :${st.port}`, 'ok')
+    toast(`Proxy :${st.port}`, 'ok')
   } catch (_) {}
-  await loadAccounts()
+  await loadModel()
+  await loadPresets()
+  await fetchModels()
+  keyStatsInterval = setInterval(pollKeyStats, 2000)
 })()

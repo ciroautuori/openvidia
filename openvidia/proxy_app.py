@@ -31,6 +31,10 @@ def should_rotate(status: int) -> bool:
 
 
 STRIPPED_RESPONSE_HEADERS = {"content-encoding", "transfer-encoding", "content-length", "connection"}
+DEGRADED_MODELS = {
+    "z-ai/glm-5.2": "deepseek-ai/deepseek-v4-pro",
+    "moonshotai/kimi-k2.6": "deepseek-ai/deepseek-v4-flash",
+}
 
 
 class BodyLimitMiddleware(BaseHTTPMiddleware):
@@ -87,8 +91,8 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 payload = None
 
         if isinstance(payload, dict):
-            m = payload.get("model")
-            if isinstance(m, str):
+            m = state.active_model or payload.get("model")
+            if isinstance(m, str) and m != "openvidia":
                 payload["model"] = m
                 body = json.dumps(payload).encode()
 
@@ -126,6 +130,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 resp = await client.send(req, stream=True)
             except httpx.HTTPError as e:
                 state.log_cb(f"key[{i}] error: {e}")
+                state.stats.record_key_usage(key, ok=False, error=str(e))
                 state.stats.rotations += 1
                 persist_index(state, (i + 1) % len(keys))
                 continue
@@ -134,6 +139,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
             if 200 <= status < 300:
                 state.stats.success += 1
+                state.stats.record_key_usage(key, ok=True)
                 persist_index(state, i)
                 if nv_path != "models":
                     state.log_cb(f"✔ key[{i}] OK")
@@ -162,7 +168,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             last_status = status
 
             if should_rotate(status):
-                # Notify account manager that this specific key failed
+                state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
                 if state.on_key_failed is not None:
                     state.on_key_failed(key)
                 state.stats.rotations += 1
@@ -182,8 +188,16 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         # can distinguish a bad request (400) from rate-limiting (429) from
         # credentials exhausted (401/403). No 503 masking: every rotatable
         # status is a real signal, not a blanket "retry me".
+        msg = "all keys exhausted"
+        model_name = payload.get("model", "") if isinstance(payload, dict) else ""
+        if last_status == 400:
+            fallback = DEGRADED_MODELS.get(model_name, "")
+            if fallback:
+                msg += f" — {model_name} is UNAVAILABLE on NVIDIA, try {fallback} via UI presets"
+            else:
+                msg += f" — {model_name} may be UNAVAILABLE on NVIDIA"
         return JSONResponse(
-            {"error": "all keys exhausted", "last_upstream_status": last_status},
+            {"error": msg, "last_upstream_status": last_status},
             status_code=last_status,
         )
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenVidia — NVIDIA multi-key API proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/Scrivania/envidia/.venv/bin/python -m openvidia
+WorkingDirectory=%h/Scrivania/envidia
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
