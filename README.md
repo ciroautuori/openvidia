@@ -68,7 +68,7 @@ Default shows **★ Popular** — a curated list of ~19 well-known models (DeepS
 
 ### Test model
 
-Click **▶** next to any model in the browser to run a quick chat completion. Working models show green, DEGRADED/errors show red with the exact API error.
+Click **▶** next to any model in the browser to test it directly against the NVIDIA API (bypasses the active model override). Uses a dedicated endpoint (`/api/test-model`) so tests reflect the real model status, not the currently active override. Working models show green, DEGRADED/errors show red with the exact API error.
 
 ## Features
 
@@ -97,8 +97,8 @@ If you have `accounts.json` from a previous version, keys are auto-extracted on 
 |-------|--------|
 | `deepseek-ai/deepseek-v4-flash` | ✅ Works |
 | `deepseek-ai/deepseek-v4-pro` | ✅ Works (slower) |
+| `minimaxai/minimax-m3` | ✅ Works |
 | `z-ai/glm-5.2` | ❌ `DEGRADED` (NVIDIA server-side, see [forum](https://forums.developer.nvidia.com/t/model-glm-5-2-showing-error-400/375867)) |
-| `minimaxai/minimax-m3` | ❌ `DEGRADED` (intermittent) |
 
 ## systemd (optional)
 

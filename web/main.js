@@ -200,21 +200,14 @@ async function testModel(id, btn) {
   resultEl.className = 'test-result'
   btn.parentElement.parentElement.after(resultEl)
   try {
-    const r = await fetch('/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer test' },
-      body: JSON.stringify({ model: id, messages: [{ role: 'user', content: 'say ok' }], max_tokens: 10 })
-    })
+    const r = await api('POST', '/api/test-model', { model: id })
     if (r.ok) {
-      const d = await r.json()
-      const txt = d.choices?.[0]?.message?.content || ''
       resultEl.className = 'test-result ok'
-      resultEl.textContent = `✓ ${txt.slice(0, 80)}`
+      resultEl.textContent = `✓ ${(r.response || '').slice(0, 80)}`
       btn.className = 'browser-test done'
       btn.textContent = '✓'
     } else {
-      const txt = await r.text()
-      const detail = (() => { try { return JSON.parse(txt).detail || txt } catch { return txt } })()
+      const detail = r.detail || r.error || 'unknown'
       resultEl.className = 'test-result fail'
       resultEl.textContent = `✗ ${detail.slice(0, 120)}`
       btn.className = 'browser-test fail'
@@ -226,8 +219,8 @@ async function testModel(id, btn) {
     btn.className = 'browser-test fail'
     btn.textContent = '✗'
   }
-  setTimeout(() => resultEl.remove(), 6000)
-  setTimeout(() => { btn.className = 'browser-test'; btn.textContent = '▶' }, 4000)
+  setTimeout(() => resultEl.remove(), 8000)
+  setTimeout(() => { btn.className = 'browser-test'; btn.textContent = '▶' }, 5000)
 }
 
 function renderModelList() {

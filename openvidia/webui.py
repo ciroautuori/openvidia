@@ -6,11 +6,14 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from . import config
 from .proxy_state import ProxyState
+
+UPSTREAM_BASE = "https://integrate.api.nvidia.com/v1/"
 
 
 def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
@@ -94,6 +97,39 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         body = await request.json()
         state.active_model = body.get("model", "") or None
         return {"ok": True, "model": state.active_model or ""}
+
+    @app.post("/api/test-model")
+    async def api_test_model(request: Request):
+        body = await request.json()
+        model_id = body.get("model", "")
+        if not model_id:
+            return {"ok": False, "error": "no model specified"}
+
+        async with state.lock:
+            keys = list(state.keys)
+        if not keys:
+            return {"ok": False, "error": "no keys"}
+
+        payload = {"model": model_id, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 5}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as client:
+            for key in keys:
+                try:
+                    r = await client.post(
+                        UPSTREAM_BASE + "chat/completions",
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json=payload,
+                    )
+                    if r.is_success:
+                        d = r.json()
+                        txt = d.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        return {"ok": True, "model": model_id, "response": txt[:100]}
+                    if r.status_code != 400 and r.status_code != 429:
+                        continue
+                except httpx.HTTPError:
+                    continue
+                return {"ok": False, "model": model_id, "error": "unavailable", "detail": r.text[:200]}
+
+        return {"ok": False, "model": model_id, "error": "all keys failed"}
 
     @app.get("/api/presets")
     async def api_get_presets():
