@@ -49,3 +49,19 @@ def load_saved_index() -> int:
         return int(p.read_text().strip())
     except (FileNotFoundError, ValueError, OSError):
         return 0
+
+
+def presets_path() -> Path:
+    return config_dir() / "presets.json"
+
+
+def load_saved_presets() -> list:
+    p = presets_path()
+    try:
+        return json.loads(p.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def save_presets_file(presets: list) -> None:
+    atomic_write(presets_path(), json.dumps(presets, indent=2))

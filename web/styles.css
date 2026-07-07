@@ -117,10 +117,13 @@ header{display:flex;align-items:center;gap:12px}
 .model-grid button{
   flex:1;min-width:100px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;
   background:rgba(255,255,255,.02);color:var(--text2);font-family:var(--font);font-size:.7rem;
-  font-weight:500;cursor:pointer;transition:all .18s ease;text-align:center
+  font-weight:500;cursor:pointer;transition:all .18s ease;text-align:center;position:relative
 }
 .model-grid button:hover{border-color:rgba(124,92,252,.3);color:var(--text);background:var(--hover);transform:translateY(-1px)}
 .model-grid button.active{border-color:var(--accent);color:#d4ccff;background:var(--accent-soft)}
+.preset-rm{position:absolute;top:-4px;right:-4px;width:16px;height:16px;border-radius:50%;background:var(--red);color:#fff;font-size:.55rem;font-weight:700;line-height:16px;text-align:center;opacity:0;transition:opacity .18s;cursor:pointer}
+.model-grid button:hover .preset-rm{opacity:1}
+.preset-rm:hover{transform:scale(1.15)}
 [data-theme="light"] .model-grid button.active{color:var(--accent)}
 
 /* ── Model Browser ──────────────────────────── */
@@ -138,6 +141,10 @@ header{display:flex;align-items:center;gap:12px}
 .browser-name{font-family:var(--mono);font-size:.62rem;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .browser-item.active .browser-name{color:var(--accent)}
 .browser-owner{font-size:.58rem;color:var(--text3);flex-shrink:0}
+.browser-acts{display:flex;align-items:center;flex-shrink:0}
+.browser-add{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:none;border-radius:4px;background:transparent;color:var(--text3);cursor:pointer;transition:all .15s ease}
+.browser-add:hover{background:var(--accent-soft);color:var(--accent);transform:scale(1.1)}
+.browser-check{font-size:.6rem;color:var(--green);opacity:.7}
 
 /* ── Usage Example ──────────────────────────── */
 .usage-tabs{display:flex;gap:2px;margin-bottom:8px;background:rgba(255,255,255,.02);border-radius:6px;padding:2px;border:1px solid var(--border);width:fit-content}

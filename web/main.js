@@ -2,6 +2,7 @@ let theme = localStorage.getItem('openvidia-theme') || 'dark'
 let keys = []
 let activeModel = ''
 let allModels = []
+let presets = []
 let _logEntries = 0
 let statsInterval, keyStatsInterval
 
@@ -60,22 +61,49 @@ statsInterval = setInterval(async () => {
 }, 1000)
 
 /* ── Model Presets ──────────────────────────── */
-const PRESETS = [
-  { id: '', label: 'Passthrough' },
-  { id: 'z-ai/glm-5.2', label: 'GLM 5.2' },
-  { id: 'deepseek-ai/deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
-  { id: 'minimaxai/minimax-m3', label: 'MiniMax M3' },
-]
+async function loadPresets() {
+  try {
+    const r = await api('GET', '/api/presets')
+    presets = r.presets || []
+  } catch (_) { presets = [] }
+  renderPresets()
+}
+
+async function savePresets() {
+  try { await api('POST', '/api/presets', { presets }) } catch (_) {}
+  renderPresets()
+}
 
 function renderPresets() {
   $('quickSwitch').innerHTML = ''
-  PRESETS.forEach(p => {
+  const all = [{ id: '', label: 'Passthrough' }, ...presets.map(id => ({ id, label: labelForModel(id) }))]
+  all.forEach(p => {
     const btn = document.createElement('button')
     btn.textContent = p.label
     btn.className = p.id === activeModel ? 'active' : ''
     btn.onclick = () => setModel(p.id)
     $('quickSwitch').appendChild(btn)
+    if (p.id) {
+      const rm = document.createElement('span')
+      rm.className = 'preset-rm'
+      rm.textContent = '×'
+      rm.title = 'Remove preset'
+      rm.onclick = e => { e.stopPropagation(); presets = presets.filter(x => x !== p.id); savePresets() }
+      btn.appendChild(rm)
+    }
   })
+}
+
+function labelForModel(id) {
+  const m = allModels.find(x => x.id === id)
+  return m ? shortLabel(m.id) : id
+}
+
+function shortLabel(id) {
+  const known = { 'z-ai/glm-5.2': 'GLM 5.2', 'deepseek-ai/deepseek-v4-pro': 'DeepSeek V4 Pro', 'minimaxai/minimax-m3': 'MiniMax M3' }
+  if (known[id]) return known[id]
+  const parts = id.split('/')
+  return parts[parts.length - 1]
 }
 
 async function setModel(id) {
@@ -85,6 +113,7 @@ async function setModel(id) {
       activeModel = id
       $('modelStatusS').textContent = id || 'passthrough'
       renderPresets()
+      renderModelList()
       toast(id ? `Model: ${id}` : 'Passthrough mode', 'ok')
     }
   } catch (_) {}
@@ -120,7 +149,24 @@ function renderModelList() {
   f.forEach(m => {
     const item = document.createElement('div')
     item.className = `browser-item ${m.id === activeModel ? 'active' : ''}`
+    const inPreset = presets.includes(m.id)
     item.innerHTML = `<span class="browser-name">${m.id}</span>${m.owned_by ? `<span class="browser-owner">${m.owned_by}</span>` : ''}`
+    const acts = document.createElement('div')
+    acts.className = 'browser-acts'
+    if (!inPreset) {
+      const addBtn = document.createElement('button')
+      addBtn.className = 'browser-add'
+      addBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
+      addBtn.title = 'Add to presets'
+      addBtn.onclick = e => { e.stopPropagation(); presets.push(m.id); savePresets(); toast(`Added ${shortLabel(m.id)}`, 'ok') }
+      acts.appendChild(addBtn)
+    } else {
+      const chk = document.createElement('span')
+      chk.className = 'browser-check'
+      chk.textContent = '✓'
+      acts.appendChild(chk)
+    }
+    item.appendChild(acts)
     item.onclick = () => setModel(m.id)
     $('modelList').appendChild(item)
   })
@@ -272,6 +318,7 @@ new EventSource('/api/logs/stream').onmessage = e => {
     toast(`Proxy :${st.port}`, 'ok')
   } catch (_) {}
   await loadModel()
+  await loadPresets()
   await fetchModels()
   keyStatsInterval = setInterval(pollKeyStats, 2000)
 })()

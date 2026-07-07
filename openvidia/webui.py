@@ -95,6 +95,17 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         state.active_model = body.get("model", "") or None
         return {"ok": True, "model": state.active_model or ""}
 
+    @app.get("/api/presets")
+    async def api_get_presets():
+        return {"presets": config.load_saved_presets()}
+
+    @app.post("/api/presets")
+    async def api_save_presets(request: Request):
+        body = await request.json()
+        presets = body.get("presets", [])
+        config.save_presets_file(presets)
+        return {"ok": True}
+
     @app.get("/api/logs/stream")
     async def log_stream(request: Request):
         async def event_generator():
