@@ -1,12 +1,16 @@
 """
 OpenVidia — minimal multi-key NVIDIA API proxy with web UI.
 
+Install:
+    cd ~/Scrivania/envidia && uv pip install -e .
+
 Usage:
-    uv run python3 -m openvidia
-    # or: openvidia
+    openvidia
+    # or: uv run python3 -m openvidia
 
 Edit keys via the web UI at http://localhost:3940
 Or edit ~/.config/openvidia/keys.json and restart.
+Keys are auto-extracted from accounts.json if keys.json is empty.
 """
 import asyncio
 import os
@@ -36,11 +40,34 @@ def _kill_stale_port(port: int):
         pass
 
 
+def _extract_keys_from_accounts() -> list:
+    """Auto-extract keys from accounts.json if keys.json is empty."""
+    try:
+        import json
+        p = config.accounts_path()
+        if not p.exists():
+            return []
+        accounts = json.loads(p.read_text())
+        keys = []
+        for acct in accounts:
+            keys.extend(acct.get("keys", []))
+        if keys:
+            config.save_keys_file(keys)
+            print(f"● Extracted {len(keys)} keys from accounts.json")
+        return keys
+    except Exception:
+        return []
+
+
 async def main_async():
     _kill_stale_port(PORT)
     keys = config.load_saved_keys_file()
     if not keys:
-        print("No keys found in ~/.config/openvidia/keys.json")
+        keys = _extract_keys_from_accounts()
+    if not keys:
+        print("✗ No keys found. Add keys to ~/.config/openvidia/keys.json")
+        print("  Or run: python -c 'import json; json.dump([\"nvapi-...\"], open(\"$HOME/.config/openvidia/keys.json\",\"w\"))'")
+        print("  Accounts with keys in accounts.json are auto-extracted.")
         sys.exit(1)
 
     stats = ProxyStats(current_index=config.load_saved_index())
