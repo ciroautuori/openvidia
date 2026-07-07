@@ -1,11 +1,10 @@
 /* ═══════════════════════════════════════════════
    OpenVidia — Frontend Controller
-   SOTA 2026 · Glassmorphism · Login Auth · Log in Home
+   Minimal · Manual Keys · Web UI
    ═══════════════════════════════════════════════ */
 
 let statsInterval = null
 let keys = []
-let accounts = []
 
 /* ── DOM refs ────────────────────────────────── */
 const $ = (id) => document.getElementById(id)
@@ -31,18 +30,6 @@ const newKeyInput = $('newKeyInput')
 const confirmAddKeyBtn = $('confirmAddKeyBtn')
 const cancelAddKeyBtn = $('cancelAddKeyBtn')
 
-const accountsList = $('accountsList')
-const accountsEmpty = $('accountsEmpty')
-const accountCount = $('accountCount')
-const addAccountBtn = $('addAccountBtn')
-const accountAddForm = $('accountAddForm')
-const accountNameInput = $('accountNameInput')
-const accountEmailInput = $('accountEmailInput')
-const accountPasswordInput = $('accountPasswordInput')
-const accountCookiesInput = $('accountCookiesInput')
-const confirmAddAccountBtn = $('confirmAddAccountBtn')
-const cancelAddAccountBtn = $('cancelAddAccountBtn')
-
 /* ── API helper ─────────────────────────────── */
 async function api(method, path, body) {
   const opts = { method, headers: {} }
@@ -58,9 +45,7 @@ function toast(msg, level = 'info') {
   const icons = { ok: '✓', error: '✕', warn: '⚠', info: 'ℹ' }
   const el = document.createElement('div')
   el.className = `toast`
-  el.innerHTML = `
-    <div class="toast-icon ${level}">${icons[level] || icons.info}</div>
-    <div class="toast-msg">${msg}</div>`
+  el.innerHTML = `<div class="toast-icon ${level}">${icons[level] || icons.info}</div><div class="toast-msg">${msg}</div>`
   container.appendChild(el)
   setTimeout(() => {
     el.classList.add('toast-out')
@@ -155,106 +140,7 @@ confirmAddKeyBtn.addEventListener('click', async () => {
 })
 newKeyInput.addEventListener('keydown', e => { if (e.key === 'Enter') confirmAddKeyBtn.click() })
 
-/* ── Accounts ───────────────────────────────── */
-function renderAccounts() {
-  if (!accountsList) return
-  accountsList.innerHTML = ''
-  if (!accounts.length) {
-    accountsEmpty.style.display = 'flex'
-    accountCount.textContent = '0'
-    return
-  }
-  accountsEmpty.style.display = 'none'
-  accountCount.textContent = String(accounts.length)
-  accounts.forEach(a => {
-    const card = document.createElement('div'); card.className = 'account-card'
-    const header = document.createElement('div'); header.className = 'account-header'
-    const nameEl = document.createElement('div'); nameEl.className = 'account-name'
-    const icon = document.createElement('div'); icon.className = 'account-name-icon'
-    icon.textContent = a.name.charAt(0).toUpperCase()
-    const txt = document.createElement('span'); txt.textContent = a.name
-    nameEl.appendChild(icon); nameEl.appendChild(txt)
-    const badge = document.createElement('div'); badge.className = 'account-key-badge'
-    badge.textContent = `${a.key_count} key${a.key_count !== 1 ? 's' : ''}`
-    header.appendChild(nameEl); header.appendChild(badge)
-    card.appendChild(header)
-
-    // Auth type indicator
-    const authRow = document.createElement('div'); authRow.className = 'account-auth-row'
-    if (a.has_credentials) {
-      authRow.innerHTML = `<span class="auth-badge auth-email">🔑 ${a.email}</span>`
-    } else if (a.cookies_preview) {
-      authRow.innerHTML = `<span class="auth-badge auth-cookie">🍪 cookies</span>`
-    } else {
-      authRow.innerHTML = `<span class="auth-badge auth-none">⚠ no auth</span>`
-    }
-    card.appendChild(authRow)
-
-    const actions = document.createElement('div'); actions.className = 'account-actions'
-    const renewBtn = document.createElement('button'); renewBtn.className = 'btn btn-sm'
-    renewBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Replenish`
-    renewBtn.title = 'Generate a fresh key to replace the oldest one'
-    renewBtn.addEventListener('click', async () => {
-      renewBtn.disabled = true; renewBtn.textContent = '…'
-      try {
-        await api('POST', `/api/accounts/${encodeURIComponent(a.name)}/replenish`)
-        toast(`Replenish triggered for ${a.name}`, 'ok')
-      } catch (e) { toast(`Replenish failed: ${e.message}`, 'error') }
-      setTimeout(() => { renewBtn.disabled = false; renewBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Replenish` }, 2000)
-    })
-    actions.appendChild(renewBtn)
-    const delBtn = document.createElement('button'); delBtn.className = 'btn btn-sm btn-danger'
-    delBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Remove`
-    delBtn.addEventListener('click', async () => {
-      if (!confirm(`Remove "${a.name}" and all its keys?`)) return
-      try {
-        await api('DELETE', `/api/accounts/${encodeURIComponent(a.name)}`)
-        toast(`Account ${a.name} removed`, 'ok')
-        await loadAccounts()
-      } catch (e) { toast(`Remove failed: ${e.message}`, 'error') }
-    })
-    actions.appendChild(delBtn)
-    card.appendChild(actions)
-    accountsList.appendChild(card)
-  })
-}
-
-async function loadAccounts() {
-  try {
-    const data = await api('GET', '/api/accounts')
-    accounts = data.accounts
-    renderAccounts()
-  } catch (_) {}
-}
-
-/* ── Account add form ──────────────────────── */
-addAccountBtn.addEventListener('click', () => {
-  accountAddForm.classList.remove('hidden')
-  accountNameInput.value = ''; accountEmailInput.value = ''; accountPasswordInput.value = ''; accountCookiesInput.value = ''
-  accountNameInput.focus()
-})
-cancelAddAccountBtn.addEventListener('click', () => accountAddForm.classList.add('hidden'))
-confirmAddAccountBtn.addEventListener('click', async () => {
-  const name = accountNameInput.value.trim()
-  const email = accountEmailInput.value.trim()
-  const password = accountPasswordInput.value
-  const cookies = accountCookiesInput.value.trim()
-  if (!name) { toast('Account name required', 'warn'); return }
-  if (!email && !cookies) { toast('Email+password or cookies required', 'warn'); return }
-  if (email && !password) { toast('Password required for email login', 'warn'); return }
-
-  confirmAddAccountBtn.disabled = true; confirmAddAccountBtn.textContent = 'Saving…'
-  try {
-    const res = await api('POST', '/api/accounts', { name, email, password, cookies })
-    if (!res.ok) { toast(res.error || 'Add failed', 'error'); return }
-    accountAddForm.classList.add('hidden')
-    toast(`Account ${name} added`, 'ok')
-    await loadAccounts()
-  } catch (e) { toast(`Add failed: ${e.message}`, 'error') }
-  finally { confirmAddAccountBtn.disabled = false; confirmAddAccountBtn.textContent = 'Save Account' }
-})
-
-/* ── Log (now on Home tab) ──────────────────── */
+/* ── Log ────────────────────────────────────── */
 let _logEntries = 0
 
 function appendLog(level, msg) {
@@ -304,5 +190,4 @@ evtSource.onmessage = (e) => {
     const st = await api('GET', '/api/status')
     toast(`Proxy running on :${st.port}`, 'ok')
   } catch (_) {}
-  await loadAccounts()
 })()

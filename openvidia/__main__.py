@@ -33,7 +33,8 @@ async def main_async():
     web_dir = Path(__file__).resolve().parent.parent / "web"
     srv = await start(PORT, keys, log, stats, config.index_path(), web_dir=web_dir)
     print(f"● OpenVidia running on :{PORT} ({len(keys)} keys)")
-    print(f"  Web UI: http://localhost:{PORT}")
+    from .webui import auto_open
+    auto_open(PORT)
 
     try:
         while True:

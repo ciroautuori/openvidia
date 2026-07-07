@@ -19,8 +19,7 @@
         </div>
         <nav class="tabs" role="tablist">
           <button class="tab active" data-tab="home" role="tab" aria-selected="true">Home</button>
-          <button class="tab" data-tab="accounts" role="tab" aria-selected="false">Accounts</button>
-          <button class="tab" data-tab="settings" role="tab" aria-selected="false">Settings</button>
+          <button class="tab" data-tab="settings" role="tab" aria-selected="false">Keys</button>
         </nav>
       </header>
 
@@ -72,46 +71,9 @@
         </div>
       </section>
 
-      <!-- ═══════ ACCOUNTS ═══════ -->
-      <section id="tab-accounts" class="tab-content" role="tabpanel">
-        <div class="card">
-          <div class="card-header">
-            <span class="card-title">NVIDIA Accounts</span>
-            <span class="card-badge" id="accountCount">0</span>
-          </div>
-          <div class="empty-state" id="accountsEmpty">
-            <div class="empty-icon">
-              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-            </div>
-            <div class="empty-title">No accounts yet</div>
-            <div class="empty-desc">Add your NVIDIA account credentials for automatic key replenishment</div>
-          </div>
-          <div id="accountsList"></div>
-          <div class="card-action">
-            <button class="btn btn-primary" id="addAccountBtn">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-              Add Account
-            </button>
-          </div>
-          <div class="slide-form hidden" id="accountAddForm">
-            <div class="slide-form-body">
-              <input type="text" id="accountNameInput" spellcheck="false" placeholder="Account name (e.g. work-1)" autocomplete="off" />
-              <input type="email" id="accountEmailInput" spellcheck="false" placeholder="Email (NVIDIA Developer account)" autocomplete="email" />
-              <input type="password" id="accountPasswordInput" placeholder="Password" autocomplete="new-password" />
-              <div class="form-divider">
-                <span>or</span>
-              </div>
-              <textarea id="accountCookiesInput" spellcheck="false" rows="3" placeholder="Paste cookie JSON (alternative to login)"></textarea>
-            </div>
-            <div class="slide-form-actions">
-              <button class="btn btn-primary" id="confirmAddAccountBtn">Save Account</button>
-              <button class="btn btn-ghost" id="cancelAddAccountBtn">Cancel</button>
-            </div>
-          </div>
-        </div>
-      </section>
 
-      <!-- ═══════ SETTINGS ═══════ -->
+
+      <!-- ═══════ KEYS ═══════ -->
       <section id="tab-settings" class="tab-content" role="tabpanel">
         <div class="card">
           <div class="card-header">

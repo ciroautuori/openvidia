@@ -159,3 +159,9 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
 def open_browser(port: int = 3940) -> None:
     import threading
     threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{port}")).start()
+
+
+def auto_open(port: int = 3940) -> None:
+    """Open browser when proxy starts, with a small delay."""
+    import threading
+    threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{port}")).start()
