@@ -57,8 +57,11 @@ async def start(
     stats: ProxyStats,
     index_path: Path,
     web_dir: Optional[Path] = None,
+    initial_model: str = "",
 ) -> ProxyServer:
     state = ProxyState(keys=keys, stats=stats, index_path=index_path, log_cb=log_cb, port=port)
+    if initial_model:
+        state.active_model = initial_model
     app = create_app(state, web_dir=web_dir)
 
     # Bind explicitly first (like Rust's TcpListener::bind) so a host with

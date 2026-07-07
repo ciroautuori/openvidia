@@ -30,13 +30,11 @@ PORT = 3940
 def _kill_stale_port(port: int):
     try:
         out = subprocess.check_output(
-            ["fuser", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=3
+            ["fuser", "-k", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=5
         )
-        for pid in out.decode().strip().split():
-            try:
-                os.kill(int(pid), signal.SIGTERM)
-            except (OSError, ValueError):
-                pass
+        # fuser -k sends SIGKILL directly, but also wait a moment
+        import time as _time
+        _time.sleep(0.5)
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         pass
 
@@ -122,12 +120,13 @@ async def main_async():
         sys.exit(1)
 
     stats = ProxyStats(current_index=config.load_saved_index())
+    saved_model = config.load_active_model()
 
     def log(msg: str):
         print(msg)
 
     web_dir = Path(__file__).resolve().parent.parent / "web"
-    srv = await start(PORT, keys, log, stats, config.index_path(), web_dir=web_dir)
+    srv = await start(PORT, keys, log, stats, config.index_path(), web_dir=web_dir, initial_model=saved_model)
     print(f"● OpenVidia running on :{PORT} ({len(keys)} keys)")
     from .webui import auto_open
     auto_open(PORT)

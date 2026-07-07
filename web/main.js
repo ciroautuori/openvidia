@@ -372,6 +372,19 @@ $('clearLogBtn').addEventListener('click', () => {
   $('logArea').innerHTML = '<div class="log-empty">Cleared</div>'; _logEntries = 0; $('logCount').textContent = '0'
 })
 
+$('restartBtn').addEventListener('click', async () => {
+  $('restartBtn').disabled = true
+  $('restartBtn').textContent = '⟳ …'
+  try {
+    await api('POST', '/api/restart')
+    toast('Restarting…', 'info')
+  } catch (_) {
+    toast('Restart failed', 'error')
+    $('restartBtn').disabled = false
+    $('restartBtn').textContent = '⟳ Restart'
+  }
+})
+
 function appendLog(level, msg) {
   const t = new Date().toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   const el = document.createElement('div')

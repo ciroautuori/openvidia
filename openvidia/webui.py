@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 import threading
 import time
 import webbrowser
@@ -95,8 +96,25 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
     @app.post("/api/model")
     async def api_set_model(request: Request):
         body = await request.json()
-        state.active_model = body.get("model", "") or None
-        return {"ok": True, "model": state.active_model or ""}
+        m = body.get("model", "") or None
+        state.active_model = m
+        config.save_active_model(m or "")
+        return {"ok": True, "model": m or ""}
+
+    @app.post("/api/restart")
+    async def api_restart():
+        import os as _os
+        import signal as _signal
+        import subprocess as _sp
+        # Schedule kill + restart in a thread to not block response
+        def _do_restart():
+            import time as _time
+            _time.sleep(0.3)
+            _os.kill(_os.getpid(), _signal.SIGTERM)
+            _time.sleep(0.5)
+            _sp.Popen([sys.executable, "-m", "openvidia"])
+        threading.Thread(target=_do_restart, daemon=True).start()
+        return {"ok": True, "restarting": True}
 
     @app.post("/api/test-model")
     async def api_test_model(request: Request):

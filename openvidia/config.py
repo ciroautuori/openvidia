@@ -68,6 +68,22 @@ def save_presets_file(presets: list) -> None:
     atomic_write(presets_path(), json.dumps(presets, indent=2))
 
 
+def active_model_path() -> Path:
+    return config_dir() / "active_model"
+
+
+def save_active_model(model: str) -> None:
+    atomic_write(active_model_path(), model)
+
+
+def load_active_model() -> str:
+    p = active_model_path()
+    try:
+        return p.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
 def opencode_config_path() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME", "")
     if xdg:
