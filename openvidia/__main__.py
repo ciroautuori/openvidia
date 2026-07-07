@@ -9,6 +9,9 @@ Edit keys via the web UI at http://localhost:3940
 Or edit ~/.config/openvidia/keys.json and restart.
 """
 import asyncio
+import os
+import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,7 +22,22 @@ from .server_manager import start
 PORT = 3940
 
 
+def _kill_stale_port(port: int):
+    try:
+        out = subprocess.check_output(
+            ["fuser", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=3
+        )
+        for pid in out.decode().strip().split():
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        pass
+
+
 async def main_async():
+    _kill_stale_port(PORT)
     keys = config.load_saved_keys_file()
     if not keys:
         print("No keys found in ~/.config/openvidia/keys.json")
