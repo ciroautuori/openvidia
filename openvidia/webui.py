@@ -36,6 +36,20 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         p = web_dir / "main.js"
         return Response(content=p.read_bytes(), media_type="application/javascript") if p.exists() else Response("", status_code=404)
 
+    @app.get("/logo.png")
+    async def logo():
+        for p in [web_dir / "logo.png", web_dir / "assets" / "logo.png"]:
+            if p.exists():
+                return Response(content=p.read_bytes(), media_type="image/png")
+        return Response("", status_code=404)
+
+    @app.get("/favicon.ico")
+    async def favicon():
+        for p in [web_dir / "favicon.ico", web_dir / "assets" / "favicon.ico", web_dir / "assets" / "logo.png"]:
+            if p.exists():
+                return Response(content=p.read_bytes(), media_type="image/x-icon")
+        return Response("", status_code=404)
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "keys": len(state.keys), "port": state.port}

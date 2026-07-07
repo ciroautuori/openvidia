@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="web/assets/logo.png">
+  <img alt="NVIDIA" src="web/assets/logo.png" width="200">
+</picture>
+
 # OpenVidia — NVIDIA Multi-Key Proxy
 
 Minimal reverse proxy for the NVIDIA NIM API with web UI, automatic key rotation, model override, and live model testing.
@@ -8,32 +13,62 @@ Minimal reverse proxy for the NVIDIA NIM API with web UI, automatic key rotation
 git clone https://github.com/ciroautuori/openvidia.git
 cd openvidia
 uv pip install -e .
-openvidia                     # starts proxy + auto-opens browser
-openvidia setup               # adds openvidia provider to opencode
+openvidia              # daemon mode — starts proxy in background, opens browser
+openvidia setup        # adds openvidia provider to opencode config
 ```
 
-Opens `http://localhost:3940` automatically.
+Opens `http://localhost:3940` automatically. The daemon runs silently in the background (no terminal output).
 
-## How It Works
+## Architecture
 
 ```
-opencode ──model:"openvidia"──→ proxy (:3940) ──model:"deepseek-ai/..."──→ NVIDIA API
+┌─────────────────────────────────────────────────────────────────┐
+│                        openvidia daemon                          │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                   Web UI (:3940)                        │    │
+│  │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────┐              │    │
+│  │  │ Home │ │ Keys │ │ News │ │ Settings │              │    │
+│  │  └──────┘ └──────┘ └──────┘ └──────────┘              │    │
+│  │  · Start/Stop proxy · Model presets · Activity log     │    │
+│  │  · Key management · Real-time stats                    │    │
+│  │  · Discourse News feed · Model browser + Test ▶        │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                           │                                       │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                   Proxy (:3940/v1)                      │    │
+│  │  intercepts → overrides model → rotates keys → forwards │    │
+│  │  default model stored in ~/.config/openvidia/active_model│    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                           │                                       │
+│                    NVIDIA NIM API                                  │
+│              integrate.api.nvidia.com/v1                           │
+└─────────────────────────────────────────────────────────────────┘
+
+opencode ──/"openvidia"──→ proxy ──/"deepseek-ai/..."──→ NVIDIA API
 ```
 
-- **opencode** sees one model: `openvidia`. You select it with `/model openvidia`.
-- **UI** controls which actual NVIDIA model the proxy uses via model override.
-- **Proxy** intercepts every request and overrides the model field before forwarding to NVIDIA.
-- No provider model list syncing. No complex config.
+- **opencode** sees one model: `openvidia`. Select it with `/model openvidia`.
+- **Web UI** controls which NVIDIA model the proxy overrides.
+- **Proxy** intercepts every request, overrides the `model` field, rotates keys on 4xx/5xx.
+- **No provider model list syncing.** No complex config.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `openvidia` | Daemon mode — spawns background process, opens browser, exits silently |
+| `openvidia foreground` | Foreground mode (used internally by daemon, useful for debugging) |
+| `openvidia setup` | Adds `openvidia` provider to `~/.config/opencode/opencode.json` |
 
 ## Usage
 
 ### With opencode
 
-1. `openvidia` — start the proxy
-2. In opencode: `/model openvidia`
-3. Open `http://localhost:3940` in browser
-4. Home → **Model Presets**: click a model to activate it
-5. Settings → **Available Models**: browse, add to presets, or test any model
+1. `openvidia` — starts the proxy daemon
+2. `opencode` → `/model openvidia`
+3. Open `http://localhost:3940` → Home → Model Presets: click a model to activate
+4. Settings → Available Models: browse, add to presets, or test any model
 
 ### With any OpenAI-compatible client
 
@@ -41,10 +76,9 @@ opencode ──model:"openvidia"──→ proxy (:3940) ──model:"deepseek-ai
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:3940/v1", api_key="ignored")
 r = client.chat.completions.create(
-    model="openvidia",  # proxy overrides this with the UI-selected model
+    model="openvidia",  # proxy overrides with the UI-selected model
     messages=[{"role":"user","content":"Hello!"}]
 )
-print(r.choices[0].message.content)
 ```
 
 ```bash
@@ -54,32 +88,48 @@ curl http://localhost:3940/v1/chat/completions \
   -d '{"model":"openvidia","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-## Web UI
+## Web UI Tabs
 
-| Tab     | Content |
-|---------|---------|
-| Home    | Status bar + model presets (click to switch) + usage example + activity log |
-| Keys    | View/add/remove API keys, per-key stats (success/fail/last error) |
-| Settings | Available model browser with **filter chips** (★ Popular / All), **Test** button (▶) for each model, search, usage examples |
+| Tab | Features |
+|-----|----------|
+| **Home** | Status bar (proxy on/off, port, active model, request stats), **Model Presets** grid (click to switch), **Activity Log** with SSE live stream, **Start/Stop** buttons, **Restart** button |
+| **Keys** | Add/remove API keys, per-key stats (requests, success/fail, freshness indicator, last error) |
+| **News** | Fetches latest NVIDIA NIM forum posts + GLM-5.2 status thread from Discourse API (1h cache) |
+| **Settings** | **Model Browser** with filter chips (★ Popular / All), search, **Test ▶** button per model, add to presets, usage examples |
+
+### Proxy state control
+
+- **Stop** — proxy returns `503 {"error":"proxy stopped"}`; web UI stays alive
+- **Start** — resumes proxying
+- **Restart** — spawns new process first, then kills old (no downtime window)
 
 ### Model browser filters
 
-Default shows **★ Popular** — a curated list of ~19 well-known models (DeepSeek, Meta, Mistral, Google, etc.). Switch to **All** to browse all 120+ NVIDIA NIM models.
+Default shows **★ Popular** — curated list of ~19 well-known models (DeepSeek, Meta, Mistral, Google, etc.). Switch to **All** to browse all 120+ NVIDIA NIM models.
 
 ### Test model
 
-Click **▶** next to any model in the browser to test it directly against the NVIDIA API (bypasses the active model override). Uses a dedicated endpoint (`/api/test-model`) so tests reflect the real model status, not the currently active override. Working models show green, DEGRADED/errors show red with the exact API error.
+Click **▶** next to any model to test it directly against the NVIDIA API (bypasses the active model override). Uses a dedicated `/api/test-model` endpoint. Working models show green, DEGRADED/errors show red with the exact API error.
+
+### NVIDIA logo
+
+Official NVIDIA logo in the web UI header (replaces placeholder icon). Also displayed at the top of this README.
 
 ## Features
 
-- **Multi-key rotation** — 9 keys, rotates on 4xx/5xx automatically, saves rotation index
+- **Multi-key rotation** — 9 keys, rotates on 4xx/5xx automatically, saves rotation index to disk
 - **Model override** — set one model from the UI, every request goes through it
-- **Model presets** — save your favorite models, switch instantly from Home
+- **Persistent active model** — saved to `~/.config/openvidia/active_model`, restored on startup
+- **Model presets** — save favorite models, switch instantly from Home
 - **Real-time stats** — request count, rotations, success rate, SSE log stream
 - **Per-key telemetry** — requests, success/fail, freshness (fresh/stale/unused), last error
+- **Daemon mode** — runs silently in background, auto-opens browser
+- **Start/Stop/Restart** — control proxy state without killing the web UI
+- **News feed** — Discourse API scraper for NVIDIA NIM updates (1h cache)
 - **NVIDIA brand colors** — official `#76B900` green, dark/light theme toggle
-- **Keyboard shortcuts** — `Enter` to confirm key add
+- **Degraded model fallback** — detects unavailable models and suggests alternatives in error messages
 - **Health check** — `GET /health`
+- **Lightweight** — FastAPI + httpx, single process, no external dependencies
 
 ## Keys
 
@@ -98,7 +148,17 @@ If you have `accounts.json` from a previous version, keys are auto-extracted on 
 | `deepseek-ai/deepseek-v4-flash` | ✅ Works |
 | `deepseek-ai/deepseek-v4-pro` | ✅ Works (slower) |
 | `minimaxai/minimax-m3` | ✅ Works |
+| `moonshotai/kimi-k2.6` | ✅ Works |
 | `z-ai/glm-5.2` | ❌ `DEGRADED` (NVIDIA server-side, see [forum](https://forums.developer.nvidia.com/t/model-glm-5-2-showing-error-400/375867)) |
+
+### Degraded model fallback
+
+When GLM-5.2 or Kimi K2.6 return a 400 error, the proxy automatically suggests the recommended fallback in the error message:
+
+| Model | Fallback |
+|-------|----------|
+| `z-ai/glm-5.2` | `deepseek-ai/deepseek-v4-pro` |
+| `moonshotai/kimi-k2.6` | `deepseek-ai/deepseek-v4-flash` |
 
 ## systemd (optional)
 
@@ -111,12 +171,16 @@ systemctl --user enable --now openvidia
 
 | File | Purpose |
 |------|---------|
-| `~/.config/openvidia/keys.json` | API keys |
+| `~/.config/openvidia/keys.json` | API keys (JSON array) |
 | `~/.config/openvidia/presets.json` | Saved model presets |
+| `~/.config/openvidia/active_model` | Currently active model (persists across restarts) |
 | `~/.config/openvidia/index` | Key rotation index |
-| `~/.config/openvidia/accounts.json` | Legacy accounts (auto-extract) |
+| `~/.config/openvidia/accounts.json` | Legacy accounts (auto-extracted to keys.json) |
+| `~/.config/openvidia/news_cache.json` | News feed cache (1h TTL) |
 
 ## Project
 
-**`main`** branch — Python (FastAPI), the only maintained version.  
-**`rust`** and **`python`** branches — legacy, no longer maintained.
+- **`main`** — Python (FastAPI), actively maintained
+- **`rust`**, **`python`** — legacy branches, no longer maintained
+
+Built with [FastAPI](https://fastapi.tiangolo.com/), [httpx](https://www.python-httpx.org/), [uvicorn](https://www.uvicorn.org/).
