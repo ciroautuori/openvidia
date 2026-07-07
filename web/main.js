@@ -4,12 +4,13 @@
    ═══════════════════════════════════════════════ */
 
 let statsInterval = null
+let keyStatsInterval = null
 let keys = []
+let theme = localStorage.getItem('openvidia-theme') || 'dark'
 
 /* ── DOM refs ────────────────────────────────── */
 const $ = (id) => document.getElementById(id)
 
-const statusDot = $('statusDot')
 const statusText = $('statusText')
 const portDisplay = $('portDisplay')
 const statReqs = $('statReqs')
@@ -31,7 +32,10 @@ const confirmAddKeyBtn = $('confirmAddKeyBtn')
 const cancelAddKeyBtn = $('cancelAddKeyBtn')
 
 const quickSwitch = $('quickSwitch')
-const modelStatus = $('modelStatus')
+const modelStatusS = $('modelStatusS')
+const usageCode = $('usageCode')
+const themeDark = $('themeDark')
+const themeLight = $('themeLight')
 
 /* ── API helper ─────────────────────────────── */
 async function api(method, path, body) {
@@ -67,8 +71,20 @@ document.querySelectorAll('.tab').forEach(tab => {
   })
 })
 
+/* ── Theme ───────────────────────────────────── */
+function applyTheme(t) {
+  theme = t
+  document.documentElement.setAttribute('data-theme', t)
+  localStorage.setItem('openvidia-theme', t)
+  themeDark.classList.toggle('active', t === 'dark')
+  themeLight.classList.toggle('active', t === 'light')
+}
+
+themeDark.addEventListener('click', () => applyTheme('dark'))
+themeLight.addEventListener('click', () => applyTheme('light'))
+applyTheme(theme)
+
 /* ── Stats ──────────────────────────────────── */
-statusDot.innerHTML = '<span class="pulse-dot running"></span>'
 statusText.textContent = 'Running'
 portDisplay.textContent = '3940'
 
@@ -89,9 +105,6 @@ const PRESETS = [
   { id: '', label: 'Passthrough' },
   { id: 'deepseek-ai/deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
   { id: 'deepseek-ai/deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
-  { id: 'google/gemma-4-31b-it', label: 'Gemma 4 31B' },
-  { id: 'mistralai/mistral-large-3-675b-instruct-2512', label: 'Mistral Large 3' },
-  { id: 'nvidia/llama-3.1-nemotron-ultra-253b-v1', label: 'Nemotron Ultra' },
 ]
 
 let activeModel = ''
@@ -113,7 +126,7 @@ async function setModel(id) {
     const r = await fetch('/api/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: id }) })
     if (r.ok) {
       activeModel = id
-      modelStatus.textContent = id || 'passthrough'
+      modelStatusS.textContent = id || 'passthrough'
       renderPresets()
       toast(id ? `Model: ${id}` : 'Passthrough mode', 'ok')
     }
@@ -124,9 +137,56 @@ async function loadModel() {
   try {
     const r = await api('GET', '/api/model')
     activeModel = r.model || ''
-    modelStatus.textContent = activeModel || 'passthrough'
+    modelStatusS.textContent = activeModel || 'passthrough'
     renderPresets()
   } catch (_) {}
+}
+
+/* ── Usage Example ──────────────────────────── */
+const USAGE_EXAMPLES = {
+  curl: `curl http://localhost:3940/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "deepseek-ai/deepseek-v4-flash",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'`,
+  python: `from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:3940/v1",
+    api_key="not-needed"
+)
+
+response = client.chat.completions.create(
+    model="deepseek-ai/deepseek-v4-flash",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.choices[0].message.content)`,
+  js: `const response = await fetch("http://localhost:3940/v1/chat/completions", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    model: "deepseek-ai/deepseek-v4-flash",
+    messages: [{ role: "user", content: "Hello!" }]
+  })
+})
+const data = await response.json()
+console.log(data.choices[0].message.content)`,
+}
+
+let currentUsageLang = 'curl'
+
+document.querySelectorAll('.usage-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.usage-tab').forEach(t => t.classList.remove('active'))
+    tab.classList.add('active')
+    currentUsageLang = tab.dataset.usage
+    renderUsageExample()
+  })
+})
+
+function renderUsageExample() {
+  usageCode.innerHTML = `<code>${USAGE_EXAMPLES[currentUsageLang]}</code>`
 }
 
 /* ── Key helpers ────────────────────────────── */
@@ -138,8 +198,18 @@ function copyToClipboard(text) {
   navigator.clipboard.writeText(text).then(() => toast('Key copied to clipboard', 'ok')).catch(() => {})
 }
 
+function timeAgo(ts) {
+  if (!ts) return ''
+  const sec = Math.floor((Date.now() / 1000) - ts)
+  if (sec < 60) return `${sec}s ago`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}m ago`
+  const h = Math.floor(min / 60)
+  return `${h}h ago`
+}
+
 /* ── Render keys ────────────────────────────── */
-function renderKeys() {
+function renderKeys(keyStatsData) {
   keysList.innerHTML = ''
   if (!keys.length) {
     keysEmpty.style.display = 'flex'
@@ -148,12 +218,41 @@ function renderKeys() {
   }
   keysEmpty.style.display = 'none'
   keyCount.textContent = String(keys.length)
+
+  const activeIdx = keyStatsData ? keyStatsData.active_index : -1
+  const statsMap = keyStatsData ? keyStatsData.key_stats || {} : {}
+
   keys.forEach((k, i) => {
-    const row = document.createElement('div'); row.className = 'key-row'
+    const isActive = i === activeIdx
+    const st = statsMap[String(i)]
+    const freshness = st ? st.freshness : 'unused'
+    const row = document.createElement('div')
+    row.className = `key-row ${isActive ? 'key-active' : ''}`
+
+    const left = document.createElement('div'); left.className = 'key-left'
+    const indicator = document.createElement('span')
+    indicator.className = `key-indicator key-${freshness}`
+    indicator.title = freshness === 'fresh' ? 'Used recently' : freshness === 'stale' ? 'Not used recently' : 'Never used'
+    left.appendChild(indicator)
+
     const val = document.createElement('span'); val.className = 'key-value'
     val.textContent = maskKey(k); val.title = k
     val.addEventListener('click', () => copyToClipboard(k))
+    left.appendChild(val)
+    row.appendChild(left)
+
     const group = document.createElement('div'); group.className = 'key-actions-group'
+    if (isActive) {
+      const activeBadge = document.createElement('span'); activeBadge.className = 'key-active-badge'
+      activeBadge.textContent = 'active'
+      group.appendChild(activeBadge)
+    }
+    if (st && st.requests > 0) {
+      const usageInfo = document.createElement('span'); usageInfo.className = 'key-usage-info'
+      usageInfo.textContent = `${st.success}✓ ${st.failed > 0 ? st.failed + '✗ ' : ''}${timeAgo(st.last_used)}`
+      usageInfo.title = st.last_error || ''
+      group.appendChild(usageInfo)
+    }
     const copyBtn = document.createElement('button'); copyBtn.className = 'key-action-btn'
     copyBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
     copyBtn.title = 'Copy key'; copyBtn.addEventListener('click', () => copyToClipboard(k))
@@ -162,13 +261,20 @@ function renderKeys() {
     delBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'
     delBtn.title = 'Remove key'; delBtn.addEventListener('click', () => { keys.splice(i, 1); persistKeys(); toast('Key removed', 'warn') })
     group.appendChild(delBtn)
-    row.appendChild(val); row.appendChild(group)
+    row.appendChild(group)
     keysList.appendChild(row)
   })
 }
 
+async function pollKeyStats() {
+  try {
+    const data = await api('GET', '/api/keys/stats')
+    renderKeys(data)
+  } catch (_) {}
+}
+
 async function persistKeys() {
-  renderKeys()
+  renderKeys(await api('GET', '/api/keys/stats').catch(() => null))
   try { await api('POST', '/api/keys', { keys }) } catch (e) { toast(`Save failed: ${e.message}`, 'error') }
 }
 
@@ -229,6 +335,7 @@ evtSource.onmessage = (e) => {
 /* ── Init ───────────────────────────────────── */
 ;(async () => {
   renderKeys()
+  renderUsageExample()
   try {
     const data = await api('GET', '/api/keys')
     keys = data.keys; renderKeys()
@@ -238,4 +345,8 @@ evtSource.onmessage = (e) => {
     const st = await api('GET', '/api/status')
     toast(`Proxy running on :${st.port}`, 'ok')
   } catch (_) {}
+  await loadModel()
+
+  if (keyStatsInterval) clearInterval(keyStatsInterval)
+  keyStatsInterval = setInterval(pollKeyStats, 2000)
 })()

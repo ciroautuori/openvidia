@@ -19,7 +19,8 @@
         </div>
         <nav class="tabs" role="tablist">
           <button class="tab active" data-tab="home" role="tab" aria-selected="true">Home</button>
-          <button class="tab" data-tab="settings" role="tab" aria-selected="false">Keys</button>
+          <button class="tab" data-tab="keys" role="tab" aria-selected="false">Keys</button>
+          <button class="tab" data-tab="settings" role="tab" aria-selected="false">Settings</button>
         </nav>
       </header>
 
@@ -46,14 +47,6 @@
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-header">
-            <span class="card-title">Model Presets</span>
-            <span class="card-badge" id="modelStatus">passthrough</span>
-          </div>
-          <div class="model-grid" id="quickSwitch"></div>
-        </div>
-
         <div class="card log-card">
           <div class="card-header">
             <span class="card-title">
@@ -71,10 +64,8 @@
         </div>
       </section>
 
-
-
       <!-- ═══════ KEYS ═══════ -->
-      <section id="tab-settings" class="tab-content" role="tabpanel">
+      <section id="tab-keys" class="tab-content" role="tabpanel">
         <div class="card">
           <div class="card-header">
             <span class="card-title">API Keys</span>
@@ -85,7 +76,7 @@
               <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
             </div>
             <div class="empty-title">No keys loaded</div>
-            <div class="empty-desc">Add API keys manually or configure accounts for automatic management</div>
+            <div class="empty-desc">Add API keys manually below</div>
           </div>
           <div id="keysList"></div>
           <div class="card-action">
@@ -102,6 +93,41 @@
               <button class="btn btn-primary" id="confirmAddKeyBtn">Add Key</button>
               <button class="btn btn-ghost" id="cancelAddKeyBtn">Cancel</button>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════ SETTINGS ═══════ -->
+      <section id="tab-settings" class="tab-content" role="tabpanel">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Model Override</span>
+            <span class="card-badge" id="modelStatusS">passthrough</span>
+          </div>
+          <div class="model-grid" id="quickSwitch"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Theme</span>
+          </div>
+          <div class="theme-selector">
+            <button class="btn" id="themeDark">Dark</button>
+            <button class="btn" id="themeLight">Light</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Usage Example</span>
+          </div>
+          <div class="usage-example" id="usageExample">
+            <div class="usage-tabs">
+              <button class="usage-tab active" data-usage="curl">cURL</button>
+              <button class="usage-tab" data-usage="python">Python</button>
+              <button class="usage-tab" data-usage="js">JavaScript</button>
+            </div>
+            <pre class="usage-code" id="usageCode"><code></code></pre>
           </div>
         </div>
       </section>

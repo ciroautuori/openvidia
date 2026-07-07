@@ -1,19 +1,23 @@
 """
 Shared state for the running proxy.
-
-Counters are plain ints, not real atomics: uvicorn runs a single asyncio
-event loop with no preemption between awaits, so a bare `+= 1` inside a
-handler is already race-free here — the Rust AtomicU64 was for a genuinely
-multi-threaded tokio runtime, which we don't have with one asyncio loop.
-If you ever run this with multiple uvicorn *workers* (separate processes),
-these counters stop being shared and this assumption breaks.
 """
 import asyncio
+import time
 from collections import deque
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .config import atomic_write
+
+
+class KeyUsage:
+    __slots__ = ("requests", "success", "failed", "last_used", "last_error")
+    def __init__(self):
+        self.requests = 0
+        self.success = 0
+        self.failed = 0
+        self.last_used = 0.0
+        self.last_error = ""
 
 
 class ProxyStats:
@@ -22,6 +26,21 @@ class ProxyStats:
         self.rotations = 0
         self.success = 0
         self.current_index = current_index
+        self.active_key_index: int = current_index
+        self.key_usage: Dict[str, KeyUsage] = {}
+
+    def record_key_usage(self, key: str, ok: bool = True, error: str = "") -> None:
+        u = self.key_usage.get(key)
+        if u is None:
+            u = KeyUsage()
+            self.key_usage[key] = u
+        u.requests += 1
+        u.last_used = time.time()
+        if ok:
+            u.success += 1
+        else:
+            u.failed += 1
+            u.last_error = error
 
 
 class ProxyState:
@@ -40,8 +59,6 @@ class ProxyState:
         self.lock = asyncio.Lock()
         self.log_buffer: deque = deque(maxlen=500)
         self._log_cb = log_cb
-        # Optional callback fired when a key returns 401/403/404 in the proxy.
-        # Receives the failed key value. Used by account_manager to replenish.
         self.on_key_failed: Optional[Callable[[str], None]] = None
         self.active_model: Optional[str] = None
 
@@ -51,16 +68,9 @@ class ProxyState:
 
 
 def persist_index(state: ProxyState, i: int) -> None:
-    """
-    Store the working-key pointer and mirror it to disk, but only when it
-    actually moves — the common case (same key keeps working) re-stores the
-    same value and skips the write.
-
-    A hard kill between the change and the write loses the last index;
-    acceptable — a stale index just costs one extra rotation after restart.
-    """
     previous = state.stats.current_index
     state.stats.current_index = i
+    state.stats.active_key_index = i
     if previous != i:
         try:
             atomic_write(state.index_path, str(i))

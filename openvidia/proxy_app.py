@@ -126,6 +126,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 resp = await client.send(req, stream=True)
             except httpx.HTTPError as e:
                 state.log_cb(f"key[{i}] error: {e}")
+                state.stats.record_key_usage(key, ok=False, error=str(e))
                 state.stats.rotations += 1
                 persist_index(state, (i + 1) % len(keys))
                 continue
@@ -134,6 +135,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
             if 200 <= status < 300:
                 state.stats.success += 1
+                state.stats.record_key_usage(key, ok=True)
                 persist_index(state, i)
                 if nv_path != "models":
                     state.log_cb(f"✔ key[{i}] OK")
@@ -162,7 +164,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             last_status = status
 
             if should_rotate(status):
-                # Notify account manager that this specific key failed
+                state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
                 if state.on_key_failed is not None:
                     state.on_key_failed(key)
                 state.stats.rotations += 1

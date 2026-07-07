@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Optional
@@ -31,6 +32,10 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         p = web_dir / "main.js"
         return Response(content=p.read_bytes(), media_type="application/javascript") if p.exists() else Response("", status_code=404)
 
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "keys": len(state.keys), "port": state.port}
+
     @app.get("/api/status")
     async def api_status():
         return {"running": True, "port": state.port}
@@ -41,6 +46,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
             "requests": state.stats.requests,
             "rotations": state.stats.rotations,
             "success": state.stats.success,
+            "active_index": state.stats.active_key_index,
         }
 
     @app.get("/api/keys")
@@ -56,6 +62,28 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
             state.keys = list(keys)
         config.save_keys_file(keys)
         return {"ok": True}
+
+    @app.get("/api/keys/stats")
+    async def api_key_stats():
+        async with state.lock:
+            stats = {}
+            now = time.time()
+            for i, k in enumerate(state.keys):
+                u = state.stats.key_usage.get(k)
+                if u:
+                    stats[str(i)] = {
+                        "requests": u.requests,
+                        "success": u.success,
+                        "failed": u.failed,
+                        "last_used": u.last_used,
+                        "last_error": u.last_error,
+                        "freshness": "fresh" if (now - u.last_used) < 120 else
+                                     "stale" if u.last_used > 0 else "unused",
+                    }
+            return {
+                "active_index": state.stats.active_key_index,
+                "key_stats": stats,
+            }
 
     @app.get("/api/model")
     async def api_get_model():
