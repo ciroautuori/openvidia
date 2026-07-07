@@ -2,17 +2,18 @@
 OpenVidia — minimal multi-key NVIDIA API proxy with web UI.
 
 Install:
-    cd ~/Scrivania/envidia && uv pip install -e .
+    pip install -e .
 
 Usage:
-    openvidia
-    # or: uv run python3 -m openvidia
+    openvidia              # start proxy
+    openvidia setup        # configure opencode provider
 
-Edit keys via the web UI at http://localhost:3940
+Edit keys via web UI at http://localhost:3940
 Or edit ~/.config/openvidia/keys.json and restart.
-Keys are auto-extracted from accounts.json if keys.json is empty.
+Keys auto-extracted from accounts.json if keys.json is empty.
 """
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -24,6 +25,22 @@ from .proxy_state import ProxyStats
 from .server_manager import start
 
 PORT = 3940
+OPENCODE_MODELS = {
+    "z-ai/glm-5.2": {"name": "GLM 5.2", "tools": True},
+    "deepseek-ai/deepseek-v4-pro": {"name": "DeepSeek V4 Pro", "tools": True},
+    "minimaxai/minimax-m3": {"name": "MiniMax M3", "tools": True},
+}
+OPENCODE_PROVIDER = {
+    "openvidia": {
+        "models": OPENCODE_MODELS,
+        "name": "OpenVidia",
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {
+            "apiKey": "ignored",
+            "baseURL": f"http://localhost:{PORT}/v1",
+        },
+    }
+}
 
 
 def _kill_stale_port(port: int):
@@ -41,9 +58,7 @@ def _kill_stale_port(port: int):
 
 
 def _extract_keys_from_accounts() -> list:
-    """Auto-extract keys from accounts.json if keys.json is empty."""
     try:
-        import json
         p = config.accounts_path()
         if not p.exists():
             return []
@@ -59,15 +74,55 @@ def _extract_keys_from_accounts() -> list:
         return []
 
 
+def _opencode_config_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME", "")
+    if xdg:
+        return Path(xdg) / "opencode" / "opencode.json"
+    return Path.home() / ".config" / "opencode" / "opencode.json"
+
+
+def _setup_opencode():
+    oc_path = _opencode_config_path()
+    if not oc_path.exists():
+        print(f"ℹ opencode not found at {oc_path} — skipping")
+        return False
+    try:
+        cfg = json.loads(oc_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        print(f"✗ Invalid opencode config at {oc_path}")
+        return False
+
+    providers = cfg.setdefault("provider", {})
+    if "openvidia" in providers:
+        print("✓ OpenVidia provider already configured in opencode")
+        return True
+
+    providers.update(OPENCODE_PROVIDER)
+    # Write back atomically
+    tmp = oc_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2))
+    tmp.rename(oc_path)
+    print(f"✓ Added OpenVidia provider to opencode ({len(OPENCODE_MODELS)} models)")
+    print(f"  → http://localhost:{PORT}/v1")
+    return True
+
+
+def _setup_cmd():
+    ok = _setup_opencode()
+    if ok:
+        print("● Run 'opencode' to use the OpenVidia models.")
+    sys.exit(0)
+
+
 async def main_async():
     _kill_stale_port(PORT)
+    _setup_opencode()
     keys = config.load_saved_keys_file()
     if not keys:
         keys = _extract_keys_from_accounts()
     if not keys:
         print("✗ No keys found. Add keys to ~/.config/openvidia/keys.json")
-        print("  Or run: python -c 'import json; json.dump([\"nvapi-...\"], open(\"$HOME/.config/openvidia/keys.json\",\"w\"))'")
-        print("  Accounts with keys in accounts.json are auto-extracted.")
+        print("  Or run: openvidia setup")
         sys.exit(1)
 
     stats = ProxyStats(current_index=config.load_saved_index())
@@ -91,6 +146,8 @@ async def main_async():
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "setup":
+        _setup_cmd()
     asyncio.run(main_async())
 
 
