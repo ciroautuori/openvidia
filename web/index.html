@@ -20,6 +20,7 @@
         <nav class="tabs" role="tablist">
           <button class="tab active" data-tab="home">Home</button>
           <button class="tab" data-tab="keys">Keys</button>
+          <button class="tab" data-tab="news">News</button>
           <button class="tab" data-tab="settings">Settings</button>
         </nav>
         <button class="theme-btn" id="themeToggle" title="Toggle theme">🌙</button>
@@ -100,6 +101,31 @@
               <button class="btn btn-primary" id="confirmAddKeyBtn">Add</button>
               <button class="btn" id="cancelAddKeyBtn">Cancel</button>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══ NEWS ══ -->
+      <section id="tab-news" class="tab-content">
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-ttl">Forum Updates</span>
+            <span class="card-badge" id="newsCount">0</span>
+          </div>
+          <div id="newsList">
+            <div class="empty-state">
+              <div class="empty-ttl">No updates yet</div>
+              <div class="empty-desc">Check back later</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-ttl">New Models</span>
+          </div>
+          <div id="newModelsList">
+            <div class="browser-empty">Checking…</div>
           </div>
         </div>
       </section>
