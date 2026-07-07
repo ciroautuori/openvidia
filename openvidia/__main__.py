@@ -93,16 +93,27 @@ def _setup_opencode():
         return False
 
     providers = cfg.setdefault("provider", {})
-    if "openvidia" in providers:
-        print("✓ OpenVidia provider already configured in opencode")
-        return True
+    changed = False
 
-    providers.update(OPENCODE_PROVIDER)
-    # Write back atomically
-    tmp = oc_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cfg, indent=2))
-    tmp.rename(oc_path)
-    print(f"✓ Added OpenVidia provider to opencode ({len(OPENCODE_MODELS)} models)")
+    # Remove orphan nvidia provider if it points to localhost (duplicate)
+    nv = providers.get("nvidia", {})
+    if isinstance(nv, dict) and nv.get("options", {}).get("baseURL", "").startswith("http://localhost"):
+        del providers["nvidia"]
+        changed = True
+        print("✓ Removed orphan nvidia provider (duplicate of openvidia)")
+
+    if "openvidia" not in providers:
+        providers.update(OPENCODE_PROVIDER)
+        changed = True
+        print(f"✓ Added OpenVidia provider ({len(OPENCODE_MODELS)} models)")
+
+    if changed:
+        tmp = oc_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, indent=2))
+        tmp.rename(oc_path)
+
+    if "openvidia" in providers:
+        print("✓ OpenVidia provider ready in opencode")
     print(f"  → http://localhost:{PORT}/v1")
     return True
 
