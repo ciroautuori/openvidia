@@ -412,6 +412,92 @@ header {
   border-color: var(--accent);
 }
 
+/* ── Model Browser ─────────────────────────── */
+.model-browser {
+  margin-top: -4px;
+}
+
+.model-search {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  background: rgba(0,0,0,0.2);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 0.72rem;
+  outline: none;
+  margin-bottom: var(--space-sm);
+  transition: border-color var(--duration-fast) var(--ease-out);
+}
+
+[data-theme="light"] .model-search {
+  background: rgba(0,0,0,0.02);
+}
+
+.model-search::placeholder {
+  color: var(--text-muted);
+}
+
+.model-search:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(124, 92, 252, 0.15);
+}
+
+.model-list {
+  max-height: 280px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.model-list-empty {
+  text-align: center;
+  padding: var(--space-xl);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.model-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--duration-fast) var(--ease-out);
+  gap: var(--space-sm);
+}
+
+.model-item:hover {
+  background: var(--surface-hover);
+}
+
+.model-item.active {
+  background: var(--accent-soft);
+  border-left: 2px solid var(--accent);
+}
+
+.model-item-name {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-item.active .model-item-name {
+  color: var(--accent);
+}
+
+.model-item-owner {
+  font-size: 0.6rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
 /* ── Usage Example ──────────────────────────── */
 .usage-example {
   margin-top: -4px;

@@ -119,6 +119,19 @@
 
         <div class="card">
           <div class="card-header">
+            <span class="card-title">Available Models</span>
+            <span class="card-badge" id="modelCount">0</span>
+          </div>
+          <div class="model-browser" id="modelBrowser">
+            <input type="text" class="model-search" id="modelSearch" placeholder="Search models…" spellcheck="false" />
+            <div class="model-list" id="modelList">
+              <div class="model-list-empty">Loading…</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
             <span class="card-title">Usage Example</span>
           </div>
           <div class="usage-example" id="usageExample">

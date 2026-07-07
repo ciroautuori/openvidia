@@ -36,6 +36,10 @@ const modelStatusS = $('modelStatusS')
 const usageCode = $('usageCode')
 const themeDark = $('themeDark')
 const themeLight = $('themeLight')
+const modelBrowser = $('modelBrowser')
+const modelList = $('modelList')
+const modelSearch = $('modelSearch')
+const modelCount = $('modelCount')
 
 /* ── API helper ─────────────────────────────── */
 async function api(method, path, body) {
@@ -103,8 +107,9 @@ async function pollStats() {
 /* ── Model Presets ──────────────────────────── */
 const PRESETS = [
   { id: '', label: 'Passthrough' },
-  { id: 'deepseek-ai/deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
+  { id: 'z-ai/glm-5.2', label: 'GLM 5.2' },
   { id: 'deepseek-ai/deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
+  { id: 'minimaxai/minimax-m3', label: 'MiniMax M3' },
 ]
 
 let activeModel = ''
@@ -142,12 +147,56 @@ async function loadModel() {
   } catch (_) {}
 }
 
+/* ── Model Browser ─────────────────────────── */
+let allModels = []
+
+async function fetchModels() {
+  try {
+    const r = await fetch('/v1/models')
+    if (!r.ok) throw new Error(r.statusText)
+    const d = await r.json()
+    allModels = (d.data || []).map(m => ({ id: m.id, owned_by: m.owned_by || '' }))
+    modelCount.textContent = allModels.length
+    renderModelList()
+  } catch (_) {
+    modelList.innerHTML = '<div class="model-list-empty">Failed to load models</div>'
+  }
+}
+
+function renderModelList() {
+  const q = (modelSearch.value || '').toLowerCase()
+  const filtered = q ? allModels.filter(m => m.id.toLowerCase().includes(q)) : allModels
+  if (!filtered.length) {
+    modelList.innerHTML = '<div class="model-list-empty">No models found</div>'
+    return
+  }
+  modelList.innerHTML = ''
+  filtered.forEach(m => {
+    const item = document.createElement('div')
+    item.className = `model-item ${m.id === activeModel ? 'active' : ''}`
+    const name = document.createElement('span')
+    name.className = 'model-item-name'
+    name.textContent = m.id
+    item.appendChild(name)
+    if (m.owned_by) {
+      const own = document.createElement('span')
+      own.className = 'model-item-owner'
+      own.textContent = m.owned_by
+      item.appendChild(own)
+    }
+    item.addEventListener('click', () => setModel(m.id))
+    modelList.appendChild(item)
+  })
+}
+
+modelSearch.addEventListener('input', renderModelList)
+
 /* ── Usage Example ──────────────────────────── */
 const USAGE_EXAMPLES = {
   curl: `curl http://localhost:3940/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -d '{
-    "model": "deepseek-ai/deepseek-v4-flash",
+    "model": "z-ai/glm-5.2",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'`,
   python: `from openai import OpenAI
@@ -158,7 +207,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="deepseek-ai/deepseek-v4-flash",
+    model="z-ai/glm-5.2",
     messages=[{"role": "user", "content": "Hello!"}]
 )
 print(response.choices[0].message.content)`,
@@ -166,7 +215,7 @@ print(response.choices[0].message.content)`,
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
-    model: "deepseek-ai/deepseek-v4-flash",
+    model: "z-ai/glm-5.2",
     messages: [{ role: "user", content: "Hello!" }]
   })
 })
@@ -346,6 +395,7 @@ evtSource.onmessage = (e) => {
     toast(`Proxy running on :${st.port}`, 'ok')
   } catch (_) {}
   await loadModel()
+  await fetchModels()
 
   if (keyStatsInterval) clearInterval(keyStatsInterval)
   keyStatsInterval = setInterval(pollKeyStats, 2000)
