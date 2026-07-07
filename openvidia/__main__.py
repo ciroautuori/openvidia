@@ -145,13 +145,31 @@ async def main_async():
     except asyncio.CancelledError:
         pass
     finally:
-        await srv.shutdown()
+        if srv:
+            await srv.shutdown()
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "setup":
-        _setup_cmd()
-    asyncio.run(main_async())
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "setup":
+            _setup_cmd()
+        if sys.argv[1] == "foreground":
+            # Called by daemonized child — run in foreground
+            asyncio.run(main_async())
+            return
+
+    # Daemon mode — spawn in background, no terminal output
+    import subprocess as _sp
+    import time as _time
+    _kill_stale_port(PORT)
+    _sp.Popen(
+        [sys.executable, "-m", "openvidia", "foreground"],
+        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+        stdin=_sp.DEVNULL,
+    )
+    _time.sleep(1.5)
+    from .webui import auto_open
+    auto_open(PORT)
 
 
 if __name__ == "__main__":

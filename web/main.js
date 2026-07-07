@@ -71,8 +71,44 @@ function applyTheme(t) {
 $('themeToggle').addEventListener('click', () => applyTheme(theme === 'dark' ? 'light' : 'dark'))
 applyTheme(theme)
 
+/* ── Running State ──────────────────────────── */
+async function updateRunningState() {
+  try {
+    const st = await api('GET', '/api/status')
+    const running = st.running
+    $('statusText').textContent = running ? 'Running' : 'Stopped'
+    $('statusDot').querySelector('.pulse-dot').className = `pulse-dot ${running ? 'running' : ''}`
+    $('stopBtn').style.display = running ? '' : 'none'
+    $('startBtn').style.display = running ? 'none' : ''
+    $('stopBtn').disabled = false
+    $('startBtn').disabled = false
+  } catch (_) {
+    $('statusText').textContent = 'Offline'
+    $('statusDot').querySelector('.pulse-dot').className = 'pulse-dot'
+  }
+}
+
+$('stopBtn').addEventListener('click', async () => {
+  $('stopBtn').disabled = true
+  try {
+    await api('POST', '/api/stop')
+    toast('Proxy stopped', 'warn')
+    await updateRunningState()
+  } catch (_) { toast('Stop failed', 'error') }
+  $('stopBtn').disabled = false
+})
+
+$('startBtn').addEventListener('click', async () => {
+  $('startBtn').disabled = true
+  try {
+    await api('POST', '/api/start')
+    toast('Proxy started', 'ok')
+    await updateRunningState()
+  } catch (_) { toast('Start failed', 'error') }
+  $('startBtn').disabled = false
+})
+
 /* ── Stats ──────────────────────────────────── */
-$('statusText').textContent = 'Running'
 $('portDisplay').textContent = '3940'
 statsInterval = setInterval(async () => {
   try {
@@ -80,8 +116,9 @@ statsInterval = setInterval(async () => {
     $('statReqs').textContent = s.requests
     $('statRots').textContent = s.rotations
     $('statOk').textContent = s.success
+    await updateRunningState()
   } catch (_) {}
-}, 1000)
+}, 2000)
 
 /* ── Model Presets (Home) ───────────────────── */
 async function loadPresets() {
@@ -420,10 +457,7 @@ new EventSource('/api/logs/stream').onmessage = e => {
     keys = data.keys; renderKeys()
     if (keys.length) toast(`Loaded ${keys.length} keys`, 'ok')
   } catch (_) {}
-  try {
-    const st = await api('GET', '/api/status')
-    toast(`Proxy :${st.port}`, 'ok')
-  } catch (_) {}
+  await updateRunningState()
   await loadModel()
   await loadPresets()
   await fetchModels()

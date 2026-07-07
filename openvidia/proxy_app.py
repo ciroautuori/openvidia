@@ -80,6 +80,9 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
     @app.api_route("/v1/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def proxy_handler(full_path: str, request: Request):
+        if not state.running:
+            return JSONResponse({"error": "proxy stopped"}, status_code=503)
+
         state.stats.requests += 1
 
         body = await request.body()

@@ -61,6 +61,7 @@ class ProxyState:
         self._log_cb = log_cb
         self.on_key_failed: Optional[Callable[[str], None]] = None
         self.active_model: Optional[str] = None
+        self.running: bool = True
 
     def log_cb(self, msg: str) -> None:
         self._log_cb(msg)

@@ -35,7 +35,7 @@
               <span class="status-meta">Port <strong id="portDisplay">3940</strong> · <strong id="activeModelDisplay">none</strong></span>
             </div>
           </div>
-          <div class="status-bar-right">
+          <div class="status-bar-right" style="display:flex;align-items:center;gap:8px">
             <div class="stat-chip">
               <span><span class="stat-num" id="statReqs">0</span> req</span>
               <span class="stat-div"></span>
@@ -43,6 +43,8 @@
               <span class="stat-div"></span>
               <span class="stat-ok"><span class="stat-num" id="statOk">0</span> ok</span>
             </div>
+            <button class="btn btn-sm" id="stopBtn" title="Stop proxy">⏹</button>
+            <button class="btn btn-sm" id="startBtn" title="Start proxy" style="display:none">▶</button>
           </div>
         </div>
 

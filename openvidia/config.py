@@ -68,6 +68,30 @@ def save_presets_file(presets: list) -> None:
     atomic_write(presets_path(), json.dumps(presets, indent=2))
 
 
+def stop_flag_path() -> Path:
+    return config_dir() / "stop"
+
+
+def save_stop_flag() -> None:
+    atomic_write(stop_flag_path(), "1")
+
+
+def check_stop_flag() -> bool:
+    p = stop_flag_path()
+    if p.exists():
+        try:
+            return p.read_text().strip() == "1"
+        except OSError:
+            return False
+    return False
+
+
+def clear_stop_flag() -> None:
+    p = stop_flag_path()
+    if p.exists():
+        p.unlink()
+
+
 def active_model_path() -> Path:
     return config_dir() / "active_model"
 

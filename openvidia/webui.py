@@ -42,7 +42,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
 
     @app.get("/api/status")
     async def api_status():
-        return {"running": True, "port": state.port}
+        return {"running": state.running, "port": state.port}
 
     @app.get("/api/stats")
     async def api_stats():
@@ -100,6 +100,18 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         state.active_model = m
         config.save_active_model(m or "")
         return {"ok": True, "model": m or ""}
+
+    @app.post("/api/stop")
+    async def api_stop():
+        state.running = False
+        config.save_stop_flag()
+        return {"ok": True, "status": "stopped"}
+
+    @app.post("/api/start")
+    async def api_start():
+        state.running = True
+        config.clear_stop_flag()
+        return {"ok": True, "status": "running"}
 
     @app.post("/api/restart")
     async def api_restart():
