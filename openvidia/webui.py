@@ -106,13 +106,13 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         import os as _os
         import signal as _signal
         import subprocess as _sp
-        # Schedule kill + restart in a thread to not block response
+        # Spawn the new process first, then kill the old one
         def _do_restart():
             import time as _time
             _time.sleep(0.3)
-            _os.kill(_os.getpid(), _signal.SIGTERM)
+            _sp.Popen([sys.executable, "-m", "openvidia"] + sys.argv[1:])
             _time.sleep(0.5)
-            _sp.Popen([sys.executable, "-m", "openvidia"])
+            _os.kill(_os.getpid(), _signal.SIGKILL)
         threading.Thread(target=_do_restart, daemon=True).start()
         return {"ok": True, "restarting": True}
 

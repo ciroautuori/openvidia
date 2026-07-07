@@ -28,15 +28,23 @@ PORT = 3940
 
 
 def _kill_stale_port(port: int):
+    import time as _time
+    # Try fuser -k first (SIGKILL)
     try:
-        out = subprocess.check_output(
+        subprocess.run(
             ["fuser", "-k", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=5
         )
-        # fuser -k sends SIGKILL directly, but also wait a moment
-        import time as _time
-        _time.sleep(0.5)
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         pass
+    # Wait until port is free (max 3s)
+    for _ in range(30):
+        try:
+            subprocess.check_output(
+                ["fuser", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=2
+            )
+            _time.sleep(0.1)
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            return  # port free
 
 
 def _extract_keys_from_accounts() -> list:
