@@ -127,7 +127,6 @@ Official NVIDIA logo in the web UI header (replaces placeholder icon). Also disp
 - **Start/Stop/Restart** — control proxy state without killing the web UI
 - **News feed** — Discourse API scraper for NVIDIA NIM updates (1h cache)
 - **NVIDIA brand colors** — official `#76B900` green, dark/light theme toggle
-- **Degraded model fallback** — detects unavailable models and suggests alternatives in error messages
 - **Health check** — `GET /health`
 - **Lightweight** — FastAPI + httpx, single process, no external dependencies
 
@@ -140,25 +139,6 @@ Add keys via the web UI (Keys tab) or edit `~/.config/openvidia/keys.json`:
 ```
 
 If you have `accounts.json` from a previous version, keys are auto-extracted on first start.
-
-### Known model status
-
-| Model | Status |
-|-------|--------|
-| `deepseek-ai/deepseek-v4-flash` | ✅ Works |
-| `deepseek-ai/deepseek-v4-pro` | ✅ Works (slower) |
-| `minimaxai/minimax-m3` | ✅ Works |
-| `moonshotai/kimi-k2.6` | ✅ Works |
-| `z-ai/glm-5.2` | ❌ `DEGRADED` (NVIDIA server-side, see [forum](https://forums.developer.nvidia.com/t/model-glm-5-2-showing-error-400/375867)) |
-
-### Degraded model fallback
-
-When GLM-5.2 or Kimi K2.6 return a 400 error, the proxy automatically suggests the recommended fallback in the error message:
-
-| Model | Fallback |
-|-------|----------|
-| `z-ai/glm-5.2` | `deepseek-ai/deepseek-v4-pro` |
-| `moonshotai/kimi-k2.6` | `deepseek-ai/deepseek-v4-flash` |
 
 ## systemd (optional)
 
@@ -177,10 +157,5 @@ systemctl --user enable --now openvidia
 | `~/.config/openvidia/index` | Key rotation index |
 | `~/.config/openvidia/accounts.json` | Legacy accounts (auto-extracted to keys.json) |
 | `~/.config/openvidia/news_cache.json` | News feed cache (1h TTL) |
-
-## Project
-
-- **`main`** — Python (FastAPI), actively maintained
-- **`rust`**, **`python`** — legacy branches, no longer maintained
 
 Built with [FastAPI](https://fastapi.tiangolo.com/), [httpx](https://www.python-httpx.org/), [uvicorn](https://www.uvicorn.org/).
