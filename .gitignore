@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 openvidia.egg-info/
 .venv/
+.env
+.env.local
+.next
+node_modules
+web/src-tauri/target
+web/src-tauri/icons/ios/
+web/src-tauri/icons/android/
+web/src-tauri/icons/StoreLogo.png
+web/src-tauri/icons/Square*.png

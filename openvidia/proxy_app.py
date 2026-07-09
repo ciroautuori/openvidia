@@ -4,8 +4,10 @@ The actual reverse proxy: catch-all route, key rotation, streaming passthrough.
 Direct port of proxy.rs's proxy_handler. Upstream is NVIDIA NIM only
 (https://integrate.api.nvidia.com) — no Z.ai routing, by design (see chat).
 """
+import asyncio
 import json
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -35,6 +37,49 @@ DEGRADED_MODELS = {
     "z-ai/glm-5.2": "deepseek-ai/deepseek-v4-pro",
     "moonshotai/kimi-k2.6": "deepseek-ai/deepseek-v4-flash",
 }
+
+
+async def _check_key_health(client: httpx.AsyncClient, key: str) -> bool:
+    headers = {"Authorization": f"Bearer {key}", "User-Agent": "openvidia/2.0"}
+    try:
+        req = client.build_request("GET", UPSTREAM_BASE + "models", headers=headers)
+        resp = await client.send(req)
+        ok = resp.is_success
+        await resp.aclose()
+        return ok
+    except httpx.HTTPError:
+        return False
+
+
+async def _health_check_all(state: ProxyState, client: httpx.AsyncClient, force: bool = False) -> None:
+    revived = 0
+    for key in state.keys:
+        if not force and not state.is_key_on_cooldown(key):
+            continue  # already healthy — skip
+        healthy = await _check_key_health(client, key)
+        if healthy:
+            state.clear_cooldown(key)
+            revived += 1
+        elif not force:
+            pass  # keep existing cooldown
+        else:
+            state.mark_key_failed(key)  # first-time check failed
+    n_unhealthy = sum(1 for k in state.keys if state.is_key_on_cooldown(k))
+    all_ok = len(state.keys) - n_unhealthy
+    state.log_cb(
+        f"⚕ health: {all_ok}/{len(state.keys)} OK"
+        + (f", {n_unhealthy} on cooldown" if n_unhealthy else "")
+        + (f", {revived} revived" if revived else "")
+    )
+
+
+async def _background_health_check(state: ProxyState, client: httpx.AsyncClient) -> None:
+    try:
+        while True:
+            await asyncio.sleep(30)
+            await _health_check_all(state, client)
+    except asyncio.CancelledError:
+        pass
 
 
 class BodyLimitMiddleware(BaseHTTPMiddleware):
@@ -71,11 +116,25 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         from .webui import attach_webui
         attach_webui(app, state, web_dir)
 
-    client = httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=120.0, write=120.0, pool=120.0))
+    client = httpx.AsyncClient(
+        http2=True,
+        timeout=httpx.Timeout(connect=3.0, read=30.0, write=30.0, pool=30.0),
+    )
     app.state.http_client = client
+
+    @app.on_event("startup")
+    async def _start_background_tasks():
+        async def _pre_warm():
+            state.log_cb("⚕ pre-warm: checking all keys...")
+            await _health_check_all(state, client, force=True)
+            state.log_cb(f"⚕ pre-warm done ({sum(1 for k in state.keys if state.is_key_healthy(k))}/{len(state.keys)} healthy)")
+        asyncio.create_task(_pre_warm())
+        state.health_task = asyncio.create_task(_background_health_check(state, client))
 
     @app.on_event("shutdown")
     async def _close_client():
+        if state.health_task is not None:
+            state.health_task.cancel()
         await client.aclose()
 
     @app.api_route("/v1/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
@@ -98,6 +157,9 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             if isinstance(m, str) and m != "openvidia":
                 payload["model"] = m
                 body = json.dumps(payload).encode()
+            elif m == "openvidia":
+                payload["model"] = "deepseek-ai/deepseek-v4-pro"
+                body = json.dumps(payload).encode()
 
         async with state.lock:
             keys = list(state.keys)
@@ -117,6 +179,11 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         for offset in range(len(keys)):
             i = (start + offset) % len(keys)
             key = keys[i]
+            if not state.is_key_healthy(key):
+                continue
+            if not state.key_can_send_rpm(key):
+                state.log_cb(f"  key[{i}] RPM saturated ({state.key_rpm(key)}/min), skip")
+                continue
             headers = {
                 "Authorization": f"Bearer {key}",
                 "User-Agent": "openvidia/2.0",
@@ -134,6 +201,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             except httpx.HTTPError as e:
                 state.log_cb(f"key[{i}] error: {e}")
                 state.stats.record_key_usage(key, ok=False, error=str(e))
+                state.mark_key_failed(key)  # network error → cooldown
                 state.stats.rotations += 1
                 persist_index(state, (i + 1) % len(keys))
                 continue
@@ -143,6 +211,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             if 200 <= status < 300:
                 state.stats.success += 1
                 state.stats.record_key_usage(key, ok=True)
+                state.record_request(key)
                 persist_index(state, i)
                 if nv_path != "models":
                     state.log_cb(f"✔ key[{i}] OK")
@@ -172,8 +241,8 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
             if should_rotate(status):
                 state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
-                if state.on_key_failed is not None:
-                    state.on_key_failed(key)
+                retry_after = resp.headers.get("retry-after")
+                state.mark_key_failed(key, status=status, retry_after=retry_after)
                 state.stats.rotations += 1
                 persist_index(state, (i + 1) % len(keys))
                 await resp.aclose()
@@ -187,18 +256,48 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 headers={"access-control-allow-origin": "*"},
             )
 
-        # All keys tried — return the real upstream status so the caller
-        # can distinguish a bad request (400) from rate-limiting (429) from
-        # credentials exhausted (401/403). No 503 masking: every rotatable
-        # status is a real signal, not a blanket "retry me".
-        msg = "all keys exhausted"
+        # All keys tried — degraded model fallback
         model_name = payload.get("model", "") if isinstance(payload, dict) else ""
-        if last_status == 400:
-            fallback = DEGRADED_MODELS.get(model_name, "")
-            if fallback:
-                msg += f" — {model_name} is UNAVAILABLE on NVIDIA, try {fallback} via UI presets"
-            else:
-                msg += f" — {model_name} may be UNAVAILABLE on NVIDIA"
+        fallback_model = DEGRADED_MODELS.get(model_name, "")
+
+        if fallback_model:
+            state.log_cb(f"↻ {model_name} failed on all keys — retry with {fallback_model}")
+            fb_body = json.dumps({**payload, "model": fallback_model}).encode()
+            for fb_key in keys:
+                hdrs = {
+                    "Authorization": f"Bearer {fb_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "openvidia/2.0",
+                }
+                try:
+                    fb_client = httpx.AsyncClient(http2=True, timeout=httpx.Timeout(30.0))
+                    req = fb_client.build_request("POST", url, content=fb_body, headers=hdrs)
+                    fb_resp = await fb_client.send(req)
+                    if fb_resp.is_success:
+                        state.log_cb(f"✔ fallback → {fallback_model}")
+                        state.record_request(fb_key)
+                        fb_body_raw = await fb_resp.aread()
+                        persist_index(state, (keys.index(fb_key) + 1) % len(keys))
+                        await fb_resp.aclose()
+                        await fb_client.aclose()
+                        fb_data = json.loads(fb_body_raw)
+                        fb_data["model"] = fallback_model
+                        return JSONResponse(content=fb_data, headers={"access-control-allow-origin": "*"})
+                    fb_body_raw = await fb_resp.aread()
+                    await fb_resp.aclose()
+                    await fb_client.aclose()
+                    if fb_resp.status_code == 429:
+                        continue
+                    state.log_cb(f"✗ fallback HTTP {fb_resp.status_code}")
+                    break
+                except Exception as e:
+                    err_msg = str(e) or type(e).__name__
+                    state.log_cb(f"  ⏳ fallback key error: {err_msg}, trying next...")
+                    continue
+
+        msg = "all keys exhausted"
+        if fallback_model:
+            msg += f" — {model_name} failed, fallback to {fallback_model} also failed"
         return JSONResponse(
             {"error": msg, "last_upstream_status": last_status},
             status_code=last_status,

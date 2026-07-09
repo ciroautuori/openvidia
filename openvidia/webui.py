@@ -9,7 +9,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 
 from . import config
 from .proxy_state import ProxyState
@@ -56,16 +56,51 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
 
     @app.get("/api/status")
     async def api_status():
-        return {"running": state.running, "port": state.port}
+        async with state.lock:
+            on_cooldown = sum(1 for k in state.keys if state.is_key_on_cooldown(k))
+        return {
+            "running": state.running,
+            "port": state.port,
+            "keys": len(state.keys),
+            "cooldowns": on_cooldown,
+        }
 
     @app.get("/api/stats")
     async def api_stats():
+        async with state.lock:
+            on_cooldown = sum(1 for k in state.keys if state.is_key_on_cooldown(k))
+            total_rpm = sum(state.key_rpm(k) for k in state.keys)
         return {
             "requests": state.stats.requests,
             "rotations": state.stats.rotations,
             "success": state.stats.success,
             "active_index": state.stats.active_key_index,
+            "cooldowns": on_cooldown,
+            "total_rpm": total_rpm,
         }
+
+    @app.get("/api/accounts")
+    async def api_get_accounts():
+        keys = list(state.keys)
+        accounts = [{"name": "Default", "keys": keys}]
+        return {"accounts": accounts, "active_account": ""}
+
+    @app.post("/api/accounts")
+    async def api_save_accounts(request: Request):
+        body = await request.json()
+        accounts = body.get("accounts", [])
+        keys = []
+        for acct in accounts:
+            keys.extend(acct.get("keys", []))
+        async with state.lock:
+            state.keys = list(keys)
+        config.save_keys_file(keys)
+        return {"ok": True}
+
+    @app.post("/api/accounts/active")
+    async def api_set_active_account(request: Request):
+        body = await request.json()
+        return {"ok": True}
 
     @app.get("/api/keys")
     async def api_get_keys():
@@ -81,6 +116,32 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         config.save_keys_file(keys)
         return {"ok": True}
 
+    @app.post("/api/keys/add")
+    async def api_add_key(request: Request):
+        body = await request.json()
+        key = body.get("key", "")
+        if not key:
+            return {"ok": False, "error": "key required"}
+        async with state.lock:
+            state.keys.append(key)
+            keys = list(state.keys)
+        config.save_keys_file(keys)
+        return {"ok": True, "keys": keys}
+
+    @app.post("/api/keys/remove")
+    async def api_remove_key(request: Request):
+        body = await request.json()
+        idx = body.get("index")
+        key = body.get("key", "")
+        async with state.lock:
+            if idx is not None and 0 <= idx < len(state.keys):
+                state.keys.pop(idx)
+            elif key:
+                state.keys = [k for k in state.keys if k != key]
+            keys = list(state.keys)
+        config.save_keys_file(keys)
+        return {"ok": True, "keys": keys}
+
     @app.get("/api/keys/stats")
     async def api_key_stats():
         async with state.lock:
@@ -88,8 +149,9 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
             now = time.time()
             for i, k in enumerate(state.keys):
                 u = state.stats.key_usage.get(k)
+                entry = {}
                 if u:
-                    stats[str(i)] = {
+                    entry.update({
                         "requests": u.requests,
                         "success": u.success,
                         "failed": u.failed,
@@ -97,7 +159,13 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
                         "last_error": u.last_error,
                         "freshness": "fresh" if (now - u.last_used) < 120 else
                                      "stale" if u.last_used > 0 else "unused",
-                    }
+                    })
+                # Cooldown / RPM
+                cd_rem = state.cooldown_remaining(k)
+                entry["cooldown"] = round(cd_rem, 1) if cd_rem > 0 else 0
+                entry["cooldown_reason"] = state.cooldown_reason(k) if cd_rem > 0 else ""
+                entry["rpm"] = state.key_rpm(k)
+                stats[str(i)] = entry
             return {
                 "active_index": state.stats.active_key_index,
                 "key_stats": stats,

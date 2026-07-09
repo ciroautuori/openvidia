@@ -33,16 +33,18 @@
             <span class="indicator-dot" id="statusDot"><span class="pulse-dot running"></span></span>
             <div class="status-info">
               <span class="status-label" id="statusText">Running</span>
-              <span class="status-meta">Port <strong id="portDisplay">3940</strong> · <strong id="activeModelDisplay">none</strong></span>
+              <span class="status-meta">Port <strong id="portDisplay">1919</strong> · <strong id="activeModelDisplay">none</strong></span>
             </div>
           </div>
           <div class="status-bar-right" style="display:flex;align-items:center;gap:8px">
-            <div class="stat-chip">
+            <div class="stat-chip" id="statsChip">
               <span><span class="stat-num" id="statReqs">0</span> req</span>
               <span class="stat-div"></span>
               <span><span class="stat-num" id="statRots">0</span> rot</span>
               <span class="stat-div"></span>
               <span class="stat-ok"><span class="stat-num" id="statOk">0</span> ok</span>
+              <span class="stat-div"></span>
+              <span title="Keys on cooldown"><span class="stat-num" id="statCooldowns">0</span> ⏳</span>
             </div>
             <button class="btn btn-sm" id="stopBtn" title="Stop proxy">⏹</button>
             <button class="btn btn-sm" id="startBtn" title="Start proxy" style="display:none">▶</button>
@@ -79,6 +81,12 @@
             <span class="card-ttl">API Keys</span>
             <span class="card-badge" id="keyCount">0</span>
           </div>
+          <div class="account-bar">
+            <span class="account-label">Account:</span>
+            <select id="accountSelect" class="account-select"></select>
+            <button class="btn btn-sm" id="addAccountBtn" title="Add account">+</button>
+          </div>
+          <div id="accountManager" class="acct-manager"></div>
           <div class="empty-state" id="keysEmpty">
             <div class="empty-icon">
               <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
@@ -96,6 +104,7 @@
           <div class="slide-form hidden" id="keyAddForm">
             <div class="slide-form-body">
               <input type="text" id="newKeyInput" spellcheck="false" placeholder="nvapi-…" autocomplete="off" />
+              <select id="keyAccountSelect" class="key-account-select"></select>
             </div>
             <div class="slide-form-actions">
               <button class="btn btn-primary" id="confirmAddKeyBtn">Add</button>

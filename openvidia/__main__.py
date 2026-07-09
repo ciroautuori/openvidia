@@ -5,11 +5,11 @@ Install:
     pip install -e .
 
 Usage:
-    openvidia              # start proxy
+    openvidia              # start proxy + desktop UI
     openvidia setup        # configure opencode provider
 
-Edit keys via web UI at http://localhost:3940
-Or edit ~/.config/openvidia/keys.json and restart.
+Dashboard + API at http://localhost:1919
+Edit keys via ~/.config/openvidia/keys.json or dashboard Keys tab.
 Keys auto-extracted from accounts.json if keys.json is empty.
 """
 import asyncio
@@ -24,19 +24,17 @@ from . import config
 from .proxy_state import ProxyStats
 from .server_manager import start
 
-PORT = 3940
+PORT = 1919
 
 
 def _kill_stale_port(port: int):
     import time as _time
-    # Try fuser -k first (SIGKILL)
     try:
         subprocess.run(
             ["fuser", "-k", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=5
         )
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         pass
-    # Wait until port is free (max 3s)
     for _ in range(30):
         try:
             subprocess.check_output(
@@ -44,7 +42,7 @@ def _kill_stale_port(port: int):
             )
             _time.sleep(0.1)
         except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-            return  # port free
+            return
 
 
 def _extract_keys_from_accounts() -> list:
@@ -75,12 +73,14 @@ def _setup_opencode():
         print(f"✗ Invalid opencode config at {oc_path}")
         return False
 
+    changed = False
     providers = cfg.setdefault("provider", {})
 
     # Remove orphan nvidia provider if it points to localhost
     nv = providers.get("nvidia", {})
     if isinstance(nv, dict) and nv.get("options", {}).get("baseURL", "").startswith("http://localhost"):
         del providers["nvidia"]
+        changed = True
 
     if "openvidia" not in providers:
         providers["openvidia"] = {
@@ -91,21 +91,51 @@ def _setup_opencode():
                 "baseURL": f"http://localhost:{PORT}/v1",
             },
         }
-        tmp = oc_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(cfg, indent=2))
-        tmp.rename(oc_path)
+        changed = True
         print(f"✓ Added OpenVidia provider to opencode")
     else:
         ov = providers["openvidia"]
         m = ov.setdefault("models", {})
         if "openvidia" not in m:
             m["openvidia"] = {"name": "OpenVidia", "tools": True}
-            tmp = oc_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(cfg, indent=2))
-            tmp.rename(oc_path)
+            changed = True
             print(f"✓ Added OpenVidia model to opencode provider")
 
+    # Compaction auto per modelli NVIDIA (contesto più piccolo di Claude)
+    comp = cfg.get("compaction")
+    if not isinstance(comp, dict) or not comp.get("auto") or not comp.get("prune"):
+        cfg["compaction"] = {"auto": True, "prune": True, "reserved": 8000}
+        changed = True
+        print(f"✓ Enabled auto-compaction (prune=true, reserved=8000)")
+
+    # Modello predefinito → openvidia/openvidia (provider/model_id)
+    if cfg.get("model") != "openvidia/openvidia":
+        cfg["model"] = "openvidia/openvidia"
+        changed = True
+        print(f"✓ Default model set to openvidia/openvidia")
+
+    # Small model per task leggeri (titoli, etc.) — stesso provider
+    if not cfg.get("small_model"):
+        cfg["small_model"] = "openvidia/openvidia"
+        changed = True
+        print(f"✓ Small model set to openvidia/openvidia")
+
+    # Instructions: punta ad AGENTS.md se esiste nel progetto
+    agents_md = Path.cwd() / "AGENTS.md"
+    if agents_md.exists():
+        instr = cfg.get("instructions", [])
+        if "AGENTS.md" not in instr:
+            cfg["instructions"] = ["AGENTS.md"] + instr
+            changed = True
+            print(f"✓ Instructions → AGENTS.md")
+
+    if changed:
+        tmp = oc_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, indent=2))
+        tmp.rename(oc_path)
+
     print(f"✓ OpenVidia provider ready → http://localhost:{PORT}/v1")
+    print(f"✓ Dashboard at http://localhost:{PORT}")
     return True
 
 
@@ -136,6 +166,7 @@ async def main_async():
     web_dir = Path(__file__).resolve().parent.parent / "web"
     srv = await start(PORT, keys, log, stats, config.index_path(), web_dir=web_dir, initial_model=saved_model)
     print(f"● OpenVidia running on :{PORT} ({len(keys)} keys)")
+
     from .webui import auto_open
     auto_open(PORT)
 
@@ -154,20 +185,21 @@ def main():
         if sys.argv[1] == "setup":
             _setup_cmd()
         if sys.argv[1] == "foreground":
-            # Called by daemonized child — run in foreground
             asyncio.run(main_async())
             return
 
-    # Daemon mode — spawn in background, no terminal output
+    # Daemon mode — spawn proxy in background
     import subprocess as _sp
     import time as _time
     _kill_stale_port(PORT)
+
     _sp.Popen(
         [sys.executable, "-m", "openvidia", "foreground"],
         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
         stdin=_sp.DEVNULL,
     )
-    _time.sleep(1.5)
+
+    _time.sleep(2)
     from .webui import auto_open
     auto_open(PORT)
 

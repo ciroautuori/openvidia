@@ -99,9 +99,13 @@ header{display:flex;align-items:center;gap:12px}
 
 .stat-chip{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:.62rem;color:var(--text3);background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:100px;padding:3px 12px}
 [data-theme="light"] .stat-chip{background:rgba(0,0,0,.02)}
+.stat-chip.warn{border-color:var(--amber)}
 .stat-div{width:1px;height:10px;background:var(--border)}
 .stat-num{color:var(--text2);font-weight:500}
 .stat-ok .stat-num{color:var(--green)}
+.stat-warn{color:var(--amber)}
+@keyframes blink-warn{0%,100%{opacity:1}50%{opacity:.4}}
+.stat-blink{animation:blink-warn 1.2s ease-in-out infinite}
 
 /* ── Log ────────────────────────────────────── */
 .log-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--text3);margin-right:6px;vertical-align:middle;transition:background .18s}
@@ -250,6 +254,20 @@ header{display:flex;align-items:center;gap:12px}
 .tab-content.active{display:flex}
 .tab-content.active>.card{animation:cardIn .3s ease}
 @keyframes cardIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+
+.account-bar{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);margin-bottom:8px}
+.acct-manager{border-bottom:1px solid var(--border);padding:4px 0 8px 0;margin-bottom:4px}
+.acct-row{display:flex;align-items:center;justify-content:space-between;padding:2px 4px;border-radius:4px;font-size:.6rem}
+.acct-row:hover{background:var(--hover)}
+.acct-name{color:var(--text2)}
+.acct-row .key-act{width:18px;height:18px}
+.acct-row .key-act svg{width:11px;height:11px}
+.account-label{font-size:.65rem;color:var(--text3);white-space:nowrap}
+.account-select,.key-account-select{background:rgba(0,0,0,.3);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:.65rem;outline:none;cursor:pointer;flex:1}
+[data-theme="light"] .account-select,[data-theme="light"] .key-account-select{background:rgba(0,0,0,.02)}
+.account-select:focus,.key-account-select:focus{border-color:var(--accent)}
+.key-account-select{margin-top:6px}
+.key-account-label{font-size:.55rem;color:var(--text3);background:var(--bg2);padding:1px 5px;border-radius:4px;white-space:nowrap;margin-left:4px}
 
 @media(max-width:600px){
   body{padding:12px}

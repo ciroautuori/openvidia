@@ -1,5 +1,7 @@
 let theme = localStorage.getItem('openvidia-theme') || 'dark'
 let keys = []
+let accounts = []
+let activeAccount = ''
 let activeModel = ''
 let allModels = []
 let presets = []
@@ -109,13 +111,23 @@ $('startBtn').addEventListener('click', async () => {
 })
 
 /* ── Stats ──────────────────────────────────── */
-$('portDisplay').textContent = '3940'
+$('portDisplay').textContent = '1919'
 statsInterval = setInterval(async () => {
   try {
     const s = await api('GET', '/api/stats')
     $('statReqs').textContent = s.requests
     $('statRots').textContent = s.rotations
     $('statOk').textContent = s.success
+    const cd = s.cooldowns || 0
+    $('statCooldowns').textContent = cd
+    const chip = $('statsChip')
+    if (cd > 0) {
+      chip.classList.add('warn')
+      $('statCooldowns').className = 'stat-num stat-warn stat-blink'
+    } else {
+      chip.classList.remove('warn')
+      $('statCooldowns').className = 'stat-num'
+    }
     await updateRunningState()
   } catch (_) {}
 }, 2000)
@@ -304,17 +316,17 @@ $('modelSearch').addEventListener('input', renderModelList)
 function renderUsage() {
   const m = activeModel || 'openvidia'
   const examples = {
-    curl: `curl http://localhost:3940/v1/chat/completions \\
+    curl: `curl http://localhost:1919/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -d '{"model":"${m}","messages":[{"role":"user","content":"Hello!"}]}'`,
     python: `from openai import OpenAI
-client = OpenAI(base_url="http://localhost:3940/v1", api_key="ignored")
+client = OpenAI(base_url="http://localhost:1919/v1", api_key="ignored")
 r = client.chat.completions.create(
     model="${m}",
     messages=[{"role":"user","content":"Hello!"}]
 )
 print(r.choices[0].message.content)`,
-    js: `const r = await fetch("http://localhost:3940/v1/chat/completions", {
+    js: `const r = await fetch("http://localhost:1919/v1/chat/completions", {
   method:"POST", headers:{"Content-Type":"application/json"},
   body: JSON.stringify({model:"${m}",
     messages:[{role:"user",content:"Hello!"}]})
@@ -334,7 +346,7 @@ document.querySelectorAll('.usage-tab').forEach(tab => {
   })
 })
 
-/* ── Keys ───────────────────────────────────── */
+/* ── Keys / Accounts ─────────────────────────── */
 function maskKey(k) { return k.length <= 14 ? k : `${k.slice(0, 8)}…${k.slice(-4)}` }
 function copyToClipboard(t) { navigator.clipboard.writeText(t).then(() => toast('Key copied', 'ok')).catch(() => {}) }
 function timeAgo(ts) {
@@ -343,6 +355,68 @@ function timeAgo(ts) {
   if (sec < 60) return `${sec}s`
   if (sec < 3600) return `${Math.floor(sec / 60)}m`
   return `${Math.floor(sec / 3600)}h`
+}
+
+function getCurrentAccountName() {
+  const sel = $('accountSelect')
+  return sel ? sel.value : activeAccount
+}
+
+function renderAccountSelect() {
+  const sel = $('accountSelect')
+  if (!sel) return
+  sel.innerHTML = ''
+  const allOpt = document.createElement('option')
+  allOpt.value = ''; allOpt.textContent = 'All accounts'
+  sel.appendChild(allOpt)
+  accounts.forEach(a => {
+    const opt = document.createElement('option')
+    opt.value = a.name
+    opt.textContent = `${a.name} (${(a.keys || []).length})`
+    sel.appendChild(opt)
+  })
+  sel.value = activeAccount
+
+  // Also populate keyAccountSelect
+  const kaSel = $('keyAccountSelect')
+  if (kaSel) {
+    kaSel.innerHTML = ''
+    accounts.forEach(a => {
+      const opt = document.createElement('option')
+      opt.value = a.name
+      opt.textContent = a.name
+      kaSel.appendChild(opt)
+    })
+    kaSel.value = activeAccount || (accounts.length ? accounts[0].name : 'default')
+  }
+
+  // Render account manager in the account bar
+  const mgr = $('accountManager')
+  if (!mgr) return
+  mgr.innerHTML = ''
+  accounts.forEach(a => {
+    const row = document.createElement('div')
+    row.className = 'acct-row'
+    const label = document.createElement('span')
+    label.className = 'acct-name'
+    label.textContent = `${a.name} (${(a.keys || []).length})`
+    row.appendChild(label)
+    const delBtn = document.createElement('button')
+    delBtn.className = 'key-act danger'
+    delBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'
+    delBtn.title = 'Delete account'
+    delBtn.onclick = () => deleteAccount(a.name)
+    row.appendChild(delBtn)
+    mgr.appendChild(row)
+  })
+}
+
+async function deleteAccount(name) {
+  if (!confirm(`Delete account "${name}" and all its keys?`)) return
+  accounts = accounts.filter(a => a.name !== name)
+  if (activeAccount === name) activeAccount = ''
+  await persistKeys()
+  toast(`Account "${name}" deleted`, 'warn')
 }
 
 function renderKeys(data) {
@@ -355,10 +429,15 @@ function renderKeys(data) {
   const sm = data ? data.key_stats || {} : {}
   keys.forEach((k, i) => {
     const s = sm[String(i)]
+    const isOnCooldown = s && s.cooldown > 0
     const row = document.createElement('div')
     row.className = `key-row ${i === ai ? 'active' : ''}`
     const dot = document.createElement('span')
-    dot.className = `key-dot key-${s ? s.freshness : 'unused'}`
+    let dotClass = 'stale'
+    if (isOnCooldown) dotClass = 'dead'
+    else if (s && s.success > 0) dotClass = 'fresh'
+    else if (s && s.requests > 0) dotClass = 'stale'
+    dot.className = `key-dot key-${dotClass}`
     row.appendChild(dot)
     const val = document.createElement('span')
     val.className = 'key-val'
@@ -366,19 +445,46 @@ function renderKeys(data) {
     val.title = k
     val.onclick = () => copyToClipboard(k)
     row.appendChild(val)
+    if (s && s.account) {
+      const acct = document.createElement('span')
+      acct.className = 'key-account-label'
+      acct.textContent = s.account
+      row.appendChild(acct)
+    }
     const acts = document.createElement('div')
     acts.className = 'key-acts'
-    if (i === ai) { const b = document.createElement('span'); b.className = 'key-badge'; b.textContent = 'active'; acts.appendChild(b) }
-    if (s && s.requests > 0) {
-      const info = document.createElement('span')
-      info.className = 'key-info'
-      info.textContent = `${s.success}✓ ${s.failed > 0 ? s.failed + '✗ ' : ''}${timeAgo(s.last_used)}`
+    const info = document.createElement('span')
+    info.className = 'key-info'
+    if (isOnCooldown) {
+      const sec = Math.ceil(s.cooldown)
+      info.textContent = `⏳ ${sec}s  ${s.cooldown_reason}`
+      info.title = s.cooldown_reason
+    } else if (s && s.requests > 0) {
+      info.textContent = `${s.success}✓ ${s.failed > 0 ? s.failed + '✗ ' : ''}${timeAgo(s.last_used)} · ${s.rpm} RPM`
       info.title = s.last_error || ''
-      acts.appendChild(info)
+    } else {
+      info.textContent = `idle · ${s && s.rpm || 0} RPM`
+      info.title = ''
     }
+    if (i === ai) {
+      const b = document.createElement('span')
+      b.className = 'key-badge'
+      b.textContent = isOnCooldown ? '⏳' : 'active'
+      acts.appendChild(b)
+    }
+    acts.appendChild(info)
     const copyB = document.createElement('button'); copyB.className = 'key-act'; copyB.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'; copyB.title = 'Copy'; copyB.onclick = () => copyToClipboard(k)
     acts.appendChild(copyB)
-    const delB = document.createElement('button'); delB.className = 'key-act danger'; delB.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'; delB.title = 'Remove'; delB.onclick = () => { keys.splice(i, 1); persistKeys(); toast('Key removed', 'warn') }
+    const delB = document.createElement('button'); delB.className = 'key-act danger'; delB.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'; delB.title = 'Remove'; delB.onclick = () => {
+      const acctName = s ? s.account : 'default'
+      const acct = accounts.find(a => a.name === acctName)
+      if (acct) {
+        acct.keys = acct.keys.filter(x => x !== k)
+        keys = keys.filter(x => x !== k)
+      }
+      persistKeys()
+      toast('Key removed', 'warn')
+    }
     acts.appendChild(delB)
     row.appendChild(acts)
     list.appendChild(row)
@@ -390,17 +496,80 @@ async function pollKeyStats() {
 }
 
 async function persistKeys() {
+  // Rebuild accounts from current state
+  const flat = []
+  accounts.forEach(a => { flat.push(...a.keys) })
+  keys = flat
+  renderAccountSelect()
   renderKeys(await api('GET', '/api/keys/stats').catch(() => null))
-  try { await api('POST', '/api/keys', { keys }) } catch (e) { toast(`Save failed: ${e.message}`, 'error') }
+  try {
+    await api('POST', '/api/accounts', { accounts })
+  } catch (e) { toast(`Save failed: ${e.message}`, 'error') }
 }
 
-$('addKeyBtn').addEventListener('click', () => { $('keyAddForm').classList.remove('hidden'); $('newKeyInput').value = ''; $('newKeyInput').focus() })
+async function switchAccount(name) {
+  activeAccount = name
+  try {
+    await api('POST', '/api/accounts/active', { account: name })
+    toast(`Account: ${name || 'All'}`, 'ok')
+  } catch (_) {}
+}
+
+$('accountSelect') && $('accountSelect').addEventListener('change', async e => {
+  await switchAccount(e.target.value)
+  // Re-fetch keys after switching
+  try {
+    const d = await api('GET', '/api/keys')
+    keys = d.keys
+    renderKeys()
+  } catch (_) {}
+})
+
+$('addAccountBtn') && $('addAccountBtn').addEventListener('click', async () => {
+  const name = prompt('Account name:')
+  if (!name || !name.trim()) return
+  if (accounts.find(a => a.name === name.trim())) {
+    toast('Account already exists', 'warn')
+    return
+  }
+  accounts.push({ name: name.trim(), keys: [] })
+  await persistKeys()
+  await switchAccount(name.trim())
+  toast(`Account "${name.trim()}" created`, 'ok')
+})
+
+$('addKeyBtn').addEventListener('click', () => {
+  $('keyAddForm').classList.remove('hidden')
+  $('newKeyInput').value = ''
+  // Populate keyAccountSelect
+  const kaSel = $('keyAccountSelect')
+  if (kaSel) {
+    kaSel.innerHTML = ''
+    accounts.forEach(a => {
+      const opt = document.createElement('option')
+      opt.value = a.name
+      opt.textContent = a.name
+      kaSel.appendChild(opt)
+    })
+    kaSel.value = activeAccount || (accounts.length ? accounts[0].name : 'default')
+  }
+  $('newKeyInput').focus()
+})
 $('cancelAddKeyBtn').addEventListener('click', () => $('keyAddForm').classList.add('hidden'))
 $('confirmAddKeyBtn').addEventListener('click', async () => {
   const v = $('newKeyInput').value.trim()
   if (!v) { toast('Enter a key', 'warn'); return }
   if (keys.includes(v)) { toast('Key already exists', 'warn'); return }
-  keys.push(v); $('keyAddForm').classList.add('hidden'); await persistKeys(); toast('Key added', 'ok')
+  // Find target account
+  const kaSel = $('keyAccountSelect')
+  const acctName = kaSel ? kaSel.value : (accounts.length ? accounts[0].name : 'default')
+  let acct = accounts.find(a => a.name === acctName)
+  if (!acct) { acct = { name: acctName, keys: [] }; accounts.push(acct) }
+  acct.keys.push(v)
+  keys.push(v)
+  $('keyAddForm').classList.add('hidden')
+  await persistKeys()
+  toast('Key added', 'ok')
 })
 $('newKeyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('confirmAddKeyBtn').click() })
 
@@ -490,9 +659,14 @@ async function loadNews() {
   renderKeys()
   renderUsage()
   try {
-    const data = await api('GET', '/api/keys')
-    keys = data.keys; renderKeys()
-    if (keys.length) toast(`Loaded ${keys.length} keys`, 'ok')
+    const d = await api('GET', '/api/accounts')
+    accounts = d.accounts || []
+    activeAccount = d.active_account || ''
+    keys = []
+    accounts.forEach(a => { keys.push(...a.keys) })
+    renderAccountSelect()
+    renderKeys()
+    if (keys.length) toast(`Loaded ${keys.length} keys across ${accounts.length} account(s)`, 'ok')
   } catch (_) {}
   await updateRunningState()
   await loadModel()
