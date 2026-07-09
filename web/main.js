@@ -1,13 +1,14 @@
 let theme = localStorage.getItem('openvidia-theme') || 'dark'
 let keys = []
-let accounts = []
-let activeAccount = ''
 let activeModel = ''
 let allModels = []
 let presets = []
 let _logEntries = 0
 let modelFilter = 'popular'
+let keyFilter = 'all'
+let _lastKeyStats = null
 
+/* ── Popular models shortcut ─────────────────── */
 const POPULAR_MODELS = new Set([
   'deepseek-ai/deepseek-v4-pro',
   'deepseek-ai/deepseek-v4-flash',
@@ -32,7 +33,7 @@ const POPULAR_MODELS = new Set([
 
 const $ = id => document.getElementById(id)
 
-/* ── API ────────────────────────────────────── */
+/* ── API helper ──────────────────────────────── */
 async function api(method, path, body) {
   const opts = { method, headers: {} }
   if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body) }
@@ -91,7 +92,7 @@ $('restartBtn').addEventListener('click', async () => {
   $('restartBtn').textContent = '⟳'
 })
 
-/* ── Stats ──────────────────────────────────── */
+/* ── Stats polling ───────────────────────────── */
 $('portDisplay').textContent = '1919'
 setInterval(async () => {
   try {
@@ -107,7 +108,7 @@ setInterval(async () => {
   } catch (_) {}
 }, 2000)
 
-/* ── Presets ───────────────────────────────── */
+/* ── Presets ────────────────────────────────── */
 async function loadPresets() {
   try { const r = await api('GET', '/api/presets'); presets = r.presets || [] } catch (_) { presets = [] }
   renderPresets()
@@ -152,7 +153,7 @@ async function loadModel() {
   try { const r = await api('GET', '/api/model'); activeModel = r.model || ''; $('activeModelDisplay').textContent = activeModel || 'none' } catch (_) {}
 }
 
-/* ── Models ────────────────────────────────── */
+/* ── Models browser ──────────────────────────── */
 const FILTERS = ['popular', 'all']
 function getFilteredModels() {
   let list = allModels
@@ -224,20 +225,51 @@ function renderModelList() {
 }
 $('modelSearch').addEventListener('input', renderModelList)
 
-/* ── Keys ──────────────────────────────────── */
+/* ── Key management: CRUD + filters ──────────── */
 function maskKey(k) { return k.length <= 14 ? k : `${k.slice(0, 8)}…${k.slice(-4)}` }
 function copyToClipboard(t) { navigator.clipboard.writeText(t).then(() => toast('Key copied', 'ok')).catch(() => {}) }
 function timeAgo(ts) { if (!ts) return ''; const s = Math.floor(Date.now() / 1000 - ts); if (s < 60) return `${s}s`; if (s < 3600) return `${Math.floor(s / 60)}m`; return `${Math.floor(s / 3600)}h` }
 
+function keyStatus(k, i, stats) {
+  const s = stats ? stats[String(i)] : null
+  if (s && s.cooldown > 0) return 'cooldown'
+  if (s && s.success > 0) return 'fresh'
+  if (s && s.requests > 0) return 'stale'
+  return 'idle'
+}
+
+function updateFilterCounts(stats) {
+  if (!stats) return
+  const sm = stats.key_stats || {}
+  let active = 0, cooldown = 0, fresh = 0, idle = 0
+  keys.forEach((k, i) => {
+    const st = keyStatus(k, i, sm)
+    if (st === 'cooldown') cooldown++
+    else if (st === 'fresh') fresh++
+    else if (st === 'stale') fresh++
+    else idle++
+    if (i === stats.active_index) active++
+  })
+  $('fAll').textContent = keys.length
+  $('fActive').textContent = active
+  $('fCooldown').textContent = cooldown
+  $('fFresh').textContent = fresh
+  $('fIdle').textContent = idle
+}
+
 function renderKeys(data) {
+  _lastKeyStats = data
   const list = $('keysList')
   list.innerHTML = ''
   $('keyCount').textContent = String(keys.length)
   $('keysEmpty').classList.toggle('hidden', keys.length > 0)
   const ai = data ? data.active_index : -1
   const sm = data ? data.key_stats || {} : {}
+  updateFilterCounts(data)
   keys.forEach((k, i) => {
     const s = sm[String(i)]
+    const status = keyStatus(k, i, sm)
+    if (keyFilter !== 'all' && keyFilter !== status && !(keyFilter === 'active' && i === ai)) return
     const isCd = s && s.cooldown > 0
     const row = document.createElement('div')
     row.className = `key-row ${i === ai ? 'active' : ''}`
@@ -271,13 +303,28 @@ function renderKeys(data) {
   })
 }
 
-async function pollKeyStats() { try { renderKeys(await api('GET', '/api/keys/stats')) } catch (_) {} }
-
-async function persistKeys() {
-  renderKeys(await api('GET', '/api/keys/stats').catch(() => null))
-  try { await api('POST', '/api/keys', { keys }) } catch (e) { toast(`Save failed: ${e.message}`, 'error') }
+async function pollKeyStats() {
+  try {
+    const data = await api('GET', '/api/keys/stats')
+    renderKeys(data)
+  } catch (_) {}
 }
 
+async function persistKeys() {
+  try { await api('POST', '/api/keys', { keys }) } catch (e) { toast(`Save failed: ${e.message}`, 'error') }
+  renderKeys(await api('GET', '/api/keys/stats').catch(() => null))
+}
+
+/* ── Key filter buttons ──────────────────────── */
+document.querySelectorAll('.key-filter').forEach(btn => {
+  btn.addEventListener('click', () => {
+    keyFilter = btn.dataset.filter
+    document.querySelectorAll('.key-filter').forEach(b => b.classList.toggle('active', b === btn))
+    renderKeys(_lastKeyStats)
+  })
+})
+
+/* ── Add key form ────────────────────────────── */
 $('addKeyBtn').addEventListener('click', () => { $('keyAddForm').classList.remove('hidden'); $('newKeyInput').value = ''; $('newKeyInput').focus() })
 $('cancelAddKeyBtn').addEventListener('click', () => $('keyAddForm').classList.add('hidden'))
 $('confirmAddKeyBtn').addEventListener('click', async () => {
@@ -322,7 +369,7 @@ new EventSource('/api/logs/stream').onmessage = e => {
   } catch (_) {}
 }
 
-/* ── News ───────────────────────────────────── */
+/* ── News ────────────────────────────────────── */
 async function loadNews() {
   try {
     const d = await api('GET', '/api/news')
@@ -342,7 +389,7 @@ async function loadNews() {
   } catch (_) { $('newsList').innerHTML = '<div class="browser-empty">Failed to load</div>' }
 }
 
-/* ── Init ──────────────────────────────────── */
+/* ── Init ───────────────────────────────────── */
 ;(async () => {
   try {
     const d = await api('GET', '/api/keys'); keys = d.keys || []
@@ -355,7 +402,7 @@ async function loadNews() {
   } catch (_) {}
   await updateRunningState()
   setInterval(pollKeyStats, 2000)
-  // Apri i primi due dropdown di default
+  // Apri i primi due dropdown: Keys + Models
   document.querySelectorAll('[data-dropdown]')[0]?.classList.add('open')
-  document.querySelectorAll('[data-dropdown]')[1]?.classList.add('open')
+  document.querySelectorAll('[data-dropdown]')[2]?.classList.add('open')
 })()

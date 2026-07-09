@@ -25,7 +25,7 @@
       </header>
 
       <div class="bento">
-        <!-- ── STATUS ── -->
+        <!-- ── STATUS (cell-status) ── -->
         <div class="bento-cell cell-status">
           <span class="indicator-dot" id="statusDot"><span class="pulse-dot running"></span></span>
           <div class="status-info">
@@ -39,92 +39,113 @@
           </div>
         </div>
 
-        <!-- ── STATS ── -->
-        <div class="bento-cell cell-stats">
+        <!-- ── STATS (cell-stats, col-span-3) ── -->
+        <div class="bento-cell cell-stats col-span-3">
           <div class="stat-mini"><span class="stat-num" id="statReqs">0</span><span class="stat-label">req</span></div>
           <div class="stat-mini"><span class="stat-num" id="statOk">0</span><span class="stat-label">ok</span></div>
           <div class="stat-mini"><span class="stat-num" id="statRots">0</span><span class="stat-label">rot</span></div>
           <div class="stat-mini" id="cdMini"><span class="stat-num" id="statCooldowns">0</span><span class="stat-label">⏳</span></div>
         </div>
 
-        <!-- ── MODEL PRESETS ── -->
+        <!-- ── MODEL PRESETS (cell-presets) ── -->
         <div class="bento-cell cell-presets" data-dropdown>
           <div class="bento-hd" data-toggle>
-            <span class="bento-ttl">Model Presets</span>
+            <span class="bento-ttl">Presets</span>
             <span class="bento-badge" id="presetCount">0</span>
             <span class="chevron">▸</span>
           </div>
           <div class="bento-body" data-body>
-            <div class="preset-grid" id="quickSwitch"></div>
-          </div>
-        </div>
-
-        <!-- ── KEYS ── -->
-        <div class="bento-cell cell-keys" data-dropdown>
-          <div class="bento-hd" data-toggle>
-            <span class="bento-ttl">Keys</span>
-            <span class="bento-badge" id="keyCount">0</span>
-            <span class="chevron">▸</span>
-          </div>
-          <div class="bento-body" data-body>
-            <div class="empty-state hidden" id="keysEmpty">
-              <div class="empty-ttl">No keys loaded</div>
-              <div class="empty-desc">Add keys with the button below</div>
-            </div>
-            <div id="keysList"></div>
-            <div class="card-actions">
-              <button class="btn btn-sm" id="addKeyBtn">+ Add Key</button>
-            </div>
-            <div class="slide-form hidden" id="keyAddForm">
-              <input type="text" id="newKeyInput" spellcheck="false" placeholder="nvapi-…" autocomplete="off" />
-              <div class="slide-form-actions">
-                <button class="btn btn-sm btn-primary" id="confirmAddKeyBtn">Add</button>
-                <button class="btn btn-sm" id="cancelAddKeyBtn">Cancel</button>
-              </div>
+            <div class="bento-body-inner">
+              <div class="preset-grid" id="quickSwitch"></div>
             </div>
           </div>
         </div>
 
-        <!-- ── MODELS ── -->
-        <div class="bento-cell cell-models" data-dropdown>
-          <div class="bento-hd" data-toggle>
-            <span class="bento-ttl">Models</span>
-            <span class="bento-badge" id="modelCount">0</span>
-            <span class="chevron">▸</span>
-          </div>
-          <div class="bento-body" data-body>
-            <div class="browser-filters" id="modelFilters"></div>
-            <input type="text" class="browser-input" id="modelSearch" placeholder="Search models…" spellcheck="false" />
-            <div class="browser-list" id="modelList"><div class="browser-empty">Loading…</div></div>
-          </div>
-        </div>
-
-        <!-- ── LOG ── -->
-        <div class="bento-cell cell-log" data-dropdown>
-          <div class="bento-hd" data-toggle>
-            <span class="bento-ttl"><span class="log-dot" id="logDot"></span>Activity</span>
-            <span class="bento-badge" id="logCount">0</span>
-            <span class="chevron">▸</span>
-          </div>
-          <div class="bento-body" data-body>
-            <div class="log-toolbar">
-              <button class="btn btn-sm" id="clearLogBtn">Clear</button>
-            </div>
-            <div class="log-box" id="logArea">
-              <div class="log-empty">Waiting for events…</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- ── NEWS ── -->
-        <div class="bento-cell cell-news" data-dropdown>
+        <!-- ── NEWS (cell-news, col-span-3) ── -->
+        <div class="bento-cell cell-news col-span-3" data-dropdown>
           <div class="bento-hd" data-toggle>
             <span class="bento-ttl">News</span>
             <span class="bento-badge" id="newsCount">0</span>
             <span class="chevron">▸</span>
           </div>
           <div class="bento-body" data-body>
-            <div id="newsList"><div class="browser-empty">Loading…</div></div>
+            <div class="bento-body-inner">
+              <div id="newsList"><div class="browser-empty">Loading…</div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── KEY MANAGEMENT (cell-keys, full width) ── -->
+        <div class="bento-cell cell-keys col-span-4" data-dropdown>
+          <div class="bento-hd" data-toggle>
+            <span class="bento-ttl">Keys</span>
+            <span class="bento-badge" id="keyCount">0</span>
+            <span class="chevron">▸</span>
+          </div>
+          <div class="bento-body" data-body>
+            <div class="bento-body-inner">
+              <!-- Toolbar: filters + add key -->
+              <div class="keys-toolbar">
+                <div class="key-filters" id="keyFilters">
+                  <button class="key-filter active" data-filter="all">All <span class="filter-count" id="fAll">0</span></button>
+                  <button class="key-filter" data-filter="active">Active <span class="filter-count" id="fActive">0</span></button>
+                  <button class="key-filter" data-filter="cooldown">⏳ <span class="filter-count" id="fCooldown">0</span></button>
+                  <button class="key-filter" data-filter="fresh">● <span class="filter-count" id="fFresh">0</span></button>
+                  <button class="key-filter" data-filter="idle">Idle <span class="filter-count" id="fIdle">0</span></button>
+                </div>
+                <button class="btn btn-sm btn-primary" id="addKeyBtn">+ Add Key</button>
+              </div>
+              <!-- Slide form for new key -->
+              <div class="slide-form hidden" id="keyAddForm">
+                <input type="text" id="newKeyInput" spellcheck="false" placeholder="nvapi-…" autocomplete="off" />
+                <div class="slide-form-actions">
+                  <button class="btn btn-sm btn-primary" id="confirmAddKeyBtn">Add</button>
+                  <button class="btn btn-sm" id="cancelAddKeyBtn">Cancel</button>
+                </div>
+              </div>
+              <!-- Empty state -->
+              <div class="empty-state hidden" id="keysEmpty">
+                <div class="empty-ttl">No keys loaded</div>
+                <div class="empty-desc">Add keys with the button above</div>
+              </div>
+              <!-- Key rows -->
+              <div id="keysList" class="keys-list"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── MODELS (cell-models, col-span-2) ── -->
+        <div class="bento-cell cell-models col-span-2" data-dropdown>
+          <div class="bento-hd" data-toggle>
+            <span class="bento-ttl">Models</span>
+            <span class="bento-badge" id="modelCount">0</span>
+            <span class="chevron">▸</span>
+          </div>
+          <div class="bento-body" data-body>
+            <div class="bento-body-inner">
+              <div class="browser-filters" id="modelFilters"></div>
+              <input type="text" class="browser-input" id="modelSearch" placeholder="Search models…" spellcheck="false" />
+              <div class="browser-list" id="modelList"><div class="browser-empty">Loading…</div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── ACTIVITY LOG (cell-log, col-span-2) ── -->
+        <div class="bento-cell cell-log col-span-2" data-dropdown>
+          <div class="bento-hd" data-toggle>
+            <span class="bento-ttl"><span class="log-dot" id="logDot"></span>Activity</span>
+            <span class="bento-badge" id="logCount">0</span>
+            <span class="chevron">▸</span>
+          </div>
+          <div class="bento-body" data-body>
+            <div class="bento-body-inner">
+              <div class="log-toolbar">
+                <button class="btn btn-sm" id="clearLogBtn">Clear</button>
+              </div>
+              <div class="log-box" id="logArea">
+                <div class="log-empty">Waiting for events…</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
