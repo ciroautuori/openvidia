@@ -2,7 +2,7 @@
 <html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>OpenVidia</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
     <link rel="stylesheet" href="styles.css" />
@@ -14,163 +14,120 @@
     <div id="app">
       <header>
         <div class="logo">
-          <img src="logo.png" alt="NVIDIA" class="logo-img">
+          <img src="logo.png" alt="OpenVidia" class="logo-img">
           <span class="logo-text">OpenVidia</span>
         </div>
-        <nav class="tabs" role="tablist">
-          <button class="tab active" data-tab="home">Home</button>
-          <button class="tab" data-tab="keys">Keys</button>
-          <button class="tab" data-tab="news">News</button>
-          <button class="tab" data-tab="settings">Settings</button>
-        </nav>
-        <button class="theme-btn" id="themeToggle" title="Toggle theme">🌙</button>
+        <div class="header-right">
+          <span class="header-stat" id="hKeyCount">0 keys</span>
+          <span class="header-stat" id="hRpm">0 RPM</span>
+          <button class="theme-btn" id="themeToggle" title="Toggle theme">🌙</button>
+        </div>
       </header>
 
-      <!-- ══ HOME ══ -->
-      <section id="tab-home" class="tab-content active">
-        <div class="status-bar">
-          <div class="status-bar-left">
-            <span class="indicator-dot" id="statusDot"><span class="pulse-dot running"></span></span>
-            <div class="status-info">
-              <span class="status-label" id="statusText">Running</span>
-              <span class="status-meta">Port <strong id="portDisplay">1919</strong> · <strong id="activeModelDisplay">none</strong></span>
-            </div>
+      <div class="bento">
+        <!-- ── STATUS ── -->
+        <div class="bento-cell cell-status">
+          <span class="indicator-dot" id="statusDot"><span class="pulse-dot running"></span></span>
+          <div class="status-info">
+            <span class="status-label" id="statusText">Running</span>
+            <span class="status-meta">Port <strong id="portDisplay">1919</strong> · <strong id="activeModelDisplay">none</strong></span>
           </div>
-          <div class="status-bar-right" style="display:flex;align-items:center;gap:8px">
-            <div class="stat-chip" id="statsChip">
-              <span><span class="stat-num" id="statReqs">0</span> req</span>
-              <span class="stat-div"></span>
-              <span><span class="stat-num" id="statRots">0</span> rot</span>
-              <span class="stat-div"></span>
-              <span class="stat-ok"><span class="stat-num" id="statOk">0</span> ok</span>
-              <span class="stat-div"></span>
-              <span title="Keys on cooldown"><span class="stat-num" id="statCooldowns">0</span> ⏳</span>
-            </div>
-            <button class="btn btn-sm" id="stopBtn" title="Stop proxy">⏹</button>
-            <button class="btn btn-sm" id="startBtn" title="Start proxy" style="display:none">▶</button>
+          <div class="status-acts">
+            <button class="btn btn-sm" id="stopBtn" title="Stop">⏹</button>
+            <button class="btn btn-sm" id="startBtn" title="Start" style="display:none">▶</button>
+            <button class="btn btn-sm" id="restartBtn" title="Restart">⟳</button>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-ttl">Model Presets</span>
-            <span class="card-badge" id="presetCount">0</span>
-          </div>
-          <div class="preset-grid" id="quickSwitch"></div>
+        <!-- ── STATS ── -->
+        <div class="bento-cell cell-stats">
+          <div class="stat-mini"><span class="stat-num" id="statReqs">0</span><span class="stat-label">req</span></div>
+          <div class="stat-mini"><span class="stat-num" id="statOk">0</span><span class="stat-label">ok</span></div>
+          <div class="stat-mini"><span class="stat-num" id="statRots">0</span><span class="stat-label">rot</span></div>
+          <div class="stat-mini" id="cdMini"><span class="stat-num" id="statCooldowns">0</span><span class="stat-label">⏳</span></div>
         </div>
 
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-ttl"><span class="log-dot" id="logDot"></span>Activity Log</span>
+        <!-- ── MODEL PRESETS ── -->
+        <div class="bento-cell cell-presets" data-dropdown>
+          <div class="bento-hd" data-toggle>
+            <span class="bento-ttl">Model Presets</span>
+            <span class="bento-badge" id="presetCount">0</span>
+            <span class="chevron">▸</span>
+          </div>
+          <div class="bento-body" data-body>
+            <div class="preset-grid" id="quickSwitch"></div>
+          </div>
+        </div>
+
+        <!-- ── KEYS ── -->
+        <div class="bento-cell cell-keys" data-dropdown>
+          <div class="bento-hd" data-toggle>
+            <span class="bento-ttl">Keys</span>
+            <span class="bento-badge" id="keyCount">0</span>
+            <span class="chevron">▸</span>
+          </div>
+          <div class="bento-body" data-body>
+            <div class="empty-state hidden" id="keysEmpty">
+              <div class="empty-ttl">No keys loaded</div>
+              <div class="empty-desc">Add keys with the button below</div>
+            </div>
+            <div id="keysList"></div>
             <div class="card-actions">
-              <span class="log-count" id="logCount">0</span>
-              <button class="btn btn-sm" id="clearLogBtn">Clear</button>
-              <button class="btn btn-sm" id="restartBtn">⟳ Restart</button>
+              <button class="btn btn-sm" id="addKeyBtn">+ Add Key</button>
             </div>
-          </div>
-          <div class="log-box" id="logArea">
-            <div class="log-empty">Waiting for events…</div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ══ KEYS ══ -->
-      <section id="tab-keys" class="tab-content">
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-ttl">API Keys</span>
-            <span class="card-badge" id="keyCount">0</span>
-          </div>
-          <div class="account-bar">
-            <span class="account-label">Account:</span>
-            <select id="accountSelect" class="account-select"></select>
-            <button class="btn btn-sm" id="addAccountBtn" title="Add account">+</button>
-          </div>
-          <div id="accountManager" class="acct-manager"></div>
-          <div class="empty-state" id="keysEmpty">
-            <div class="empty-icon">
-              <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
-            </div>
-            <div class="empty-ttl">No keys loaded</div>
-            <div class="empty-desc">Add keys manually below</div>
-          </div>
-          <div id="keysList"></div>
-          <div class="card-actions">
-            <button class="btn btn-primary" id="addKeyBtn">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-              Add Key
-            </button>
-          </div>
-          <div class="slide-form hidden" id="keyAddForm">
-            <div class="slide-form-body">
+            <div class="slide-form hidden" id="keyAddForm">
               <input type="text" id="newKeyInput" spellcheck="false" placeholder="nvapi-…" autocomplete="off" />
-              <select id="keyAccountSelect" class="key-account-select"></select>
-            </div>
-            <div class="slide-form-actions">
-              <button class="btn btn-primary" id="confirmAddKeyBtn">Add</button>
-              <button class="btn" id="cancelAddKeyBtn">Cancel</button>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ══ NEWS ══ -->
-      <section id="tab-news" class="tab-content">
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-ttl">Forum Updates</span>
-            <span class="card-badge" id="newsCount">0</span>
-          </div>
-          <div id="newsList">
-            <div class="empty-state">
-              <div class="empty-ttl">No updates yet</div>
-              <div class="empty-desc">Check back later</div>
+              <div class="slide-form-actions">
+                <button class="btn btn-sm btn-primary" id="confirmAddKeyBtn">Add</button>
+                <button class="btn btn-sm" id="cancelAddKeyBtn">Cancel</button>
+              </div>
             </div>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-ttl">New Models</span>
+        <!-- ── MODELS ── -->
+        <div class="bento-cell cell-models" data-dropdown>
+          <div class="bento-hd" data-toggle>
+            <span class="bento-ttl">Models</span>
+            <span class="bento-badge" id="modelCount">0</span>
+            <span class="chevron">▸</span>
           </div>
-          <div id="newModelsList">
-            <div class="browser-empty">Checking…</div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ══ SETTINGS ══ -->
-      <section id="tab-settings" class="tab-content">
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-ttl">Available Models</span>
-            <span class="card-badge" id="modelCount">0</span>
-          </div>
-          <div class="browser">
+          <div class="bento-body" data-body>
             <div class="browser-filters" id="modelFilters"></div>
-            <input type="text" class="browser-input" id="modelSearch" placeholder="Search…" spellcheck="false" />
-            <div class="browser-list" id="modelList">
-              <div class="browser-empty">Loading…</div>
+            <input type="text" class="browser-input" id="modelSearch" placeholder="Search models…" spellcheck="false" />
+            <div class="browser-list" id="modelList"><div class="browser-empty">Loading…</div></div>
+          </div>
+        </div>
+
+        <!-- ── LOG ── -->
+        <div class="bento-cell cell-log" data-dropdown>
+          <div class="bento-hd" data-toggle>
+            <span class="bento-ttl"><span class="log-dot" id="logDot"></span>Activity</span>
+            <span class="bento-badge" id="logCount">0</span>
+            <span class="chevron">▸</span>
+          </div>
+          <div class="bento-body" data-body>
+            <div class="log-toolbar">
+              <button class="btn btn-sm" id="clearLogBtn">Clear</button>
+            </div>
+            <div class="log-box" id="logArea">
+              <div class="log-empty">Waiting for events…</div>
             </div>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-hd">
-            <span class="card-ttl">Usage Example</span>
+        <!-- ── NEWS ── -->
+        <div class="bento-cell cell-news" data-dropdown>
+          <div class="bento-hd" data-toggle>
+            <span class="bento-ttl">News</span>
+            <span class="bento-badge" id="newsCount">0</span>
+            <span class="chevron">▸</span>
           </div>
-          <div class="usage-example">
-            <div class="usage-tabs">
-              <button class="usage-tab active" data-usage="curl">cURL</button>
-              <button class="usage-tab" data-usage="python">Python</button>
-              <button class="usage-tab" data-usage="js">JS</button>
-            </div>
-            <pre class="usage-code" id="usageCode"><code></code></pre>
+          <div class="bento-body" data-body>
+            <div id="newsList"><div class="browser-empty">Loading…</div></div>
           </div>
         </div>
-
-
-      </section>
+      </div>
     </div>
 
     <script type="module" src="main.js"></script>

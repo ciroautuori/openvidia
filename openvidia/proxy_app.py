@@ -199,8 +199,9 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 req = client.build_request(request.method, url, content=body, headers=headers)
                 resp = await client.send(req, stream=True)
             except httpx.HTTPError as e:
-                state.log_cb(f"key[{i}] error: {e}")
-                state.stats.record_key_usage(key, ok=False, error=str(e))
+                err_msg = str(e) or type(e).__name__
+                state.log_cb(f"key[{i}] {err_msg}")
+                state.stats.record_key_usage(key, ok=False, error=err_msg)
                 state.mark_key_failed(key)  # network error → cooldown
                 state.stats.rotations += 1
                 persist_index(state, (i + 1) % len(keys))
