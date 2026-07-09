@@ -1,8 +1,3 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="web/assets/logo.png">
-  <img alt="OpenVidia" src="web/assets/logo.png" width="200">
-</picture>
-
 # OpenVidia — NVIDIA NIM Multi-Key Proxy with Smart Rate Limiting
 
 A lightweight reverse proxy for the [NVIDIA NIM API](https://build.nvidia.com) with a built-in web dashboard, intelligent per-key cooldown management, sliding-window RPM tracking, automatic key rotation, model override, and live model testing.
