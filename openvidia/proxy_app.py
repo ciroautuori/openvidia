@@ -118,7 +118,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
     client = httpx.AsyncClient(
         http2=True,
-        timeout=httpx.Timeout(connect=3.0, read=30.0, write=30.0, pool=30.0),
+        timeout=httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=120.0),
     )
     app.state.http_client = client
 
@@ -198,6 +198,12 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             try:
                 req = client.build_request(request.method, url, content=body, headers=headers)
                 resp = await client.send(req, stream=True)
+            except httpx.ReadTimeout:
+                state.log_cb(f"key[{i}] ReadTimeout (rotating, no cooldown)")
+                state.stats.record_key_usage(key, ok=False, error="ReadTimeout")
+                state.stats.rotations += 1
+                persist_index(state, (i + 1) % len(keys))
+                continue
             except httpx.HTTPError as e:
                 err_msg = str(e) or type(e).__name__
                 state.log_cb(f"key[{i}] {err_msg}")
