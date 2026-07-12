@@ -214,6 +214,32 @@ async def main_async():
             await srv.shutdown()
 
 
+def _place_window_right(w: int, h: int) -> None:
+    """Monkey-patch pywebview Qt: finestra appare gia a destra, nessun salto visivo."""
+    try:
+        from pywebview.platforms import qt as _qt
+        _orig = _qt.MainWindow.__init__
+
+        def _placed(self, window):
+            _orig(self, window)
+            try:
+                from PyQt6.QtWidgets import QApplication
+                app = QApplication.instance()
+                if not app:
+                    return
+                screen = app.primaryScreen()
+                if not screen:
+                    return
+                geo = screen.availableGeometry()
+                self.move(geo.width() - w, max(0, (geo.height() - h) // 2))
+            except Exception:
+                pass
+
+        _qt.MainWindow.__init__ = _placed
+    except Exception:
+        pass
+
+
 def open_desk(port: int) -> None:
     """Apre la dashboard in una finestra nativa pywebview."""
     try:
@@ -234,8 +260,8 @@ def open_desk(port: int) -> None:
         "OpenVidia",
         url=url,
         width=760,
-        height=440,
-        min_size=(360, 300),
+        height=480,
+        min_size=(760, 480),
         text_select=True,
         easy_drag=True,
     )
@@ -246,6 +272,9 @@ def open_desk(port: int) -> None:
         print("● Desk closed — proxy terminated", flush=True)
 
     window.events.closed += kill_proxy
+
+    # Posiziona la finestra a destra (monkey-patch MainWindow.__init__)
+    _place_window_right(760, 480)
 
     webview.start(debug=False, icon=icon_path)
 
