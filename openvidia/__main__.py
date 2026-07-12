@@ -227,18 +227,12 @@ def open_desk(port: int) -> None:
         auto_open(port)
         return
 
-    # Su Wayland, WebKitGTK ha bug con eventi mouse: X11 (XWayland) funziona meglio
-    wdisp = os.environ.get("WAYLAND_DISPLAY", "")
-    if wdisp and not os.environ.get("GDK_BACKEND"):
-        os.environ["GDK_BACKEND"] = "x11"
-        print("● GDK_BACKEND=x11 (Wayland detected, XWayland for WebKitGTK compat)", flush=True)
-
     url = f"http://localhost:{port}"
     assets = Path(__file__).resolve().parent.parent / "web" / "assets"
     icon_path = str(assets / "logo.png")
+    # pywebview auto-detect: Qt (KDE Wayland nativo) se disponibile, altrimenti GTK
     print(f"● Desktop window → {url}", flush=True)
 
-    # Crea la finestra (pywebview usa frame nativo GTK, no barra WebKit extra)
     window = webview.create_window(
         "OpenVidia",
         url=url,
@@ -249,7 +243,6 @@ def open_desk(port: int) -> None:
         easy_drag=True,
     )
 
-    # Alla chiusura: kill proxy
     def kill_proxy():
         import subprocess
         subprocess.run(["fuser", "-k", f"{port}/tcp"], stderr=subprocess.DEVNULL, timeout=5)
@@ -257,7 +250,6 @@ def open_desk(port: int) -> None:
 
     window.events.closed += kill_proxy
 
-    # Avvia pywebview — blocca nel main thread
     webview.start(debug=False, icon=icon_path)
 
 
