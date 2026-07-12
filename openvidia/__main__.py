@@ -29,18 +29,11 @@ PORT = 1919
 
 
 def _kill_stale_port(port: int):
-    """Usa psutil (più robusto di fuser) per trovate e killlare il processo sulla porta."""
+    """Termina qualsiasi processo in ascolto sulla porta (multipiattaforma via psutil)."""
     import time as _time
     try:
         import psutil
     except ImportError:
-        # Fallback a fuser se psutil non disponibile
-        try:
-            subprocess.run(
-                ["fuser", "-k", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=5
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-            pass
         return
 
     killed = []
@@ -58,13 +51,15 @@ def _kill_stale_port(port: int):
 
     # Aspetta che la porta si liberi
     for _ in range(30):
+        conns = []
         try:
-            subprocess.check_output(
-                ["fuser", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=2
-            )
-            _time.sleep(0.1)
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            conns = psutil.net_connections()
+        except (psutil.AccessDenied, OSError):
             return
+        still = any(c.laddr.port == port and c.status == "LISTEN" for c in conns)
+        if not still:
+            return
+        _time.sleep(0.1)
 
 
 def _extract_keys_from_accounts() -> list:
@@ -241,8 +236,13 @@ def open_desk(port: int) -> None:
     )
 
     def kill_proxy():
-        import subprocess
-        subprocess.run(["fuser", "-k", f"{port}/tcp"], stderr=subprocess.DEVNULL, timeout=5)
+        try:
+            import psutil
+            for conn in psutil.net_connections():
+                if conn.laddr.port == port and conn.status == "LISTEN" and conn.pid:
+                    psutil.Process(conn.pid).terminate()
+        except Exception:
+            pass
         print("● Desk closed — proxy terminated", flush=True)
 
     window.events.closed += kill_proxy

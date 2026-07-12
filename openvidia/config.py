@@ -1,11 +1,19 @@
 import json
 import os
+import sys
 from pathlib import Path
 from typing import List
 
 
 def config_dir() -> Path:
-    d = Path.home() / ".config" / "openvidia"
+    """Directory di config multipiattaforma."""
+    if sys.platform == "win32":
+        d = Path(os.environ.get("APPDATA", Path.home())) / "openvidia"
+    elif sys.platform == "darwin":
+        d = Path.home() / "Library" / "Application Support" / "openvidia"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME", "")
+        d = Path(xdg) / "openvidia" if xdg else Path.home() / ".config" / "openvidia"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

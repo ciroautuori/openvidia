@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -e
 
-# Lavora sempre dalla directory dello script
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
@@ -19,71 +18,42 @@ elif command -v pip >/dev/null 2>&1; then
     pip install -e . --quiet
     echo "  ✓ Dipendenze installate (pip)"
 else
-    echo "  ✗ Devi installare uv o pip prima di continuare"
+    echo "  ✗ Devi installare uv (consigliato) o pip prima di continuare"
+    echo "    curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
 echo ""
 
-# ── 2. Launcher in ~/.local/bin ───────────────────
-echo "▶ Installa launcher..."
-BIN_DIR="$HOME/.local/bin"
-mkdir -p "$BIN_DIR"
-cat > "$BIN_DIR/openvidia" << 'LAUNCHER'
-#!/usr/bin/env bash
-set -e
-
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)/.."
-# Prova prima con uv, fallback a python diretto
-if command -v uv >/dev/null 2>&1; then
-    PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && echo "$(dirname "$HOME")")"
-    PROJECT_DIR="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
-    if [ -f "$PROJECT_DIR/pyproject.toml" ]; then
-        : # ok
-    else
-        PROJECT_DIR="/home/$(whoami)/Scrivania/openvidia"
-    fi
-fi
-
-pkill -f "python.*-m openvidia" 2>/dev/null || true
-export PYTHONDONTWRITEBYTECODE=1
-
-if command -v uv >/dev/null 2>&1 && [ -f "$PROJECT_DIR/pyproject.toml" ]; then
-    nohup uv run --directory "$PROJECT_DIR" python -m openvidia "$@" > /dev/null 2>&1 &
-else
-    nohup python3 -m openvidia "$@" > /dev/null 2>&1 &
-fi
-
-echo "● OpenVidia avviato su http://localhost:1919"
-LAUNCHER
-chmod +x "$BIN_DIR/openvidia"
-echo "  ✓ Launcher installato in $BIN_DIR/openvidia"
-echo ""
-
-# ── 3. Configura opencode ────────────────────────
+# ── 2. Configura opencode (se presente) ──────────
 echo "▶ Configura opencode..."
-python3 -m openvidia setup
+if [ -f "$HOME/.config/opencode/opencode.json" ] || [ -f "$HOME/.opal/config.json" ]; then
+    python3 -m openvidia setup 2>/dev/null || true
+    echo "  ✓ opencode configurato"
+else
+    echo "  ℹ opencode non trovato — salto (configura manualmente dopo)"
+fi
 echo ""
 
-# ── 4. Avvia e verifica ──────────────────────────
-echo "▶ Verifica avvio..."
-export PYTHONDONTWRITEBYTECODE=1
+# ── 3. Avvia e verifica ──────────────────────────
+echo "▶ Avvia proxy + desktop app..."
+pkill -f "python.*-m openvidia" 2>/dev/null || true
 nohup python3 -m openvidia > /dev/null 2>&1 &
 sleep 3
 if curl -s http://localhost:1919/health >/dev/null 2>&1; then
-    KEYS=$(curl -s http://localhost:1919/health | python3 -c "import sys,json; print(json.load(sys.stdin)['keys'])" 2>/dev/null || echo "?")
-    echo "  ✓ Proxy attivo — $KEYS key caricate su http://localhost:1919"
+    KEYS=$(curl -s http://localhost:1919/health | python3 -c "import sys,json; print(json.load(sys.stdin).keys())" 2>/dev/null || echo "?")
+    echo "  ✓ Proxy attivo — $KEYS keys su http://localhost:1919"
+    echo "  ✓ Desktop app aperta"
 else
-    echo "  ⚠ Proxy non ancora attivo — controlla con: python3 -m openvidia foreground"
+    echo "  ⚠ Proxy non ancora attivo — controlla: python3 -m openvidia foreground"
 fi
 echo ""
 
 echo "╔════════════════════════════════════════════╗"
 echo "║   Installazione completata!                ║"
 echo "╠════════════════════════════════════════════╣"
-echo "║   Proxy:    http://localhost:1919         ║"
-echo "║   Provider: openvidia (auto-configurato)   ║"
-echo "║   Compaction: auto + prune attivi         ║"
-echo "║                                            ║"
-echo "║   Usa in opencode:  /model openvidia       ║"
-echo "║   Dashboard:        http://localhost:1919  ║"
+echo "║   Comando:    openvidia                    ║"
+echo "║   Proxy:      http://localhost:1919/v1     ║"
+echo "║   Dashboard:  http://localhost:1919        ║"
+echo "╠════════════════════════════════════════════╣"
+echo "║   In opencode:  /model openvidia           ║"
 echo "╚════════════════════════════════════════════╝"
