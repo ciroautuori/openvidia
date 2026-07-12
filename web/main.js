@@ -369,37 +369,6 @@ new EventSource('/api/logs/stream').onmessage = e => {
   } catch (_) {}
 }
 
-/* ── News ────────────────────────────────────── */
-async function loadNews(refresh = false) {
-  try {
-    const d = await api('GET', `/api/news${refresh ? '?refresh=true' : ''}`)
-    const news = d.news || []
-    $('newsCount').textContent = news.length
-    const list = $('newsList')
-    if (!news.length) { list.innerHTML = '<div class="browser-empty">No updates</div>'; return }
-    list.innerHTML = ''
-    news.forEach(n => {
-      const item = document.createElement('div'); item.className = 'news-item'
-      const a = document.createElement('a'); a.href = n.url; a.target = '_blank'; a.textContent = n.title
-      item.appendChild(a)
-      if (n.excerpt) { const ex = document.createElement('div'); ex.className = 'news-excerpt'; ex.textContent = n.excerpt.replace(/<[^>]+>/g, '').slice(0, 200); item.appendChild(ex) }
-      const m = document.createElement('div'); m.className = 'news-meta'; m.textContent = [n.author, n.time.slice(0, 10)].filter(Boolean).join(' · '); item.appendChild(m)
-      list.appendChild(item)
-    })
-  } catch (_) { $('newsList').innerHTML = '<div class="browser-empty">Failed to load</div>' }
-}
-
-/* ── Refresh news button ─────────────────────── */
-if ($('refreshNewsBtn')) {
-  $('refreshNewsBtn').addEventListener('click', async () => {
-    $('refreshNewsBtn').disabled = true
-    $('refreshNewsBtn').textContent = '…'
-    try { await loadNews(true); toast('News refreshed', 'ok') } catch (_) { toast('Refresh failed', 'error') }
-    $('refreshNewsBtn').disabled = false
-    $('refreshNewsBtn').textContent = '↻'
-  })
-}
-
 /* ── CLI Setup tab (opencode / Codex / Claude Code / Grok) ──────── */
 let currentCli = 'opencode'
 const CLI_TABS = [
@@ -494,7 +463,6 @@ provider = "openvidia"` },
     await loadModel()
     await loadPresets()
     await fetchModels()
-    await loadNews()
     renderKeys()
     if (keys.length) toast(`${keys.length} keys loaded`, 'ok')
   } catch (_) {}

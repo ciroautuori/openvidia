@@ -197,61 +197,6 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         config.clear_stop_flag()
         return {"ok": True, "status": "running"}
 
-    @app.get("/api/news")
-    async def api_news(refresh: bool = False):
-        cache_path = config.config_dir() / "news_cache.json"
-        # Check cache (1h TTL) — skip if refresh forced
-        if not refresh:
-            try:
-                cached = json.loads(cache_path.read_text())
-                if time.time() - cached.get("ts", 0) < 3600:
-                    return cached["data"]
-            except (FileNotFoundError, json.JSONDecodeError, OSError):
-                pass
-
-        news = []
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as cl:
-            # Fetch GLM-5.2 thread
-            try:
-                r = await cl.get("https://forums.developer.nvidia.com/t/model-glm-5-2-showing-error-400/375867.json")
-                if r.is_success:
-                    d = r.json()
-                    posts = d.get("post_stream", {}).get("posts", [])
-                    if posts:
-                        latest = posts[-1]
-                        news.append({
-                            "title": "GLM-5.2 status update",
-                            "url": "https://forums.developer.nvidia.com/t/model-glm-5-2-showing-error-400/375867",
-                            "excerpt": latest.get("cooked", "")[:200],
-                            "author": latest.get("username", ""),
-                            "time": latest.get("created_at", ""),
-                        })
-            except Exception:
-                pass
-
-            # Fetch recent posts in NVIDIA NIM category
-            try:
-                r = await cl.get("https://forums.developer.nvidia.com/c/nvidiadevist/nvidia-nim/l/latest.json")
-                if r.is_success:
-                    d = r.json()
-                    for topic in d.get("topic_list", {}).get("topics", [])[:5]:
-                        news.append({
-                            "title": topic.get("title", ""),
-                            "url": f"https://forums.developer.nvidia.com/t/{topic.get('slug', '')}/{topic.get('id', '')}",
-                            "excerpt": "",
-                            "author": "",
-                            "time": topic.get("created_at", ""),
-                        })
-            except Exception:
-                pass
-
-        data = {"news": news, "updated": time.time()}
-        try:
-            cache_path.write_text(json.dumps({"ts": time.time(), "data": data}))
-        except OSError:
-            pass
-        return data
-
     @app.post("/api/restart")
     async def api_restart():
         import os as _os

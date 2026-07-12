@@ -218,14 +218,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 4
 .log-entry.error .log-msg{color:var(--red)}
 .log-entry.cooldown .log-msg{color:var(--amber)}
 
-/* ── News ────────────────────────────────────── */
-.news-item{padding:8px 0;border-bottom:1px solid var(--border)}
-.news-item:last-child{border-bottom:none}
-.news-item a{font-size:.72rem;color:var(--accent);font-weight:600;text-decoration:none;display:block;margin-bottom:2px}
-.news-item a:hover{text-decoration:underline}
-.news-excerpt{font-size:.66rem;color:var(--text3);line-height:1.5}
-.news-meta{font-size:.6rem;color:var(--text3);margin-top:3px}
-
 /* ── Buttons ─────────────────────────────────── */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:7px 14px;border:1px solid var(--border);border-radius:6px;font-family:var(--font);font-size:.7rem;font-weight:600;cursor:pointer;white-space:nowrap;color:var(--text2);background:transparent;transition:all .18s}
 .btn:hover{background:var(--hover);color:var(--text)}
