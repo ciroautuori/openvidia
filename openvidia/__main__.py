@@ -218,7 +218,7 @@ async def main_async():
 
 
 def open_desk(port: int) -> None:
-    """Apre la dashboard in una finestra nativa pywebview (desktop app)."""
+    """Apre la dashboard in una finestra nativa pywebview."""
     try:
         import webview
     except ImportError:
@@ -228,17 +228,31 @@ def open_desk(port: int) -> None:
         return
 
     url = f"http://localhost:{port}"
+    assets = Path(__file__).resolve().parent.parent / "web" / "assets"
+    icon_path = str(assets / "logo.png")
     print(f"● Desktop window → {url}", flush=True)
-    webview.create_window(
+
+    # Crea la finestra (pywebview usa gia' frame nativo GTK, no barra WebKit extra)
+    window = webview.create_window(
         "OpenVidia",
         url=url,
         width=1100,
         height=720,
         min_size=(480, 600),
         text_select=True,
+        easy_drag=True,
     )
-    # webview avvia il loop GUI nel thread principale — blocca qui
-    webview.start(debug=False)
+
+    # Alla chiusura: kill proxy
+    def kill_proxy():
+        import subprocess
+        subprocess.run(["fuser", "-k", f"{port}/tcp"], stderr=subprocess.DEVNULL, timeout=5)
+        print("● Desk closed — proxy terminated", flush=True)
+
+    window.events.closed += kill_proxy
+
+    # Avvia pywebview — blocca nel main thread
+    webview.start(debug=False, icon=icon_path)
 
 
 def main():

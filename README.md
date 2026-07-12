@@ -305,6 +305,6 @@ PRs welcome. Key areas:
 - Additional fallback model mappings
 - Prometheus/Grafana metrics export
 - Support for non-NVIDIA upstreams
-- Tauri desktop wrapper (WIP in `web/src-tauri/`)
+- Desktop app via pywebview (`openvidia --desk`)
 
 Built with care by [Ciro Autuori](https://github.com/ciroautuori).
