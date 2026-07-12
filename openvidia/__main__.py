@@ -1,11 +1,13 @@
 """
-OpenVidia — minimal multi-key NVIDIA API proxy with web UI.
+OpenVidia — minimal multi-key NVIDIA API proxy with web UI + desktop app.
 
 Install:
     pip install -e .
 
 Usage:
-    openvidia              # start proxy + desktop UI
+    openvidia              # start proxy + browser dashboard
+    openvidia --desk       # start proxy + desktop window (pywebview)
+    openvidia foreground    # foreground mode (logs stdout)
     openvidia setup        # configure opencode provider
 
 Dashboard + API at http://localhost:1919
@@ -215,6 +217,30 @@ async def main_async():
             await srv.shutdown()
 
 
+def open_desk(port: int) -> None:
+    """Apre la dashboard in una finestra nativa pywebview (desktop app)."""
+    try:
+        import webview
+    except ImportError:
+        print("⚠ pywebview non installato — apertura browser", flush=True)
+        from .webui import auto_open
+        auto_open(port)
+        return
+
+    url = f"http://localhost:{port}"
+    print(f"● Desktop window → {url}", flush=True)
+    webview.create_window(
+        "OpenVidia",
+        url=url,
+        width=1100,
+        height=720,
+        min_size=(480, 600),
+        text_select=True,
+    )
+    # webview avvia il loop GUI nel thread principale — blocca qui
+    webview.start(debug=False)
+
+
 def main():
     if len(sys.argv) > 1:
         if sys.argv[1] == "setup":
@@ -222,6 +248,21 @@ def main():
         if sys.argv[1] == "foreground":
             asyncio.run(main_async())
             return
+
+    # Desckapp mode: proxy in background + finestra nativa pywebview
+    if "--desk" in sys.argv:
+        import subprocess as _sp
+        import time as _time
+
+        _kill_stale_port(PORT)
+        _sp.Popen(
+            [sys.executable, "-m", "openvidia", "foreground"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            stdin=_sp.DEVNULL,
+        )
+        _time.sleep(3)
+        open_desk(PORT)
+        sys.exit(0)
 
     # Daemon mode — spawn proxy in background
     import subprocess as _sp
