@@ -255,6 +255,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:2px
 .browser-add{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:none;border-radius:4px;background:transparent;color:var(--text3);cursor:pointer;transition:all .15s}
 .browser-add:hover{background:var(--accent-soft);color:var(--accent);transform:scale(1.1)}
 .browser-check{font-size:.64rem;color:var(--green);opacity:.75}
+.browser-star{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:none;border-radius:4px;background:transparent;color:var(--text3);cursor:pointer;font-size:.82rem;line-height:1;transition:all .15s}
+.browser-star:hover{background:var(--accent-soft);transform:scale(1.15)}
+.browser-star.on{color:var(--amber)}
 .browser-test{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:none;border-radius:4px;background:transparent;color:var(--text3);cursor:pointer;font-size:.64rem;transition:all .15s}
 .browser-test:hover{background:var(--accent-soft);color:var(--green)}
 .browser-test.testing{animation:pulse .5s ease infinite;color:var(--amber)}

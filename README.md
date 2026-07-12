@@ -329,9 +329,8 @@ update-desktop-database ~/.local/share/applications/
 |---------|----------|
 | **Status** | Proxy state, active model, start/stop/restart controls |
 | **Stats** | Request count, success rate, rotations, cooldown counter |
-| **Presets** | Quick-switch model presets grid |
 | **Keys** | Per-key status (Active filter default), live cooldown countdown, RPM, success/fail, freshness dots, add/remove/copy |
-| **Models** | Filter chips, search, test ▶ any model, add to presets |
+| **Models** | Single list — filters: **★ Starred** (default; your shortlist, doubles as the fallback chain) · All · Popular. Search, test ▶, star/unstar. Active model highlighted and pinned to top. |
 | **Activity** | Real-time SSE log stream with color-coded levels |
 | **CLI Setup** | Copy-paste config for opencode / Codex / Claude / Grok |
 
@@ -362,7 +361,7 @@ update-desktop-database ~/.local/share/applications/
 | File | Purpose |
 |------|---------|
 | `keys.json` | API keys (JSON array) |
-| `presets.json` | Saved model presets |
+| `presets.json` | ★ Starred models — quick-switch shortlist + ordered fallback chain |
 | `active_model` | Currently active model (persists across restarts) |
 | `index` | Key rotation index |
 | `compaction.json` | Auto-compaction tuning (optional — see [Auto-Compaction](#auto-compaction)) |

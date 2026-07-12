@@ -50,16 +50,18 @@
           <div class="stat-mini" id="cdMini"><span class="stat-num" id="statCooldowns">0</span><span class="stat-label">⏳</span></div>
         </div>
 
-        <!-- ── MODEL PRESETS (cell-presets, solo se vuoi cambiarli) ── -->
-        <div class="bento-cell cell-presets" data-dropdown>
+        <!-- ── MODELS (unica lista; ★ Starred = shortlist + catena di fallback) ── -->
+        <div class="bento-cell cell-models col-span-2" data-dropdown>
           <div class="bento-hd" data-toggle data-idx="01">
-            <span class="bento-ttl">Presets</span>
-            <span class="bento-badge" id="presetCount">0</span>
+            <span class="bento-ttl">Models</span>
+            <span class="bento-badge" id="modelCount">0</span>
             <span class="chevron">▸</span>
           </div>
           <div class="bento-body" data-body>
             <div class="bento-body-inner">
-              <div class="preset-grid" id="quickSwitch"></div>
+              <div class="browser-filters" id="modelFilters"></div>
+              <input type="text" class="browser-input" id="modelSearch" placeholder="Search models…" spellcheck="false" />
+              <div class="browser-list" id="modelList"><div class="browser-empty">Loading…</div></div>
             </div>
           </div>
         </div>
@@ -95,22 +97,6 @@
                 <div class="empty-desc">Add keys with the button above</div>
               </div>
               <div id="keysList" class="keys-list"></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- ── MODELS (cell-models, col-span-2) ── -->
-        <div class="bento-cell cell-models col-span-2" data-dropdown>
-          <div class="bento-hd" data-toggle data-idx="03">
-            <span class="bento-ttl">Models</span>
-            <span class="bento-badge" id="modelCount">0</span>
-            <span class="chevron">▸</span>
-          </div>
-          <div class="bento-body" data-body>
-            <div class="bento-body-inner">
-              <div class="browser-filters" id="modelFilters"></div>
-              <input type="text" class="browser-input" id="modelSearch" placeholder="Search models…" spellcheck="false" />
-              <div class="browser-list" id="modelList"><div class="browser-empty">Loading…</div></div>
             </div>
           </div>
         </div>

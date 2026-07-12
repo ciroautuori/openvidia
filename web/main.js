@@ -4,7 +4,7 @@ let activeModel = ''
 let allModels = []
 let presets = []
 let _logEntries = 0
-let modelFilter = 'popular'
+let modelFilter = 'starred'
 let keyFilter = 'active'
 let _lastKeyStats = null
 
@@ -108,35 +108,17 @@ setInterval(async () => {
   } catch (_) {}
 }, 2000)
 
-/* ── Presets ────────────────────────────────── */
+/* ── Starred models (= presets = catena di fallback ordinata) ────── */
 async function loadPresets() {
   try { const r = await api('GET', '/api/presets'); presets = r.presets || [] } catch (_) { presets = [] }
-  renderPresets()
+  renderFilters(); renderModelList()
 }
-async function savePresets() { try { await api('POST', '/api/presets', { presets }) } catch (_) {} renderPresets() }
+async function savePresets() { try { await api('POST', '/api/presets', { presets }) } catch (_) {} renderFilters(); renderModelList() }
 
-function labelForModel(id) { const m = allModels.find(x => x.id === id); return m ? shortLabel(m.id) : id }
 function shortLabel(id) {
   const known = { 'z-ai/glm-5.2': 'GLM 5.2', 'deepseek-ai/deepseek-v4-pro': 'DeepSeek V4 Pro', 'minimaxai/minimax-m3': 'MiniMax M3' }
   if (known[id]) return known[id]
   return id.split('/').pop()
-}
-
-function renderPresets() {
-  const grid = $('quickSwitch')
-  $('presetCount').textContent = presets.length
-  grid.innerHTML = ''
-  presets.map(id => ({ id, label: labelForModel(id) })).forEach(p => {
-    const btn = document.createElement('button')
-    btn.textContent = p.label
-    btn.className = p.id === activeModel ? 'active' : ''
-    btn.onclick = () => setModel(p.id)
-    const rm = document.createElement('span')
-    rm.className = 'preset-rm'; rm.textContent = '×'; rm.title = 'Remove'
-    rm.onclick = e => { e.stopPropagation(); presets = presets.filter(x => x !== p.id); savePresets() }
-    btn.appendChild(rm)
-    grid.appendChild(btn)
-  })
 }
 
 async function setModel(id) {
@@ -144,7 +126,7 @@ async function setModel(id) {
     await fetch('/api/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: id }) })
     activeModel = id
     $('activeModelDisplay').textContent = id || 'none'
-    renderPresets(); renderModelList(); renderUsage()
+    renderModelList(); renderUsage()
     toast(`Model: ${id || 'none'}`, 'ok')
   } catch (_) {}
 }
@@ -154,12 +136,24 @@ async function loadModel() {
 }
 
 /* ── Models browser ──────────────────────────── */
-const FILTERS = ['popular', 'all']
+const FILTERS = ['starred', 'all', 'popular']
 function getFilteredModels() {
-  let list = allModels
-  if (modelFilter === 'popular') list = allModels.filter(m => POPULAR_MODELS.has(m.id))
+  let list
+  if (modelFilter === 'starred') {
+    // in ordine di stellatura = ordine della catena di fallback
+    list = presets.map(id => allModels.find(m => m.id === id) || { id, owned_by: '' })
+  } else if (modelFilter === 'popular') {
+    list = allModels.filter(m => POPULAR_MODELS.has(m.id))
+  } else {
+    list = allModels
+  }
   const q = ($('modelSearch').value || '').toLowerCase()
   if (q) list = list.filter(m => m.id.toLowerCase().includes(q))
+  // modello attivo pinnato in cima a qualsiasi filtro
+  if (activeModel) {
+    const i = list.findIndex(m => m.id === activeModel)
+    if (i > 0) { const [a] = list.splice(i, 1); list.unshift(a) }
+  }
   return list
 }
 
@@ -168,7 +162,9 @@ function renderFilters() {
   FILTERS.forEach(f => {
     const b = document.createElement('button')
     b.className = `browser-filter ${f === modelFilter ? 'active' : ''}`
-    b.textContent = f === 'popular' ? '★ Popular' : 'All'
+    if (f === 'starred') b.innerHTML = `★ Starred <span class="filter-count">${presets.length}</span>`
+    else if (f === 'popular') b.textContent = 'Popular'
+    else b.textContent = 'All'
     b.onclick = () => { modelFilter = f; renderFilters(); renderModelList() }
     c.appendChild(b)
   })
@@ -199,7 +195,13 @@ async function testModel(id, btn) {
 function renderModelList() {
   const f = getFilteredModels()
   $('modelCount').textContent = `${f.length} / ${allModels.length}`
-  if (!f.length) { $('modelList').innerHTML = '<div class="browser-empty">No models found</div>'; return }
+  if (!f.length) {
+    const hint = modelFilter === 'starred'
+      ? 'No starred models — tap ☆ on any model in All'
+      : 'No models found'
+    $('modelList').innerHTML = `<div class="browser-empty">${hint}</div>`
+    return
+  }
   $('modelList').innerHTML = ''
   f.forEach(m => {
     const item = document.createElement('div')
@@ -209,15 +211,19 @@ function renderModelList() {
     const test = document.createElement('button'); test.className = 'browser-test'; test.textContent = '▶'; test.title = 'Test'
     test.onclick = e => { e.stopPropagation(); testModel(m.id, test) }
     acts.appendChild(test)
-    if (!presets.includes(m.id)) {
-      const add = document.createElement('button'); add.className = 'browser-add'
-      add.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
-      add.title = 'Add to presets'
-      add.onclick = e => { e.stopPropagation(); presets.push(m.id); savePresets(); toast(`Added ${shortLabel(m.id)}`, 'ok') }
-      acts.appendChild(add)
-    } else {
-      const chk = document.createElement('span'); chk.className = 'browser-check'; chk.textContent = '✓'; acts.appendChild(chk)
+    const starred = presets.includes(m.id)
+    const star = document.createElement('button')
+    star.className = `browser-star ${starred ? 'on' : ''}`
+    star.textContent = starred ? '★' : '☆'
+    star.title = starred ? 'Unstar — remove from fallback chain' : 'Star — add to fallback chain'
+    star.onclick = e => {
+      e.stopPropagation()
+      if (starred) presets = presets.filter(x => x !== m.id)
+      else presets.push(m.id)
+      savePresets()
+      toast(`${starred ? 'Unstarred' : 'Starred'} ${shortLabel(m.id)}`, 'ok')
     }
+    acts.appendChild(star)
     item.appendChild(acts)
     item.onclick = () => setModel(m.id)
     $('modelList').appendChild(item)
