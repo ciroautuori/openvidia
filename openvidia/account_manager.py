@@ -15,7 +15,6 @@ import json
 import logging
 import threading
 import time
-from functools import partial
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -250,7 +249,7 @@ class AccountManager:
             if new_key:
                 self._log_cb(f"✅ Replenished: {old_key[:12]}… → {new_key[:12]}…")
             else:
-                self._log_cb(f"✗ Replenish returned no key (sync fallback)")
+                self._log_cb("✗ Replenish returned no key (sync fallback)")
         except Exception as e:
             self._log_cb(f"❌ Replenish failed for {old_key[:12]}…: {e}")
         finally:
@@ -262,7 +261,7 @@ class AccountManager:
     async def _generate_and_swap_cdp(self, acct_name: str, old_key: str,
                                      acct_idx: int) -> Optional[str]:
         """Generate key via CDP for *acct_name* and swap it in."""
-        from .cdp_keygen import read_ws_url, generate_one_key, attach_and_get_sid
+        from .cdp_keygen import read_ws_url
         import websockets
 
         ws_url = read_ws_url()

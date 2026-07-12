@@ -16,8 +16,6 @@ Keys auto-extracted from accounts.json if keys.json is empty.
 import asyncio
 import json
 import os
-import signal
-import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +24,8 @@ from .proxy_state import ProxyStats
 from .server_manager import start
 
 PORT = 1919
+_tray_ref = None  # Riferimento globale al tray (anti-GC)
+_tray_hide = None  # Riferimento alla funzione hide per close-to-tray
 
 
 def _kill_stale_port(port: int):
@@ -109,33 +109,33 @@ def _setup_opencode():
             },
         }
         changed = True
-        print(f"✓ Added OpenVidia provider to opencode")
+        print("✓ Added OpenVidia provider to opencode")
     else:
         ov = providers["openvidia"]
         m = ov.setdefault("models", {})
         if "openvidia" not in m:
             m["openvidia"] = {"name": "OpenVidia", "tools": True}
             changed = True
-            print(f"✓ Added OpenVidia model to opencode provider")
+            print("✓ Added OpenVidia model to opencode provider")
 
     # Compaction auto per modelli NVIDIA (contesto più piccolo di Claude)
     comp = cfg.get("compaction")
     if not isinstance(comp, dict) or not comp.get("auto") or not comp.get("prune"):
         cfg["compaction"] = {"auto": True, "prune": True, "reserved": 8000}
         changed = True
-        print(f"✓ Enabled auto-compaction (prune=true, reserved=8000)")
+        print("✓ Enabled auto-compaction (prune=true, reserved=8000)")
 
     # Modello predefinito → openvidia/openvidia (provider/model_id)
     if cfg.get("model") != "openvidia/openvidia":
         cfg["model"] = "openvidia/openvidia"
         changed = True
-        print(f"✓ Default model set to openvidia/openvidia")
+        print("✓ Default model set to openvidia/openvidia")
 
     # Small model per task leggeri (titoli, etc.) — stesso provider
     if not cfg.get("small_model"):
         cfg["small_model"] = "openvidia/openvidia"
         changed = True
-        print(f"✓ Small model set to openvidia/openvidia")
+        print("✓ Small model set to openvidia/openvidia")
 
     # Instructions: punta ad AGENTS.md se esiste nel progetto
     agents_md = Path.cwd() / "AGENTS.md"
@@ -144,7 +144,7 @@ def _setup_opencode():
         if "AGENTS.md" not in instr:
             cfg["instructions"] = ["AGENTS.md"] + instr
             changed = True
-            print(f"✓ Instructions → AGENTS.md")
+            print("✓ Instructions → AGENTS.md")
 
     if changed:
         tmp = oc_path.with_suffix(".json.tmp")
@@ -209,8 +209,133 @@ async def main_async():
             await srv.shutdown()
 
 
+def _kill_proxy_by_port(port: int) -> None:
+    """Termina il processo in ascolto sulla porta — usato da Quit del tray."""
+    try:
+        import psutil
+        for conn in psutil.net_connections():
+            if conn.laddr.port == port and conn.status == "LISTEN" and conn.pid:
+                psutil.Process(conn.pid).terminate()
+    except Exception:
+        pass
+
+
+def _make_signaller(icon_path, window, port):
+    """Crea un QObject nel main thread con segnale 'create'.
+
+    L'emit cross-thread atterra sul Qt main loop via QueuedConnection,
+    eseguendo _create_tray nel thread giusto.
+    """
+    try:
+        from PyQt6.QtCore import QObject, pyqtSignal
+    except ImportError:
+        return None
+
+    class _Sig(QObject):
+        create = pyqtSignal()
+
+    s = _Sig()
+    s.create.connect(lambda: _create_tray(icon_path, window, port))
+    return s
+
+
+def _tray_waiter_factory(signaller, window):
+    """Crea la funzione per webview.start(func=...).
+
+    1) Aspetta QCoreApplication (pywebview l'ha creato)
+    2) Aspetta la finestra mostrata
+    3) Emette segnale cross-thread -> tray sul Qt main loop
+    """
+    import time as _time
+
+    def _waiter():
+        from PyQt6.QtCore import QCoreApplication
+
+        for _ in range(100):
+            if QCoreApplication.instance() is not None:
+                break
+            _time.sleep(0.2)
+        else:
+            return
+
+        if not window.events.shown.wait(20):
+            return
+
+        signaller.create.emit()
+
+    return _waiter
+
+
+def _create_tray(icon_path: str, window, port: int):
+    """Crea QSystemTrayIcon (eseguito sul Qt main loop).
+
+    Usa window.native (BrowserView/QMainWindow) per show/hide diretto,
+    bypassando i decorator pywebview."""
+
+    from PyQt6.QtCore import QCoreApplication
+    from PyQt6.QtGui import QAction, QIcon
+    from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
+
+    app = QCoreApplication.instance()
+    if app is None:
+        print("⚠ Tray: nessun QApplication", flush=True)
+        return
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        print("⚠ Tray: non disponibile su questo desktop", flush=True)
+        return
+
+    def _show_window():
+        w = window.native
+        if w is None:
+            return
+        w.show()
+        w.raise_()
+        w.activateWindow()
+
+    def _hide_window():
+        w = window.native
+        if w is None:
+            return
+        w.hide()
+
+    icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
+    tray = QSystemTrayIcon(icon)
+    tray.setToolTip("OpenVidia")
+
+    menu = QMenu()
+
+    show_action = QAction("Show")
+    show_action.triggered.connect(_show_window)
+    menu.addAction(show_action)
+
+    menu.addSeparator()
+
+    quit_action = QAction("Quit")
+    quit_action.triggered.connect(lambda: (_kill_proxy_by_port(port), app.quit()))
+    menu.addAction(quit_action)
+
+    tray.setContextMenu(menu)
+    tray.show()
+    print("● Tray icon attiva", flush=True)
+
+    def _on_activated(reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            _show_window()
+
+    tray.activated.connect(_on_activated)
+
+    # Riferimento globale per evitare garbage collection di tray/menu/azioni
+    global _tray_ref, _tray_hide
+    _tray_ref = (tray, menu, show_action, quit_action, _show_window, _on_activated)
+    _tray_hide = _hide_window
+
+
 def open_desk(port: int) -> None:
-    """Apre la dashboard in una finestra nativa pywebview."""
+    """Apre la dashboard in una finestra nativa pywebview con system tray."""
     try:
         import webview
     except ImportError:
@@ -222,7 +347,6 @@ def open_desk(port: int) -> None:
     url = f"http://localhost:{port}"
     assets = Path(__file__).resolve().parent.parent / "web" / "assets"
     icon_path = str(assets / "logo.png")
-    # pywebview auto-detect: Qt (KDE Wayland nativo) se disponibile, altrimenti GTK
     print(f"● Desktop window → {url}", flush=True)
 
     window = webview.create_window(
@@ -235,19 +359,38 @@ def open_desk(port: int) -> None:
         easy_drag=True,
     )
 
-    def kill_proxy():
+    signaller = _make_signaller(icon_path, window, port)
+
+    def on_closing():
+        """Close-to-tray: nasconde la finestra, NON uccide il proxy."""
         try:
-            import psutil
-            for conn in psutil.net_connections():
-                if conn.laddr.port == port and conn.status == "LISTEN" and conn.pid:
-                    psutil.Process(conn.pid).terminate()
+            h = _tray_hide
+            if h is not None:
+                h()
+            else:
+                window.hide()
         except Exception:
             pass
-        print("● Desk closed — proxy terminated", flush=True)
+        return False
 
-    window.events.closed += kill_proxy
+    window.events.closing += on_closing
+    window.events.closed += lambda: _kill_proxy_by_port(port)
 
-    webview.start(debug=False, icon=icon_path)
+    if signaller is not None:
+        webview.start(
+            func=_tray_waiter_factory(signaller, window),
+            debug=False,
+            icon=icon_path,
+        )
+    else:
+        # Fallback: niente tray, close = kill proxy
+        def kill_proxy():
+            _kill_proxy_by_port(port)
+            print("● Desk closed — proxy terminated", flush=True)
+
+        window.events.closing -= on_closing
+        window.events.closed += kill_proxy
+        webview.start(debug=False, icon=icon_path)
 
 
 def main():

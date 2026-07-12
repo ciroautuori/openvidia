@@ -400,7 +400,6 @@ def _get_fallback_model(state: ProxyState, failed_model: str) -> Optional[str]:
     Fallback basato sui preset utente: trova il modello successivo nei preset
     rispetto al modello attivo. Niente mapping hardcoded.
     """
-    import json as _json
     from . import config
 
     try:

@@ -234,7 +234,6 @@ function keyStatus(k, i, stats) {
   const s = stats ? stats[String(i)] : null
   if (s && s.cooldown > 0) return 'cooldown'
   if (s && s.success > 0) return 'fresh'
-  if (s && s.requests > 0) return 'stale'
   return 'idle'
 }
 
@@ -246,7 +245,6 @@ function updateFilterCounts(stats) {
     const st = keyStatus(k, i, sm)
     if (st === 'cooldown') cooldown++
     else if (st === 'fresh') fresh++
-    else if (st === 'stale') fresh++
     else idle++
     if (i === stats.active_index) active++
   })
@@ -274,18 +272,14 @@ function renderKeys(data) {
     const row = document.createElement('div')
     row.className = `key-row ${i === ai ? 'active' : ''}`
     const dot = document.createElement('span')
-    let dc = 'stale'
-    if (isCd) dc = 'dead'
-    else if (s && s.success > 0) dc = 'fresh'
-    else if (!s || !s.requests) dc = 'unused'
-    dot.className = `key-dot key-${dc}`
+    dot.className = `key-dot key-${status}`
     row.appendChild(dot)
     const val = document.createElement('span')
     val.className = 'key-val'; val.textContent = maskKey(k); val.title = k
     val.onclick = () => copyToClipboard(k)
     row.appendChild(val)
     const acts = document.createElement('div'); acts.className = 'key-acts'
-    if (i === ai) { const b = document.createElement('span'); b.className = 'key-badge'; b.textContent = isCd ? '⏳' : 'active'; acts.appendChild(b) }
+    if (i === ai) { const b = document.createElement('span'); b.className = `key-badge ${isCd ? 'cd' : ''}`; b.textContent = isCd ? '⏳' : 'active'; acts.appendChild(b) }
     const info = document.createElement('span'); info.className = 'key-info'
     if (isCd) { info.textContent = `⏳ ${Math.ceil(s.cooldown)}s`; info.title = s.cooldown_reason || '' }
     else if (s && s.requests > 0) { info.textContent = `${s.success}✓${s.failed > 0 ? ' ' + s.failed + '✗' : ''} ${timeAgo(s.last_used)}`; info.title = s.last_error || '' }

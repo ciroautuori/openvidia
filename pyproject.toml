@@ -11,6 +11,9 @@ dependencies = [
     "pywebview>=5.0",
     "PyGObject>=3.42; platform_system=='Linux'",
     "pycairo>=1.20; platform_system=='Linux'",
+    "PyQt6>=6.5; platform_system=='Linux'",
+    "PyQt6-WebEngine>=6.5; platform_system=='Linux'",
+    "qtpy>=2.4; platform_system=='Linux'",
 ]
 license = "MIT"
 authors = [{ name = "Ciro Autuori" }]

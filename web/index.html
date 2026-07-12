@@ -3,8 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="description" content="OpenVidia — local multi-key proxy control panel for NVIDIA-hosted models." />
     <title>OpenVidia</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -49,7 +52,7 @@
 
         <!-- ── MODEL PRESETS (cell-presets, solo se vuoi cambiarli) ── -->
         <div class="bento-cell cell-presets" data-dropdown>
-          <div class="bento-hd" data-toggle>
+          <div class="bento-hd" data-toggle data-idx="01">
             <span class="bento-ttl">Presets</span>
             <span class="bento-badge" id="presetCount">0</span>
             <span class="chevron">▸</span>
@@ -63,7 +66,7 @@
 
         <!-- ── KEY MANAGEMENT (subito dopo status/stats, full width, default aperto) ── -->
         <div class="bento-cell cell-keys col-span-4 open" data-dropdown>
-          <div class="bento-hd" data-toggle>
+          <div class="bento-hd" data-toggle data-idx="02">
             <span class="bento-ttl">Keys</span>
             <span class="bento-badge" id="keyCount">0</span>
             <span class="chevron">▸</span>
@@ -98,7 +101,7 @@
 
         <!-- ── MODELS (cell-models, col-span-2) ── -->
         <div class="bento-cell cell-models col-span-2" data-dropdown>
-          <div class="bento-hd" data-toggle>
+          <div class="bento-hd" data-toggle data-idx="03">
             <span class="bento-ttl">Models</span>
             <span class="bento-badge" id="modelCount">0</span>
             <span class="chevron">▸</span>
@@ -114,7 +117,7 @@
 
         <!-- ── ACTIVITY LOG (cell-log, col-span-2) ── -->
         <div class="bento-cell cell-log col-span-2" data-dropdown>
-          <div class="bento-hd" data-toggle>
+          <div class="bento-hd" data-toggle data-idx="04">
             <span class="bento-ttl"><span class="log-dot" id="logDot"></span>Activity</span>
             <span class="bento-badge" id="logCount">0</span>
             <span class="chevron">▸</span>
@@ -133,7 +136,7 @@
 
         <!-- ── CLI SETUP (cell-cli, full width) ── -->
         <div class="bento-cell cell-cli col-span-4" data-dropdown>
-          <div class="bento-hd" data-toggle>
+          <div class="bento-hd" data-toggle data-idx="05">
             <span class="bento-ttl">CLI Setup</span>
             <span class="chevron">▸</span>
           </div>

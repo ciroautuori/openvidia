@@ -13,7 +13,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from playwright.sync_api import sync_playwright, Page, BrowserContext, expect
+from playwright.sync_api import sync_playwright, Page, BrowserContext
 
 logger = logging.getLogger(__name__)
 

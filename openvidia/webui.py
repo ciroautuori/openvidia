@@ -5,11 +5,10 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from . import config
 from .proxy_state import ProxyState

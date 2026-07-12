@@ -285,7 +285,6 @@ async def generate_for_all(ws_url: str, accounts: List[dict],
 
     Returns [(account_name, key_or_error, success)].
     """
-    import websockets
 
     targets = await list_targets(ws_url)
     nv_pages = [t for t in targets

@@ -17,7 +17,6 @@ Niente astrazioni — solo traduzione di payload.
 from __future__ import annotations
 
 import json
-import time
 import uuid
 from typing import Any, AsyncGenerator
 
