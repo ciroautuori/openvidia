@@ -28,13 +28,34 @@ PORT = 1919
 
 
 def _kill_stale_port(port: int):
+    """Usa psutil (più robusto di fuser) per trovate e killlare il processo sulla porta."""
     import time as _time
     try:
-        subprocess.run(
-            ["fuser", "-k", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=5
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        pass
+        import psutil
+    except ImportError:
+        # Fallback a fuser se psutil non disponibile
+        try:
+            subprocess.run(
+                ["fuser", "-k", str(port) + "/tcp"], stderr=subprocess.DEVNULL, timeout=5
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            pass
+        return
+
+    killed = []
+    for conn in psutil.net_connections():
+        try:
+            if conn.laddr.port == port and conn.status == "LISTEN" and conn.pid:
+                proc = psutil.Process(conn.pid)
+                proc.terminate()
+                killed.append(f"{proc.name()}({proc.pid})")
+        except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+            continue
+
+    if killed:
+        print(f"● Killed stale process on port {port}: {', '.join(killed)}", flush=True)
+
+    # Aspetta che la porta si liberi
     for _ in range(30):
         try:
             subprocess.check_output(
@@ -161,11 +182,25 @@ async def main_async():
     saved_model = config.load_active_model()
 
     def log(msg: str):
-        print(msg)
+        print(msg, flush=True)
 
     web_dir = Path(__file__).resolve().parent.parent / "web"
     srv = await start(PORT, keys, log, stats, config.index_path(), web_dir=web_dir, initial_model=saved_model)
-    print(f"● OpenVidia running on :{PORT} ({len(keys)} keys)")
+    srv.state.log_cb(f"● OpenVidia running on :{PORT} ({len(keys)} keys)")
+
+    # AccountManager: auto-rigenerazione chiavi quando muoiono (dal VECCHIO)
+    try:
+        from .account_manager import AccountManager
+        am = AccountManager(srv.state, config.accounts_path())
+        am.set_log_cb(log)
+        am.load()
+        srv.state.on_key_failed = am.on_key_failed
+        asyncio.create_task(am.health_check_loop())
+        srv.state.log_cb(f"● AccountManager loaded ({len(am.accounts)} accounts)")
+    except ImportError:
+        pass  # playwright/websockets non installati — auto-rigenerazione disabilitata
+    except Exception as e:
+        srv.state.log_cb(f"⚠ AccountManager init failed: {e}")
 
     from .webui import auto_open
     auto_open(PORT)

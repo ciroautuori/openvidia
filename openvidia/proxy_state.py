@@ -1,16 +1,20 @@
 """
 Shared state for the running proxy.
 
-Cooldown + sliding-window RPM per key.
+Merges il meglio di entrambe le versioni:
+- Dal VECCHIO: KeyState con is_valid permanente, SSE listener push, persist asincrona,
+  on_key_failed callback, key setter con preservazione stati
+- Dal NUOVO: KeyCooldown dataclass, RpmTracker sliding window, COOLDOWN_DURATIONS,
+  mark_key_failed con Retry-After parsing, API cooldown completa
 """
 from __future__ import annotations
 
 import asyncio
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 from .config import atomic_write
 
@@ -31,7 +35,20 @@ COOLDOWN_DURATIONS: Dict[int, float] = {
 DEFAULT_COOLDOWN = 30.0
 
 
-# ── Models ─────────────────────────────────────────────────────────────
+# ── KeyState (dal VECCHIO — traccia is_valid permanente) ──────────────
+
+class KeyState:
+    """Per-key state: validità permanente + cooldown temporaneo."""
+    __slots__ = ("key", "is_valid", "cooldown_until", "last_error")
+
+    def __init__(self, key: str):
+        self.key = key
+        self.is_valid = True       # False = permanentemente morta (401/403)
+        self.cooldown_until = 0.0  # 0 = non in cooldown
+        self.last_error = ""
+
+
+# ── KeyCooldown (dal NUOVO — dataclass pulita per APICooldown) ─────────
 
 @dataclass
 class KeyCooldown:
@@ -47,6 +64,8 @@ class KeyCooldown:
     def active(self) -> bool:
         return self.remaining > 0
 
+
+# ── RPM Tracker (dal NUOVO — sliding window 60s) ─────────────────────
 
 class RpmTracker:
     """Sliding-window requests-per-minute counter per key."""
@@ -76,6 +95,8 @@ class RpmTracker:
         while self.timestamps and self.timestamps[0] < cutoff:
             self.timestamps.popleft()
 
+
+# ── Usage / Stats (identici in entrambe le versioni) ──────────────────
 
 class KeyUsage:
     __slots__ = ("requests", "success", "failed", "last_used", "last_error")
@@ -111,6 +132,8 @@ class ProxyStats:
             u.last_error = error
 
 
+# ── ProxyState (merge) ────────────────────────────────────────────────
+
 class ProxyState:
     def __init__(
         self,
@@ -120,28 +143,62 @@ class ProxyState:
         log_cb: Callable[[str], None],
         port: int = 3940,
     ):
-        self.keys: List[str] = list(keys)
+        self._keys: List[str] = list(keys)
+        self._key_states: Dict[str, KeyState] = {k: KeyState(k) for k in keys}
         self.stats = stats
         self.index_path = index_path
         self.port = port
         self.lock = asyncio.Lock()
+        self.save_lock = asyncio.Lock()
         self.log_buffer: deque = deque(maxlen=500)
         self._log_cb = log_cb
+        self.on_key_failed: Optional[Callable[[str], None]] = None
         self.active_model: Optional[str] = None
         self.running: bool = True
         self.health_task: Optional[asyncio.Task] = None
 
-        # Cooldown / RPM per key (replaces old unhealthy_keys set)
+        # Cooldown / RPM per key (dal NUOVO)
         self.cooldowns: Dict[str, KeyCooldown] = {}
         self.rpm: Dict[str, RpmTracker] = {}
 
-    # ── Logging ───────────────────────────────────────────────────────
+        # SSE listener push (dal VECCHIO)
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.get_event_loop()
+        self.listeners: Set[asyncio.Queue] = set()
+
+    # ── Keys (dal VECCHIO — preserva stati al update) ──────────────────
+
+    @property
+    def keys(self) -> List[str]:
+        return self._keys
+
+    @keys.setter
+    def keys(self, new_keys: List[str]) -> None:
+        self._keys = list(new_keys)
+        updated_states = {}
+        for k in new_keys:
+            if k in self._key_states:
+                updated_states[k] = self._key_states[k]
+            else:
+                updated_states[k] = KeyState(k)
+        self._key_states = updated_states
+
+    @property
+    def key_states(self) -> Dict[str, KeyState]:
+        return self._key_states
+
+    # ── Logging (dal VECCHIO — push ai listener SSE) ───────────────────
 
     def log_cb(self, msg: str) -> None:
         self._log_cb(msg)
         self.log_buffer.append(msg)
+        if self.loop and self.loop.is_running():
+            for q in list(self.listeners):
+                self.loop.call_soon_threadsafe(q.put_nowait, msg)
 
-    # ── Cooldown API ───────────────────────────────────────────────────
+    # ── Cooldown API (dal NUOVO — strutturata + Retry-After) ───────────
 
     def is_key_on_cooldown(self, key: str) -> bool:
         cd = self.cooldowns.get(key)
@@ -181,7 +238,38 @@ class ProxyState:
 
         self.set_cooldown(key, reason=reason, duration=duration)
 
-    # ── RPM API ────────────────────────────────────────────────────────
+        # Dal VECCHIO: marca permanentemente invalida per 401/403
+        if status in (401, 403):
+            ks = self._key_states.get(key)
+            if ks:
+                ks.is_valid = False
+                ks.last_error = f"HTTP {status}"
+            self.log_cb(f"⚠ key marked INVALID (HTTP {status})")
+        elif status in (400, 404, 429):
+            # Cooldown temporaneo — non invalida permanentemente
+            ks = self._key_states.get(key)
+            if ks:
+                ks.cooldown_until = time.time() + duration
+                ks.last_error = reason
+        else:
+            ks = self._key_states.get(key)
+            if ks:
+                ks.cooldown_until = time.time() + duration
+                ks.last_error = reason
+
+        # Callback per auto-rigenerazione (dal VECCHIO)
+        if self.on_key_failed is not None:
+            self.on_key_failed(key)
+
+    def restore_key(self, key: str) -> None:
+        """Ripristina una chiave dopo successo (dal VECCHIO)."""
+        self.clear_cooldown(key)
+        ks = self._key_states.get(key)
+        if ks:
+            ks.cooldown_until = 0.0
+            ks.is_valid = True
+
+    # ── RPM API (dal NUOVO) ────────────────────────────────────────────
 
     def record_request(self, key: str) -> None:
         t = self.rpm.get(key)
@@ -198,18 +286,36 @@ class ProxyState:
         t = self.rpm.get(key)
         return t is None or t.can_send()
 
-    # ── Composite helpers (used by proxy loop) ────────────────────────
+    # ── Composite helpers ──────────────────────────────────────────────
 
     def is_key_healthy(self, key: str) -> bool:
-        """A key is 'healthy' when not on cooldown (RPM is checked separately)."""
+        """Una chiave è healthy quando valida AND non in cooldown."""
+        ks = self._key_states.get(key)
+        if ks and not ks.is_valid:
+            return False
         return not self.is_key_on_cooldown(key)
 
-    def mark_key_healthy(self, key: str, healthy: bool) -> None:
-        """Legacy compat for health-check code — clears cooldown."""
-        if healthy:
-            self.clear_cooldown(key)
-        else:
-            self.mark_key_failed(key)  # mark with default cooldown
+    def clear_cooldown_and_restore(self, key: str) -> None:
+        """Usato dal health check per rivitalizzare una chiave."""
+        self.restore_key(key)
+
+    # ── Stats per key (dal NUOVO — include cooldown + RPM info) ─────────
+
+    def key_cooldown_info(self, key: str) -> tuple[float, str]:
+        """Ritorna (remaining_seconds, reason) per la UI."""
+        if self.is_key_on_cooldown(key):
+            return self.cooldown_remaining(key), self.cooldown_reason(key)
+        return 0.0, ""
+
+
+# ── Persist index asincrona (dal VECCHIO — non blocca il loop) ─────────
+
+async def _async_write_index(path: Path, i: int, lock: asyncio.Lock) -> None:
+    async with lock:
+        try:
+            await asyncio.to_thread(atomic_write, path, str(i))
+        except OSError:
+            pass
 
 
 def persist_index(state: ProxyState, i: int) -> None:
@@ -217,7 +323,4 @@ def persist_index(state: ProxyState, i: int) -> None:
     state.stats.current_index = i
     state.stats.active_key_index = i
     if previous != i:
-        try:
-            atomic_write(state.index_path, str(i))
-        except OSError:
-            pass
+        asyncio.create_task(_async_write_index(state.index_path, i, state.save_lock))

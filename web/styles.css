@@ -287,3 +287,16 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 4
   .log-box{height:200px}
   .keys-toolbar{flex-direction:column;align-items:stretch}
 }
+/* ── CLI Setup ─────────────────────────────── */
+.cli-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.cli-tab{padding:6px 14px;background:var(--c-elev);border:1px solid var(--c-border);border-radius:8px;color:var(--c-text-dim);font-size:.82rem;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .15s}
+.cli-tab:hover{border-color:var(--c-accent);color:var(--c-text)}
+.cli-tab.active{background:var(--c-accent);border-color:var(--c-accent);color:#fff;font-weight:600}
+.cli-tab-icon{font-size:.95rem}
+
+.cli-setup{max-width:100%}
+.cli-setup-content h4{margin:0 0 8px;font-size:.85rem;color:var(--c-text-dim);font-weight:500}
+.cli-step{margin-bottom:10px}
+.cli-step-label{font-size:.72rem;color:var(--c-accent);margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.cli-step-code{background:var(--c-bg);border:1px solid var(--c-border);border-radius:6px;padding:8px 12px;overflow-x:auto;margin:0}
+.cli-step-code code{font-family:'SF Mono',Consolas,'Source Code Pro',monospace;font-size:.78rem;line-height:1.5;white-space:pre;color:var(--c-text-dim)}

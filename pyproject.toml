@@ -3,7 +3,7 @@ name = "openvidia"
 version = "2.0.0"
 description = "NVIDIA NIM multi-key proxy with smart rate limiting, cooldown management, and web dashboard"
 requires-python = ">=3.12"
-dependencies = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27"]
+dependencies = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27", "psutil>=6.0", "playwright>=1.40", "websockets>=12.0"]
 license = "MIT"
 authors = [{ name = "Ciro Autuori" }]
 keywords = ["nvidia", "nim", "proxy", "rate-limiting", "api-gateway", "opencode"]

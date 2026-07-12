@@ -144,7 +144,7 @@ async function setModel(id) {
     await fetch('/api/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: id }) })
     activeModel = id
     $('activeModelDisplay').textContent = id || 'none'
-    renderPresets(); renderModelList()
+    renderPresets(); renderModelList(); renderUsage()
     toast(`Model: ${id || 'none'}`, 'ok')
   } catch (_) {}
 }
@@ -177,9 +177,9 @@ function renderFilters() {
 async function fetchModels() {
   try {
     const r = await fetch('/v1/models'); const d = await r.json()
-    allModels = (d.data || []).map(m => ({ id: m.id, owned_by: m.owned_by || '' }))
+    allModels = (d.data || d.models || []).map(m => ({ id: m.id, owned_by: m.owned_by || '' }))
     $('modelCount').textContent = allModels.length
-    renderFilters(); renderModelList()
+    renderFilters(); renderModelList(); renderUsage()
   } catch (_) { $('modelList').innerHTML = '<div class="browser-empty">Failed to load</div>' }
 }
 
@@ -198,7 +198,7 @@ async function testModel(id, btn) {
 
 function renderModelList() {
   const f = getFilteredModels()
-  $('modelCount').textContent = f.length
+  $('modelCount').textContent = `${f.length} / ${allModels.length}`
   if (!f.length) { $('modelList').innerHTML = '<div class="browser-empty">No models found</div>'; return }
   $('modelList').innerHTML = ''
   f.forEach(m => {
@@ -370,9 +370,9 @@ new EventSource('/api/logs/stream').onmessage = e => {
 }
 
 /* ── News ────────────────────────────────────── */
-async function loadNews() {
+async function loadNews(refresh = false) {
   try {
-    const d = await api('GET', '/api/news')
+    const d = await api('GET', `/api/news${refresh ? '?refresh=true' : ''}`)
     const news = d.news || []
     $('newsCount').textContent = news.length
     const list = $('newsList')
@@ -389,6 +389,104 @@ async function loadNews() {
   } catch (_) { $('newsList').innerHTML = '<div class="browser-empty">Failed to load</div>' }
 }
 
+/* ── Refresh news button ─────────────────────── */
+if ($('refreshNewsBtn')) {
+  $('refreshNewsBtn').addEventListener('click', async () => {
+    $('refreshNewsBtn').disabled = true
+    $('refreshNewsBtn').textContent = '…'
+    try { await loadNews(true); toast('News refreshed', 'ok') } catch (_) { toast('Refresh failed', 'error') }
+    $('refreshNewsBtn').disabled = false
+    $('refreshNewsBtn').textContent = '↻'
+  })
+}
+
+/* ── CLI Setup tab (opencode / Codex / Claude Code / Grok) ──────── */
+let currentCli = 'opencode'
+const CLI_TABS = [
+  { id: 'opencode', label: 'opencode', icon: '⚡' },
+  { id: 'codex',    label: 'Codex',    icon: '⬡' },
+  { id: 'claude',   label: 'Claude',   icon: '✦' },
+  { id: 'grok',     label: 'Grok',     icon: '✸' },
+]
+
+function renderCliTabs() {
+  const c = $('cliTabs')
+  if (!c) return
+  c.innerHTML = ''
+  CLI_TABS.forEach(t => {
+    const b = document.createElement('button')
+    b.className = `cli-tab ${t.id === currentCli ? 'active' : ''}`
+    b.innerHTML = `<span class="cli-tab-icon">${t.icon}</span>${t.label}`
+    b.onclick = () => { currentCli = t.id; renderCliTabs(); renderUsage() }
+    c.appendChild(b)
+  })
+}
+
+function renderUsage() {
+  const m = activeModel || 'openvidia'
+  const examples = {
+    opencode: {
+      title: 'opencode',
+      steps: [
+        { label: 'Config', code: `# ~/.config/opencode/opencode.json
+{
+  "provider": "openvidia",
+  "model": "${m}",
+  "api_base": "http://localhost:1919/v1"
+}` },
+        { label: 'Run', code: `opencode` },
+      ],
+    },
+    codex: {
+      title: 'Codex CLI',
+      steps: [
+        { label: 'Env', code: `export OPENAI_API_KEY=ignored
+export OPENAI_BASE_URL=http://localhost:1919/v1` },
+        { label: 'Config', code: `# ~/.codex/config.toml
+model = "${m}"
+api_base_url = "http://localhost:1919/v1"` },
+        { label: 'Run', code: `codex exec "explain this codebase"` },
+      ],
+    },
+    claude: {
+      title: 'Claude Code',
+      steps: [
+        { label: 'Env (temporary, this shell only)', code: `export ANTHROPIC_BASE_URL=http://localhost:1919
+export ANTHROPIC_API_KEY=ignored` },
+        { label: 'Run', code: `claude --model ${m}` },
+        { label: 'Or one-shot', code: `ANTHROPIC_BASE_URL=http://localhost:1919 \\
+  ANTHROPIC_API_KEY=ignored \\
+  claude -p "explain this file"` },
+      ],
+    },
+    grok: {
+      title: 'Grok (xAI)',
+      steps: [
+        { label: 'config.toml', code: `# ~/.grok/config.toml
+[provider.openvidia]
+base_url = "http://localhost:1919/v1"
+api_key = "ignored"
+
+[model."${m}"]
+provider = "openvidia"` },
+        { label: 'Run', code: `grok -m ${m} "explain this codebase"` },
+      ],
+    },
+  }
+
+  const ex = examples[currentCli]
+  if (!ex) return
+  const container = $('usageCode') || $('cliSetup')
+  if (!container) return
+  const stepsHtml = ex.steps.map((s, i) => `
+    <div class="cli-step">
+      <div class="cli-step-label">${i + 1}. ${s.label}</div>
+      <pre class="cli-step-code"><code>${s.code}</code></pre>
+    </div>
+  `).join('')
+  container.innerHTML = `<div class="cli-setup-content"><h4>${ex.title}</h4>${stepsHtml}</div>`
+}
+
 /* ── Init ───────────────────────────────────── */
 ;(async () => {
   try {
@@ -401,8 +499,11 @@ async function loadNews() {
     if (keys.length) toast(`${keys.length} keys loaded`, 'ok')
   } catch (_) {}
   await updateRunningState()
+  renderCliTabs()
+  renderUsage()
   setInterval(pollKeyStats, 2000)
   // Apri i primi due dropdown: Keys + Models
-  document.querySelectorAll('[data-dropdown]')[0]?.classList.add('open')
-  document.querySelectorAll('[data-dropdown]')[2]?.classList.add('open')
+  const dropdowns = document.querySelectorAll('[data-dropdown]')
+  dropdowns[0]?.classList.add('open')  // Keys
+  dropdowns[2]?.classList.add('open') // Models
 })()

@@ -160,11 +160,13 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
                         "freshness": "fresh" if (now - u.last_used) < 120 else
                                      "stale" if u.last_used > 0 else "unused",
                     })
-                # Cooldown / RPM
+                # Cooldown / RPM / validità
                 cd_rem = state.cooldown_remaining(k)
                 entry["cooldown"] = round(cd_rem, 1) if cd_rem > 0 else 0
                 entry["cooldown_reason"] = state.cooldown_reason(k) if cd_rem > 0 else ""
                 entry["rpm"] = state.key_rpm(k)
+                ks = state.key_states.get(k)
+                entry["is_valid"] = ks.is_valid if ks else True
                 stats[str(i)] = entry
             return {
                 "active_index": state.stats.active_key_index,
@@ -196,15 +198,16 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         return {"ok": True, "status": "running"}
 
     @app.get("/api/news")
-    async def api_news():
+    async def api_news(refresh: bool = False):
         cache_path = config.config_dir() / "news_cache.json"
-        # Check cache (1h TTL)
-        try:
-            cached = json.loads(cache_path.read_text())
-            if time.time() - cached.get("ts", 0) < 3600:
-                return cached["data"]
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            pass
+        # Check cache (1h TTL) — skip if refresh forced
+        if not refresh:
+            try:
+                cached = json.loads(cache_path.read_text())
+                if time.time() - cached.get("ts", 0) < 3600:
+                    return cached["data"]
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                pass
 
         news = []
         async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as cl:
@@ -311,19 +314,26 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
     @app.get("/api/logs/stream")
     async def log_stream(request: Request):
         async def event_generator():
-            last_len = 0
-            while True:
-                if await request.is_disconnected():
-                    break
-                buf = state.log_buffer
-                current_len = len(buf)
-                if current_len > last_len:
-                    for i in range(last_len, current_len):
-                        yield f"data: {json.dumps({'msg': buf[i]})}\n\n"
-                    last_len = current_len
-                else:
-                    yield ": heartbeat\n\n"
-                await asyncio.sleep(0.2)
+            q = asyncio.Queue()
+
+            # Invia lo storico attuale
+            buf = list(state.log_buffer)
+            for msg in buf:
+                yield f"data: {json.dumps({'msg': msg})}\n\n"
+
+            # Registra la coda per i nuovi log live (push, non polling)
+            state.listeners.add(q)
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        msg = await asyncio.wait_for(q.get(), timeout=2.0)
+                        yield f"data: {json.dumps({'msg': msg})}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": heartbeat\n\n"
+            finally:
+                state.listeners.discard(q)
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
