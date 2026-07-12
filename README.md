@@ -84,9 +84,9 @@ Without this, dead keys stay parked until you manually replace them.
 │                     OpenVidia (:1919)                       │
 │                                                             │
 │  ┌─────────────────────────────────────────────────────┐    │
-│  │               Desktop App (pywebview)                │    │
+│  │               Desktop App (pywebview)               │    │
 │  │  310×570 native window — Keys, Presets, Models,     │    │
-│  │  Activity log, CLI setup — all in one panel          │    │
+│  │  Activity log, CLI setup — all in one panel         │    │
 │  └─────────────────────────────────────────────────────┘    │
 │                          │                                  │
 │  ┌─────────────────────────────────────────────────────┐    │
