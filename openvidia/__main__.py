@@ -1,12 +1,11 @@
 """
-OpenVidia — minimal multi-key NVIDIA API proxy with web UI + desktop app.
+OpenVidia — minimal multi-key NVIDIA API proxy with desktop app.
 
 Install:
     pip install -e .
 
 Usage:
-    openvidia              # start proxy + browser dashboard
-    openvidia --desk       # start proxy + desktop window (pywebview)
+    openvidia              # start proxy + desktop window
     openvidia foreground    # foreground mode (logs stdout)
     openvidia setup        # configure opencode provider
 
@@ -204,9 +203,7 @@ async def main_async():
     except Exception as e:
         srv.state.log_cb(f"⚠ AccountManager init failed: {e}")
 
-    from .webui import auto_open
-    auto_open(PORT)
-
+    # foreground = solo log, niente UI
     try:
         while True:
             await asyncio.sleep(3600)
@@ -236,9 +233,9 @@ def open_desk(port: int) -> None:
     window = webview.create_window(
         "OpenVidia",
         url=url,
-        width=860,
-        height=560,
-        min_size=(400, 400),
+        width=760,
+        height=440,
+        min_size=(360, 300),
         text_select=True,
         easy_drag=True,
     )
@@ -272,14 +269,9 @@ def main():
         stdin=_sp.DEVNULL,
     )
 
-    # Apre la desk app (pywebview) — piu ordinata del browser
-    if "--web" in sys.argv:
-        _time.sleep(2)
-        from .webui import auto_open
-        auto_open(PORT)
-    else:
-        _time.sleep(3)
-        open_desk(PORT)
+    # Desk app — finestra nativa compatta
+    _time.sleep(3)
+    open_desk(PORT)
 
 
 if __name__ == "__main__":
