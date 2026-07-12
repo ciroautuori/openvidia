@@ -227,11 +227,11 @@ def open_desk(port: int) -> None:
         auto_open(port)
         return
 
-    # Su Wayland, GTK deve usare il backend wayland per gli eventi mouse/focus
+    # Su Wayland, WebKitGTK ha bug con eventi mouse: X11 (XWayland) funziona meglio
     wdisp = os.environ.get("WAYLAND_DISPLAY", "")
     if wdisp and not os.environ.get("GDK_BACKEND"):
-        os.environ["GDK_BACKEND"] = "wayland"
-        print("● GDK_BACKEND=wayland (Wayland detected)", flush=True)
+        os.environ["GDK_BACKEND"] = "x11"
+        print("● GDK_BACKEND=x11 (Wayland detected, XWayland for WebKitGTK compat)", flush=True)
 
     url = f"http://localhost:{port}"
     assets = Path(__file__).resolve().parent.parent / "web" / "assets"
