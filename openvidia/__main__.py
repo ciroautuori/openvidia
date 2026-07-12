@@ -234,7 +234,7 @@ def open_desk(port: int) -> None:
         "OpenVidia",
         url=url,
         width=310,
-        height=580,
+        height=570,
         min_size=(260, 300),
         text_select=True,
         easy_drag=True,
