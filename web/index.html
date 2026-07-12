@@ -47,7 +47,7 @@
           <div class="stat-mini" id="cdMini"><span class="stat-num" id="statCooldowns">0</span><span class="stat-label">⏳</span></div>
         </div>
 
-        <!-- ── MODEL PRESETS (cell-presets) ── -->
+        <!-- ── MODEL PRESETS (cell-presets, solo se vuoi cambiarli) ── -->
         <div class="bento-cell cell-presets" data-dropdown>
           <div class="bento-hd" data-toggle>
             <span class="bento-ttl">Presets</span>
@@ -57,6 +57,41 @@
           <div class="bento-body" data-body>
             <div class="bento-body-inner">
               <div class="preset-grid" id="quickSwitch"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── KEY MANAGEMENT (subito dopo status/stats, full width, default aperto) ── -->
+        <div class="bento-cell cell-keys col-span-4 open" data-dropdown>
+          <div class="bento-hd" data-toggle>
+            <span class="bento-ttl">Keys</span>
+            <span class="bento-badge" id="keyCount">0</span>
+            <span class="chevron">▸</span>
+          </div>
+          <div class="bento-body" data-body>
+            <div class="bento-body-inner">
+              <div class="keys-toolbar">
+                <div class="key-filters" id="keyFilters">
+                  <button class="key-filter active" data-filter="all">All <span class="filter-count" id="fAll">0</span></button>
+                  <button class="key-filter" data-filter="active">Active <span class="filter-count" id="fActive">0</span></button>
+                  <button class="key-filter" data-filter="cooldown">⏳ <span class="filter-count" id="fCooldown">0</span></button>
+                  <button class="key-filter" data-filter="fresh">● <span class="filter-count" id="fFresh">0</span></button>
+                  <button class="key-filter" data-filter="idle">Idle <span class="filter-count" id="fIdle">0</span></button>
+                </div>
+                <button class="btn btn-sm btn-primary" id="addKeyBtn">+ Add Key</button>
+              </div>
+              <div class="slide-form hidden" id="keyAddForm">
+                <input type="text" id="newKeyInput" spellcheck="false" placeholder="nvapi-…" autocomplete="off" />
+                <div class="slide-form-actions">
+                  <button class="btn btn-sm btn-primary" id="confirmAddKeyBtn">Add</button>
+                  <button class="btn btn-sm" id="cancelAddKeyBtn">Cancel</button>
+                </div>
+              </div>
+              <div class="empty-state hidden" id="keysEmpty">
+                <div class="empty-ttl">No keys loaded</div>
+                <div class="empty-desc">Add keys with the button above</div>
+              </div>
+              <div id="keysList" class="keys-list"></div>
             </div>
           </div>
         </div>
@@ -71,45 +106,6 @@
           <div class="bento-body" data-body>
             <div class="bento-body-inner">
               <div id="newsList"><div class="browser-empty">Loading…</div></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- ── KEY MANAGEMENT (cell-keys, full width) ── -->
-        <div class="bento-cell cell-keys col-span-4" data-dropdown>
-          <div class="bento-hd" data-toggle>
-            <span class="bento-ttl">Keys</span>
-            <span class="bento-badge" id="keyCount">0</span>
-            <span class="chevron">▸</span>
-          </div>
-          <div class="bento-body" data-body>
-            <div class="bento-body-inner">
-              <!-- Toolbar: filters + add key -->
-              <div class="keys-toolbar">
-                <div class="key-filters" id="keyFilters">
-                  <button class="key-filter active" data-filter="all">All <span class="filter-count" id="fAll">0</span></button>
-                  <button class="key-filter" data-filter="active">Active <span class="filter-count" id="fActive">0</span></button>
-                  <button class="key-filter" data-filter="cooldown">⏳ <span class="filter-count" id="fCooldown">0</span></button>
-                  <button class="key-filter" data-filter="fresh">● <span class="filter-count" id="fFresh">0</span></button>
-                  <button class="key-filter" data-filter="idle">Idle <span class="filter-count" id="fIdle">0</span></button>
-                </div>
-                <button class="btn btn-sm btn-primary" id="addKeyBtn">+ Add Key</button>
-              </div>
-              <!-- Slide form for new key -->
-              <div class="slide-form hidden" id="keyAddForm">
-                <input type="text" id="newKeyInput" spellcheck="false" placeholder="nvapi-…" autocomplete="off" />
-                <div class="slide-form-actions">
-                  <button class="btn btn-sm btn-primary" id="confirmAddKeyBtn">Add</button>
-                  <button class="btn btn-sm" id="cancelAddKeyBtn">Cancel</button>
-                </div>
-              </div>
-              <!-- Empty state -->
-              <div class="empty-state hidden" id="keysEmpty">
-                <div class="empty-ttl">No keys loaded</div>
-                <div class="empty-desc">Add keys with the button above</div>
-              </div>
-              <!-- Key rows -->
-              <div id="keysList" class="keys-list"></div>
             </div>
           </div>
         </div>
@@ -149,7 +145,7 @@
           </div>
         </div>
 
-        <!-- ── CLI SETUP (cell-cli, full width, dopo Activity come Keys) ── -->
+        <!-- ── CLI SETUP (cell-cli, full width) ── -->
         <div class="bento-cell cell-cli col-span-4" data-dropdown>
           <div class="bento-hd" data-toggle>
             <span class="bento-ttl">CLI Setup</span>

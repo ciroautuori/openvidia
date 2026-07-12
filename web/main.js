@@ -502,8 +502,4 @@ provider = "openvidia"` },
   renderCliTabs()
   renderUsage()
   setInterval(pollKeyStats, 2000)
-  // Apri i primi due dropdown: Keys + Models
-  const dropdowns = document.querySelectorAll('[data-dropdown]')
-  dropdowns[0]?.classList.add('open')  // Keys
-  dropdowns[2]?.classList.add('open') // Models
 })()
