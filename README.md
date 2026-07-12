@@ -3,7 +3,7 @@
 **Multi-key proxy for NVIDIA NIM with a native desktop dashboard.**
 
 <p align="center">
-  <img src="web/assets/dashboard.png" alt="OpenVidia desktop dashboard — 22 pooled keys, ★ Starred model shortlist, live status" width="820">
+  <img src="web/assets/dashboard.gif" alt="OpenVidia dashboard — pooled keys, ★ Starred model shortlist, star any model into the fallback chain" width="400">
 </p>
 
 Pool multiple free-tier API keys behind one endpoint. Automatic rotation, per-key cooldown, sliding-window RPM limiting, and a compact desktop app — no browser needed.
