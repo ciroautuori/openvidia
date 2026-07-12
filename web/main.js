@@ -5,7 +5,7 @@ let allModels = []
 let presets = []
 let _logEntries = 0
 let modelFilter = 'popular'
-let keyFilter = 'all'
+let keyFilter = 'active'
 let _lastKeyStats = null
 
 /* ── Popular models shortcut ─────────────────── */
