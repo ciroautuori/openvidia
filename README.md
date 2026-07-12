@@ -2,6 +2,10 @@
 
 **Multi-key proxy for NVIDIA NIM with a native desktop dashboard.**
 
+<p align="center">
+  <img src="web/assets/dashboard.png" alt="OpenVidia desktop dashboard — 22 pooled keys, ★ Starred model shortlist, live status" width="820">
+</p>
+
 Pool multiple free-tier API keys behind one endpoint. Automatic rotation, per-key cooldown, sliding-window RPM limiting, and a compact desktop app — no browser needed.
 
 Built for [opencode](https://opencode.ai), [Codex CLI](https://github.com/openai/codex), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Grok](https://x.ai), and any OpenAI-compatible client.
