@@ -227,12 +227,18 @@ def open_desk(port: int) -> None:
         auto_open(port)
         return
 
+    # Su Wayland, GTK deve usare il backend wayland per gli eventi mouse/focus
+    wdisp = os.environ.get("WAYLAND_DISPLAY", "")
+    if wdisp and not os.environ.get("GDK_BACKEND"):
+        os.environ["GDK_BACKEND"] = "wayland"
+        print("● GDK_BACKEND=wayland (Wayland detected)", flush=True)
+
     url = f"http://localhost:{port}"
     assets = Path(__file__).resolve().parent.parent / "web" / "assets"
     icon_path = str(assets / "logo.png")
     print(f"● Desktop window → {url}", flush=True)
 
-    # Crea la finestra (pywebview usa gia' frame nativo GTK, no barra WebKit extra)
+    # Crea la finestra (pywebview usa frame nativo GTK, no barra WebKit extra)
     window = webview.create_window(
         "OpenVidia",
         url=url,
