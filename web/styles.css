@@ -275,7 +275,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 4
   .col-span-4{grid-column:span 2}
 }
 
-/* ── Responsive: mobile (1 col) ─────────────── */
+/* ── Responsive: narrow / phone portrait ─────── */
 @media(max-width:600px){
   body{padding:8px}
   #app{max-width:100%}
@@ -286,6 +286,24 @@ header{display:flex;align-items:center;justify-content:space-between;padding:0 4
   .keys-list{max-height:240px}
   .log-box{height:200px}
   .keys-toolbar{flex-direction:column;align-items:stretch}
+}
+@media(max-width:400px){
+  body{padding:6px}
+  header{flex-wrap:wrap;gap:6px}
+  .header-right{gap:6px}
+  .header-stat{font-size:.55rem;padding:2px 7px}
+  .cell-status{gap:8px;padding:10px 12px}
+  .cell-stats{padding:10px 8px;flex-wrap:wrap;gap:6px}
+  .bento-hd{padding:10px 12px}
+  .bento-body-inner{padding:0 12px 12px}
+  .key-row{padding:6px 10px;gap:6px}
+  .key-val{font-size:.64rem}
+  .key-info{font-size:.52rem}
+  .preset-grid button{min-width:70px;padding:7px 8px;font-size:.66rem}
+  .log-box{height:160px}
+  .log-entry{padding:1px 6px}
+  .log-time{font-size:.54rem}
+  .toast{max-width:220px;font-size:.66rem}
 }
 /* ── CLI Setup ─────────────────────────────── */
 .cli-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
