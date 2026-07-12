@@ -236,9 +236,9 @@ def open_desk(port: int) -> None:
     window = webview.create_window(
         "OpenVidia",
         url=url,
-        width=1100,
-        height=720,
-        min_size=(480, 600),
+        width=860,
+        height=560,
+        min_size=(400, 400),
         text_select=True,
         easy_drag=True,
     )
@@ -257,26 +257,11 @@ def main():
     if len(sys.argv) > 1:
         if sys.argv[1] == "setup":
             _setup_cmd()
+            return
         if sys.argv[1] == "foreground":
             asyncio.run(main_async())
             return
 
-    # Desckapp mode: proxy in background + finestra nativa pywebview
-    if "--desk" in sys.argv:
-        import subprocess as _sp
-        import time as _time
-
-        _kill_stale_port(PORT)
-        _sp.Popen(
-            [sys.executable, "-m", "openvidia", "foreground"],
-            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-            stdin=_sp.DEVNULL,
-        )
-        _time.sleep(3)
-        open_desk(PORT)
-        sys.exit(0)
-
-    # Daemon mode — spawn proxy in background
     import subprocess as _sp
     import time as _time
     _kill_stale_port(PORT)
@@ -287,9 +272,14 @@ def main():
         stdin=_sp.DEVNULL,
     )
 
-    _time.sleep(2)
-    from .webui import auto_open
-    auto_open(PORT)
+    # Apre la desk app (pywebview) — piu ordinata del browser
+    if "--web" in sys.argv:
+        _time.sleep(2)
+        from .webui import auto_open
+        auto_open(PORT)
+    else:
+        _time.sleep(3)
+        open_desk(PORT)
 
 
 if __name__ == "__main__":
