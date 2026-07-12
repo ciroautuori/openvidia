@@ -119,6 +119,7 @@ NVIDIA's free NIM tier limits each API key to ~40 RPM. Aggressive bursts trigger
 - **Sliding-window RPM limiting** — keeps each key under 28 RPM (safe margin below 40)
 - **Health checks** — revives keys whose cooldowns have expired
 - **Degraded fallback** — if a model fails on all keys, tries the next preset
+- **Auto-compaction** — summarizes long histories so requests never fail on context overflow ([details](#auto-compaction))
 
 ---
 
@@ -171,6 +172,8 @@ claude --model openvidia
 ```
 
 > The `/v1/messages` endpoint translates Anthropic format ↔ OpenAI chat/completions bidirectionally (streaming, tool use, system prompts). Claude Code works unmodified.
+>
+> **Images:** NVIDIA NIM models are text-only, so image blocks (e.g. screenshots) can't be processed. Instead of silently dropping them, OpenVidia replaces each with a `[image omitted: model has no vision]` placeholder so the model stays aware, and logs a warning in the **Activity** panel.
 
 ### Grok (xAI)
 
@@ -214,7 +217,7 @@ Streaming (SSE) is fully supported — tokens flow through unbuffered.
 |-------------|----------|--------|
 | **429** | `Retry-After` header (or 60s) | Rate limited — respect NVIDIA's backoff |
 | **401 / 403** | 3600s | Dead key — don't waste requests |
-| **400 / 404** | 120s | Model access issue — might be temporary |
+| **400 / 404** | — (no cooldown) | Deterministic request error (bad payload / unknown model) — returned to the client immediately, **key untouched**. Rotating wouldn't help: every key gets the same error. |
 | **5xx** | 30s | Server error — retry soon |
 | **Network error** | 30s | Transient connectivity issue |
 
@@ -230,6 +233,7 @@ Request arrives
     ├─ Key on cooldown? → skip, try next
     ├─ Key RPM ≥ 28?   → skip, try next
     ├─ Send to NVIDIA  → 200? ✅ record RPM, return response
+    │                  → 400/404? return to client (no rotation, key untouched)
     │                  → 429? read Retry-After, set cooldown, rotate
     │                  → 401? set 3600s cooldown, rotate
     │                  → 5xx? set 30s cooldown, rotate
@@ -244,6 +248,53 @@ Every 30 seconds:
 2. Sends a lightweight `GET /v1/models` probe
 3. If the key responds OK — clears the cooldown (revived)
 4. If still failing — leaves the cooldown in place
+
+---
+
+## Auto-Compaction
+
+Long conversations eventually exceed the model's context window. Without handling, the upstream returns a `400`, and — since that error is identical on every key — a naive proxy would burn through the whole pool before dying. **OpenVidia never blocks on context overflow.**
+
+Before forwarding a request, if the estimated history exceeds a token budget, OpenVidia compacts it:
+
+```
+history > budget?
+    │
+    ├─ Summarize  → fold old messages into a dense summary via ONE upstream call.
+    │               Roll-forward cache: each turn summarizes only the *new* aged-out
+    │               messages on top of the previous summary — not from scratch.
+    │               System prompt + last N turns are always kept verbatim.
+    │
+    └─ Summarize failed (all keys down / timeout / still too long)?
+        └─ Trim  → deterministic fallback: keep system + first + most recent
+                   messages that fit the budget. Zero cost, never fails.
+```
+
+- **Works for every client** — hooks both `/v1/chat/completions` (opencode / Codex) and the `/v1/messages` Anthropic shim (Claude Code).
+- **Cheap** — a cache-hit costs zero extra calls; only genuinely new content is ever summarized.
+- **Safe** — if summarization can't run, trimming guarantees the request still goes through.
+
+Watch it in the **Activity** log: `⧉ compaction: summarized N msgs → …`.
+
+### Tuning
+
+Optional — create `~/.config/openvidia/compaction.json` (defaults shown):
+
+```json
+{
+  "enabled": true,
+  "budget_tokens": 100000,
+  "keep_recent": 8,
+  "summary_max_tokens": 1024
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `enabled` | Turn compaction on/off |
+| `budget_tokens` | History size (estimated) that triggers compaction |
+| `keep_recent` | Most recent messages always kept verbatim |
+| `summary_max_tokens` | Cap on the generated summary length |
 
 ---
 
@@ -314,6 +365,7 @@ update-desktop-database ~/.local/share/applications/
 | `presets.json` | Saved model presets |
 | `active_model` | Currently active model (persists across restarts) |
 | `index` | Key rotation index |
+| `compaction.json` | Auto-compaction tuning (optional — see [Auto-Compaction](#auto-compaction)) |
 | `accounts.json` | Legacy accounts (auto-extracted to keys.json) |
 
 Add keys via the dashboard (**Keys** section) or edit `keys.json`:

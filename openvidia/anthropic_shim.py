@@ -28,6 +28,21 @@ from .proxy_state import ProxyState
 
 UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
 
+# 400/404 sono deterministici sul contenuto (payload malformato / modello
+# inesistente): ruotare non aiuta e sprecherebbe chiavi. Si ritorna al client.
+_CLIENT_ERR = {400, 404}
+
+
+def _extract_err(raw: bytes, status: int) -> str:
+    try:
+        d = json.loads(raw)
+        m = d.get("error", {})
+        if isinstance(m, dict):
+            m = m.get("message")
+        return str(m or d.get("detail") or raw.decode("utf-8", "replace"))
+    except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
+        return raw.decode("utf-8", "replace") if raw else f"HTTP {status}"
+
 
 # ── Request: Anthropic Messages -> chat/completions ──────────────────
 
@@ -106,7 +121,10 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
                     "content": str(tr_content),
                 })
 
-            # image blocks: ignorati (NVIDIA NIM non supporta vision)
+            elif btype == "image":
+                # NVIDIA NIM non supporta vision: placeholder testuale cosi' il
+                # modello sa che c'era un'immagine (invece del drop silenzioso).
+                text_parts.append("[immagine omessa: il modello non supporta vision]")
 
         # Costruisci il messaggio finale
         if role == "assistant":
@@ -323,10 +341,17 @@ async def _stream_anthropic(
             break
 
         err_status = resp.status_code
-        await resp.aread()
+        err_raw = await resp.aread()
         await resp.aclose()
         resp = None
         state.log_cb(f"  anthropic shim: key HTTP {err_status}")
+        if err_status in _CLIENT_ERR:
+            # deterministico: errore al client, niente rotazione ne' cooldown
+            yield _sse_event("error", {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": _extract_err(err_raw, err_status)},
+            })
+            return
         state.mark_key_failed(k, status=err_status)
 
     if resp is None or used_key is None:
@@ -505,8 +530,24 @@ async def handle_anthropic_messages(
         f"tools={len(body.get('tools', []))}"
     )
 
+    n_img = sum(
+        1
+        for m in body.get("messages", [])
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "image"
+    )
+    if n_img:
+        state.log_cb(f"  ⚠ anthropic: {n_img} immagine/i omessa/e (NVIDIA NIM no-vision)")
+
     model_override = state.active_model
     chat_payload = _build_chat_payload(body, model_override)
+
+    # Auto-compaction: se la history supera il budget, riassumi (fallback trim).
+    from .compaction import maybe_compact
+    chat_payload["messages"] = await maybe_compact(
+        chat_payload["messages"], state=state, client=client, log=state.log_cb
+    )
 
     want_stream = body.get("stream", False)
 
@@ -553,8 +594,16 @@ async def handle_anthropic_messages(
             used_key = k
             break
         err_status = resp.status_code
+        err_raw = await resp.aread()
         await resp.aclose()
         resp = None
+        if err_status in _CLIENT_ERR:
+            # deterministico: errore al client, niente rotazione ne' cooldown
+            return JSONResponse(
+                {"type": "error",
+                 "error": {"type": "invalid_request_error", "message": _extract_err(err_raw, err_status)}},
+                status_code=err_status,
+            )
         state.mark_key_failed(k, status=err_status)
         continue
 

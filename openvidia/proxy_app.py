@@ -13,6 +13,7 @@ le chiavi, prova il modello successivo nei preset dell'utente.
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -29,7 +30,11 @@ from .anthropic_shim import handle_anthropic_messages
 UPSTREAM_BASE = "https://integrate.api.nvidia.com/v1/"
 MAX_BODY_BYTES = 64 * 1024 * 1024
 
-ROTATE_STATUSES = {400, 401, 403, 404, 429}
+# 400 (payload malformato) e 404 (modello inesistente) sono deterministici sul
+# contenuto: ruotare non aiuta (stesso errore su ogni chiave) e sprecherebbe
+# chiavi in cooldown. Vengono ritornati direttamente al client.
+# 401/403 (auth) e 429 (rate) sono invece colpa della chiave → rotazione+cooldown.
+ROTATE_STATUSES = {401, 403, 429}
 
 
 def should_rotate(status: int) -> bool:
@@ -98,7 +103,33 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
 
 
 def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
-    app = FastAPI()
+    # Connection pooling tuned (dal VECCHIO) + HTTP/2 (dal NUOVO)
+    limits = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0)
+    client = httpx.AsyncClient(
+        http2=True,
+        limits=limits,
+        timeout=httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=120.0),
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # startup: pre-warm chiavi + health check in background
+        async def _pre_warm():
+            state.log_cb("⚕ pre-warm: checking all keys...")
+            await _health_check_all(state, client, force=True)
+            state.log_cb(
+                f"⚕ pre-warm done ({sum(1 for k in state.keys if state.is_key_healthy(k))}/{len(state.keys)} healthy)"
+            )
+        asyncio.create_task(_pre_warm())
+        state.health_task = asyncio.create_task(_background_health_check(state, client))
+        yield
+        # shutdown: ferma il task e chiudi il client
+        if state.health_task is not None:
+            state.health_task.cancel()
+        await client.aclose()
+
+    app = FastAPI(lifespan=lifespan)
+    app.state.http_client = client
 
     app.add_middleware(
         CORSMiddleware,
@@ -111,32 +142,6 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
     if web_dir and web_dir.exists():
         from .webui import attach_webui
         attach_webui(app, state, web_dir)
-
-    # Connection pooling tuned (dal VECCHIO) + HTTP/2 (dal NUOVO)
-    limits = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0)
-    client = httpx.AsyncClient(
-        http2=True,
-        limits=limits,
-        timeout=httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=120.0),
-    )
-    app.state.http_client = client
-
-    @app.on_event("startup")
-    async def _start_background_tasks():
-        async def _pre_warm():
-            state.log_cb("⚕ pre-warm: checking all keys...")
-            await _health_check_all(state, client, force=True)
-            state.log_cb(
-                f"⚕ pre-warm done ({sum(1 for k in state.keys if state.is_key_healthy(k))}/{len(state.keys)} healthy)"
-            )
-        asyncio.create_task(_pre_warm())
-        state.health_task = asyncio.create_task(_background_health_check(state, client))
-
-    @app.on_event("shutdown")
-    async def _close_client():
-        if state.health_task is not None:
-            state.health_task.cancel()
-        await client.aclose()
 
     # ── Shim Responses API → chat/completions (Codex) ────────────────
     @app.post("/v1/responses")
@@ -216,6 +221,20 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 body = json.dumps(payload).encode()
             elif m == "openvidia":
                 payload["model"] = DEFAULT_MODEL
+                body = json.dumps(payload).encode()
+
+        # ── Auto-compaction: history troppo lunga → riassunto (no block) ──
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("messages"), list)
+            and full_path.endswith("chat/completions")
+        ):
+            from .compaction import maybe_compact
+            new_messages = await maybe_compact(
+                payload["messages"], state=state, client=client, log=state.log_cb
+            )
+            if new_messages is not payload["messages"]:
+                payload["messages"] = new_messages
                 body = json.dumps(payload).encode()
 
         # ── Key rotation con bucket (dal VECCHIO meglio del NUOVO) ─────
