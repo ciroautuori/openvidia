@@ -24,13 +24,14 @@ else
 fi
 echo ""
 
-# ── 2. Configura opencode (se presente) ──────────
-echo "▶ Configura opencode..."
-if [ -f "$HOME/.config/opencode/opencode.json" ] || [ -f "$HOME/.opal/config.json" ]; then
-    python3 -m openvidia setup 2>/dev/null || true
-    echo "  ✓ opencode configurato"
+# ── 2. Auto-configura tutte le CLI trovate ────────
+echo "▶ Auto-configura CLI (opencode, Codex, Grok)..."
+if command -v uv >/dev/null 2>&1; then
+    uv run openvidia setup 2>/dev/null || true
+elif command -v openvidia >/dev/null 2>&1; then
+    openvidia setup 2>/dev/null || true
 else
-    echo "  ℹ opencode non trovato — salto (configura manualmente dopo)"
+    python3 -m openvidia setup 2>/dev/null || true
 fi
 echo ""
 
@@ -40,7 +41,7 @@ pkill -f "python.*-m openvidia" 2>/dev/null || true
 nohup python3 -m openvidia > /dev/null 2>&1 &
 sleep 3
 if curl -s http://localhost:1919/health >/dev/null 2>&1; then
-    KEYS=$(curl -s http://localhost:1919/health | python3 -c "import sys,json; print(json.load(sys.stdin).keys())" 2>/dev/null || echo "?")
+    KEYS=$(curl -s http://localhost:1919/health | python3 -c "import sys,json; print(json.load(sys.stdin).get('keys','?'))" 2>/dev/null || echo "?")
     echo "  ✓ Proxy attivo — $KEYS keys su http://localhost:1919"
     echo "  ✓ Desktop app aperta"
 else
@@ -55,5 +56,7 @@ echo "║   Comando:    openvidia                    ║"
 echo "║   Proxy:      http://localhost:1919/v1     ║"
 echo "║   Dashboard:  http://localhost:1919        ║"
 echo "╠════════════════════════════════════════════╣"
-echo "║   In opencode:  /model openvidia           ║"
+echo "║   opencode → /model openvidia              ║"
+echo "║   codex    → codex --model openvidia       ║"
+echo "║   grok     → grok --model openvidia        ║"
 echo "╚════════════════════════════════════════════╝"

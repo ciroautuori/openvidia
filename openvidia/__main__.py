@@ -7,7 +7,7 @@ Install:
 Usage:
     openvidia              # start proxy + desktop window
     openvidia foreground    # foreground mode (logs stdout)
-    openvidia setup        # configure opencode provider
+    openvidia setup        # auto-configure ALL detected CLIs (opencode, Codex, Grok)
 
 Dashboard + API at http://localhost:1919
 Edit keys via ~/.config/openvidia/keys.json or dashboard Keys tab.
@@ -16,6 +16,7 @@ Keys auto-extracted from accounts.json if keys.json is empty.
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -24,6 +25,8 @@ from .proxy_state import ProxyStats
 from .server_manager import start
 
 PORT = 1919
+ENV_VAR = "OPENVIDIA_API_KEY"
+ENV_VAL = "ignored"
 _tray_ref = None  # Riferimento globale al tray (anti-GC)
 _tray_hide = None  # Riferimento alla funzione hide per close-to-tray
 
@@ -156,16 +159,240 @@ def _setup_opencode():
     return True
 
 
+def _ensure_env_var():
+    """Assicura che OPENVIDIA_API_KEY=ignored sia nel file rc della shell."""
+    shell = os.environ.get("SHELL", "")
+    home = Path.home()
+    rc = home / ".zshrc"
+    if "bash" in shell:
+        rc = home / ".bashrc"
+    elif "fish" in shell:
+        rc = home / ".config" / "fish" / "config.fish"
+    else:
+        rc = home / ".zshrc"
+
+    rc.parent.mkdir(parents=True, exist_ok=True)
+
+    line = f"export {ENV_VAR}={ENV_VAL}"
+    try:
+        content = rc.read_text() if rc.exists() else ""
+    except OSError:
+        content = ""
+
+    if ENV_VAR in content:
+        return False
+
+    with open(rc, "a") as f:
+        if content and not content.endswith("\n"):
+            f.write("\n")
+        f.write(f"\n# OpenVidia proxy (NVIDIA NIM multi-key)\n{line}\n")
+    print(f"✓ Added {ENV_VAR}={ENV_VAL} to {rc}")
+    return True
+
+
+def _setup_codex():
+    """Configura Codex CLI (~/.codex/config.toml) per usare OpenVidia."""
+    codex_dir = Path.home() / ".codex"
+    if not codex_dir.exists():
+        print("ℹ Codex CLI not found — skipping")
+        return False
+
+    cfg_path = codex_dir / "config.toml"
+    content = cfg_path.read_text() if cfg_path.exists() else ""
+
+    changed = False
+    needs_model = not re.search(r'^model\s*=\s*"openvidia"', content, re.MULTILINE)
+    needs_provider = not re.search(r'^model_provider\s*=\s*"openvidia"', content, re.MULTILINE)
+    needs_block = "[model_providers.openvidia]" not in content
+
+    if needs_model or needs_provider or needs_block:
+        lines = content.splitlines()
+        new_lines = []
+        in_openvidia_block = False
+        model_set = False
+        provider_set = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Salta vecchie righe model= / model_provider= per sovrascriverle
+            if stripped.startswith("model ") or stripped.startswith("model="):
+                if not model_set:
+                    new_lines.append('model = "openvidia"')
+                    model_set = True
+                    if needs_model:
+                        changed = True
+                    continue
+            if stripped.startswith("model_provider ") or stripped.startswith("model_provider="):
+                if not provider_set:
+                    new_lines.append('model_provider = "openvidia"')
+                    provider_set = True
+                    if needs_provider:
+                        changed = True
+                    continue
+
+            # Salta vecchio blocco [model_providers.openvidia] se presente
+            if stripped == "[model_providers.openvidia]":
+                in_openvidia_block = True
+                continue
+            if in_openvidia_block and stripped.startswith("[") and stripped != "[model_providers.openvidia]":
+                in_openvidia_block = False
+            if in_openvidia_block:
+                continue
+
+            new_lines.append(line)
+
+        # Aggiungi model/model_provider in cima se non ancora messi
+        if not model_set:
+            new_lines.insert(0, f'model = "openvidia"')
+        if not provider_set:
+            new_lines.insert(1, f'model_provider = "openvidia"')
+
+        # Aggiungi blocco provider alla fine
+        new_lines.append("")
+        new_lines.append("# Provider custom: openvidia (NVIDIA NIM multi-key proxy)")
+        new_lines.append("[model_providers.openvidia]")
+        new_lines.append('name = "OpenVidia"')
+        new_lines.append(f'base_url = "http://localhost:{PORT}/v1"')
+        new_lines.append(f'env_key = "{ENV_VAR}"')
+        new_lines.append('wire_api = "responses"')
+        new_lines.append("")
+        changed = True
+
+        if changed:
+            cfg_path.write_text("\n".join(new_lines))
+            print("✓ Configured Codex CLI → ~/.codex/config.toml")
+    else:
+        print("✓ Codex CLI already configured")
+
+    # Also set env var in auth.json if Codex needs it
+    _ensure_env_var()
+    print(f"✓ Codex CLI ready — run: codex --model openvidia")
+    return True
+
+
+def _setup_grok():
+    """Configura Grok CLI (~/.grok/config.toml) per usare OpenVidia."""
+    grok_dir = Path.home() / ".grok"
+    if not grok_dir.exists():
+        print("ℹ Grok CLI not found — skipping")
+        return False
+
+    cfg_path = grok_dir / "config.toml"
+    content = cfg_path.read_text() if cfg_path.exists() else ""
+
+    has_model = re.search(r'^\[model\.openvidia\]', content, re.MULTILINE)
+    has_default = re.search(r'^default\s*=\s*"openvidia"', content, re.MULTILINE)
+
+    if has_model and has_default:
+        print("✓ Grok CLI already configured")
+        return True
+
+    block = """
+# Provider custom: openvidia (NVIDIA NIM multi-key proxy)
+[model.openvidia]
+api_key = "ignored"
+base_url = "http://localhost:{PORT}/v1"
+api_backend = "chat_completions"
+context_window = 128000
+""".format(PORT=PORT)
+
+    lines = content.splitlines()
+    new_lines = []
+    default_set = False
+    in_models_section = False
+    skip_old_openvidia = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Track [models] section
+        if stripped == "[models]":
+            in_models_section = True
+            new_lines.append(line)
+            continue
+        elif stripped.startswith("[") and stripped != "[models]":
+            in_models_section = False
+
+        # Replace default model in [models] section
+        if in_models_section and (stripped.startswith("default ") or stripped.startswith("default=")):
+            if not default_set:
+                new_lines.append('default = "openvidia"')
+                default_set = True
+                continue
+
+        # Skip old [model.openvidia] block
+        if stripped == "[model.openvidia]":
+            skip_old_openvidia = True
+            continue
+        if skip_old_openvidia and stripped.startswith("[") and stripped != "[model.openvidia]":
+            skip_old_openvidia = False
+        if skip_old_openvidia:
+            continue
+
+        new_lines.append(line)
+
+    if not default_set:
+        # Ensure [models] section exists with default
+        if "[models]" not in "\n".join(new_lines):
+            new_lines.insert(0, "[models]")
+            new_lines.insert(1, 'default = "openvidia"')
+            new_lines.insert(2, "")
+        else:
+            # Insert after [models] header
+            for i, l in enumerate(new_lines):
+                if l.strip() == "[models]":
+                    new_lines.insert(i + 1, 'default = "openvidia"')
+                    break
+        default_set = True
+
+    new_lines.append(block)
+
+    cfg_path.write_text("\n".join(new_lines))
+    print("✓ Configured Grok CLI → ~/.grok/config.toml")
+    _ensure_env_var()
+    print("✓ Grok CLI ready — run: grok -m openvidia")
+    return True
+
+
 def _setup_cmd():
-    ok = _setup_opencode()
-    if ok:
-        print("● Run 'opencode' to use the OpenVidia models.")
+    """Setup completo: configura tutte le CLI trovate (opencode, Codex, Grok)."""
+    print("╔════════════════════════════════════════════╗")
+    print("║   OpenVidia — Setup CLI auto-config        ║")
+    print("╚════════════════════════════════════════════╝")
+    print()
+
+    _ensure_env_var()
+    print()
+
+    _setup_opencode()
+    print()
+
+    _setup_codex()
+    print()
+
+    _setup_grok()
+    print()
+
+    print("╔════════════════════════════════════════════╗")
+    print("║   Setup completato!                       ║")
+    print("╠════════════════════════════════════════════╣")
+    print(f"║   Proxy:       http://localhost:{PORT}/v1")
+    print(f"║   Dashboard:   http://localhost:{PORT}")
+    print("║                                            ║")
+    print("║   opencode → /model openvidia              ║")
+    print("║   codex    → codex --model openvidia       ║")
+    print("║   grok     → grok --model openvidia        ║")
+    print("╚════════════════════════════════════════════╝")
+
     sys.exit(0)
 
 
 async def main_async():
     _kill_stale_port(PORT)
     _setup_opencode()
+    _setup_codex()
+    _setup_grok()
     keys = config.load_saved_keys_file()
     if not keys:
         keys = _extract_keys_from_accounts()

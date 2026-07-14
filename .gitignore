@@ -6,3 +6,7 @@ openvidia.egg-info/
 .env.local
 .next
 node_modules
+.ruff_cache/
+.codex/
+C:/
+.agents/

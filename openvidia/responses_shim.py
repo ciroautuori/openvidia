@@ -10,6 +10,7 @@ Traduce /v1/responses (l'API usata da Codex CLI) in /v1/chat/completions
 
 Niente astrazioni — solo traduzione di payload.
 """
+
 from __future__ import annotations
 
 import json
@@ -21,7 +22,106 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+
 from .proxy_state import ProxyState
+
+
+# ── Sanitize chat/completions messages (defensive) ────────────────────
+def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
+    """
+    Ensure every message is a valid OpenAI chat/completions message so
+    upstream never rejects a request with::
+
+        data did not match any variant of untagged enum
+        ChatCompletionRequestToolMessageContent
+
+    Rules applied:
+      - content must be a str (or None only when tool_calls are present on an
+        assistant message). Lists are flattened to text where possible.
+      - tool messages must have non-null string content and a tool_call_id.
+      - assistant messages with tool_calls get content coerced to "" (never
+        None) — NVIDIA NIM rejects content:null on non-tool messages.
+      - drop empty/unknown roles.
+    """
+    out: list[dict] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role not in ("system", "user", "assistant", "tool"):
+            continue
+        content = m.get("content")
+        tool_calls = m.get("tool_calls")
+
+        # Flatten list/array content to a text string (tool_call_output arrays,
+        # Codex content parts, multimodal that we reduce to text).
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    if part.get("type") in ("text", "input_text", "output_text"):
+                        parts.append(str(part.get("text", "")))
+                    else:
+                        parts.append(json.dumps(part, ensure_ascii=False))
+            content = chr(10).join(p for p in parts if p)
+        elif isinstance(content, dict):
+            content = json.dumps(content, ensure_ascii=False)
+        elif content is None:
+            content = ""
+        elif not isinstance(content, str):
+            content = str(content)
+
+        if role == "tool":
+            tcid = m.get("tool_call_id") or ""
+            if not tcid:
+                # Recover from tool_calls present on a previous assistant message:
+                # NVIDIA requires a matching tool_call_id; if absent, synthesize.
+                tcid = f"call_{uuid.uuid4().hex[:24]}"
+            if not content:
+                content = " "
+            out.append({"role": "tool", "tool_call_id": tcid, "content": content})
+            continue
+
+        if role == "assistant" and tool_calls:
+            # NVIDIA NIM rejects content: null on assistant messages; use "".
+            clean_calls = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                args = fn.get("arguments", "")
+                if not isinstance(args, str):
+                    args = json.dumps(args, ensure_ascii=False)
+                if not args:
+                    args = "{}"
+                clean_calls.append(
+                    {
+                        "id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {
+                            "name": fn.get("name", ""),
+                            "arguments": args,
+                        },
+                    }
+                )
+            if not clean_calls:
+                # Malformed tool_calls: treat as plain assistant text.
+                out.append({"role": "assistant", "content": content or " "})
+                continue
+            out.append(
+                {
+                    "role": "assistant",
+                    "content": content or "",
+                    "tool_calls": clean_calls,
+                }
+            )
+            continue
+
+        out.append({"role": role, "content": content or " "})
+    return out
+
 
 # ── Request: Responses input → chat/completions messages ─────────────
 
@@ -64,7 +164,9 @@ def _input_to_messages(input_data: Any) -> list[dict]:
             output = item.get("output", "")
             if isinstance(output, dict):
                 output = json.dumps(output)
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": str(output)})
+            messages.append(
+                {"role": "tool", "tool_call_id": call_id, "content": str(output)}
+            )
 
         elif typ == "function_call":
             # Una function call gia' fatta nel turno precedente — la ricostruiamo
@@ -72,14 +174,18 @@ def _input_to_messages(input_data: Any) -> list[dict]:
             name = item.get("name", "")
             arguments = item.get("arguments", "")
             call_id = item.get("call_id", "")
-            messages.append({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": arguments},
-                }],
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    ],
+                }
+            )
         # item type sconosciuto → skip
 
     return messages
@@ -100,25 +206,29 @@ def _tools_to_chat_tools(tools: list[dict]) -> list[dict]:
             continue
         # Formato flat (Codex) — nome e parametri al top level
         if "name" in tool:
-            chat_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool.get("name", ""),
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("parameters", {}),
-                },
-            })
+            chat_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", {}),
+                    },
+                }
+            )
         # Formato nested (standard OpenAI)
         elif "function" in tool:
             fn = tool["function"]
-            chat_tools.append({
-                "type": "function",
-                "function": {
-                    "name": fn.get("name", ""),
-                    "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
-                },
-            })
+            chat_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": fn.get("name", ""),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {}),
+                    },
+                }
+            )
     return chat_tools
 
 
@@ -148,11 +258,18 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
         payload["tools"] = _tools_to_chat_tools(tools)
 
     # Parametri opzionali pass-through (solo quelli compatibili con chat/completions)
-    for key in ("temperature", "top_p", "max_tokens", "max_completion_tokens", "stream"):
+    for key in (
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "max_completion_tokens",
+        "stream",
+    ):
         val = body.get(key)
         if val is not None:
             payload[key] = val
 
+    payload["messages"] = _sanitize_chat_messages(payload["messages"])
     return payload
 
 
@@ -173,24 +290,28 @@ def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
     if tool_calls:
         for tc in tool_calls:
             fn = tc.get("function", {})
-            output.append({
-                "type": "function_call",
-                "id": f"fc_{uuid.uuid4().hex[:24]}",
-                "call_id": tc.get("id", ""),
-                "name": fn.get("name", ""),
-                "arguments": fn.get("arguments", ""),
-            })
+            output.append(
+                {
+                    "type": "function_call",
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
+                    "call_id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", ""),
+                }
+            )
 
     # Text content → message item con content array (output_text)
     text = msg.get("content")
     if text:
-        output.append({
-            "type": "message",
-            "id": f"msg_{uuid.uuid4().hex[:24]}",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": text}],
-        })
+        output.append(
+            {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        )
 
     # Status
     finish = choice.get("finish_reason", "stop")
@@ -217,6 +338,7 @@ def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
 
 # ── Streaming: SSE chat chunks → SSE Responses events ─────────────────
 
+
 def _sse_event(event_type: str, data: dict) -> bytes:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
 
@@ -237,29 +359,35 @@ async def _stream_responses(
     created_ts = int(time.time())
 
     # Evento iniziale: response.created
-    yield _sse_event("response.created", {
-        "type": "response.created",
-        "response": {
-            "id": resp_id,
-            "object": "response",
-            "created_at": created_ts,
-            "model": model,
-            "output": [],
-            "status": "in_progress",
+    yield _sse_event(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": {
+                "id": resp_id,
+                "object": "response",
+                "created_at": created_ts,
+                "model": model,
+                "output": [],
+                "status": "in_progress",
+            },
         },
-    })
+    )
     # response.in_progress — Codex lo aspetta
-    yield _sse_event("response.in_progress", {
-        "type": "response.in_progress",
-        "response": {
-            "id": resp_id,
-            "object": "response",
-            "created_at": created_ts,
-            "model": model,
-            "output": [],
-            "status": "in_progress",
+    yield _sse_event(
+        "response.in_progress",
+        {
+            "type": "response.in_progress",
+            "response": {
+                "id": resp_id,
+                "object": "response",
+                "created_at": created_ts,
+                "model": model,
+                "output": [],
+                "status": "in_progress",
+            },
         },
-    })
+    )
 
     upstream = "https://integrate.api.nvidia.com/v1/chat/completions"
 
@@ -275,7 +403,9 @@ async def _stream_responses(
             "User-Agent": "openvidia/2.0",
         }
         try:
-            req = client.build_request("POST", upstream, json=chat_payload, headers=hdrs)
+            req = client.build_request(
+                "POST", upstream, json=chat_payload, headers=hdrs
+            )
             resp = await client.send(req, stream=True)
         except httpx.HTTPError:
             continue
@@ -294,17 +424,20 @@ async def _stream_responses(
 
     if resp is None or used_key is None:
         yield _sse_event("error", {"type": "error", "message": "all keys failed"})
-        yield _sse_event("response.failed", {
-            "type": "response.failed",
-            "response": {
-                "id": resp_id,
-                "object": "response",
-                "created_at": created_ts,
-                "model": model,
-                "output": [],
-                "status": "failed",
+        yield _sse_event(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "created_at": created_ts,
+                    "model": model,
+                    "output": [],
+                    "status": "failed",
+                },
             },
-        })
+        )
         return
 
     state.stats.success += 1
@@ -345,23 +478,29 @@ async def _stream_responses(
                 text_started = True
                 text_output_index = next_output_index
                 next_output_index += 1
-                yield _sse_event("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": text_output_index,
-                    "item": {
-                        "type": "message",
-                        "id": text_item_id,
-                        "role": "assistant",
-                        "status": "in_progress",
-                        "content": [],
+                yield _sse_event(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": text_output_index,
+                        "item": {
+                            "type": "message",
+                            "id": text_item_id,
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": [],
+                        },
                     },
-                })
-            yield _sse_event("response.output_text.delta", {
-                "type": "response.output_text.delta",
-                "item_id": text_item_id,
-                "output_index": text_output_index,
-                "delta": text_content,
-            })
+                )
+            yield _sse_event(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": text_item_id,
+                    "output_index": text_output_index,
+                    "delta": text_content,
+                },
+            )
             text_full += text_content
 
         # Tool call deltas
@@ -380,88 +519,110 @@ async def _stream_responses(
                     "arguments": "",
                     "output_index": tc_output_index,
                 }
-                yield _sse_event("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": tc_output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": fc_id,
-                        "call_id": call_id,
-                        "name": tc.get("function", {}).get("name", ""),
-                        "arguments": "",
-                        "status": "in_progress",
+                yield _sse_event(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": tc_output_index,
+                        "item": {
+                            "type": "function_call",
+                            "id": fc_id,
+                            "call_id": call_id,
+                            "name": tc.get("function", {}).get("name", ""),
+                            "arguments": "",
+                            "status": "in_progress",
+                        },
                     },
-                })
+                )
             tcm = tool_calls_map[idx]
             args_delta = tc.get("function", {}).get("arguments", "")
             if args_delta:
                 tcm["arguments"] += args_delta
-                yield _sse_event("response.function_call_arguments.delta", {
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": tcm["fc_id"],
-                    "output_index": tcm["output_index"],
-                    "delta": args_delta,
-                })
+                yield _sse_event(
+                    "response.function_call_arguments.delta",
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": tcm["fc_id"],
+                        "output_index": tcm["output_index"],
+                        "delta": args_delta,
+                    },
+                )
 
         # Finish
         finish = choice.get("finish_reason")
         if finish:
             if text_started:
-                yield _sse_event("response.output_text.done", {
-                    "type": "response.output_text.done",
-                    "item_id": text_item_id,
-                    "output_index": text_output_index,
-                    "text": text_full,
-                })
-                yield _sse_event("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": text_output_index,
-                    "item": {
-                        "type": "message",
-                        "id": text_item_id,
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{"type": "output_text", "text": text_full}],
+                yield _sse_event(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": text_item_id,
+                        "output_index": text_output_index,
+                        "text": text_full,
                     },
-                })
+                )
+                yield _sse_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": text_output_index,
+                        "item": {
+                            "type": "message",
+                            "id": text_item_id,
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": text_full}],
+                        },
+                    },
+                )
             for idx, tcm in tool_calls_map.items():
-                yield _sse_event("response.function_call_arguments.done", {
-                    "type": "response.function_call_arguments.done",
-                    "item_id": tcm["fc_id"],
-                    "output_index": tcm["output_index"],
-                    "arguments": tcm["arguments"],
-                })
-                yield _sse_event("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": tcm["output_index"],
-                    "item": {
-                        "type": "function_call",
-                        "id": tcm["fc_id"],
-                        "call_id": tcm["call_id"],
-                        "name": tcm["name"],
+                yield _sse_event(
+                    "response.function_call_arguments.done",
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": tcm["fc_id"],
+                        "output_index": tcm["output_index"],
                         "arguments": tcm["arguments"],
-                        "status": "completed",
                     },
-                })
+                )
+                yield _sse_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": tcm["output_index"],
+                        "item": {
+                            "type": "function_call",
+                            "id": tcm["fc_id"],
+                            "call_id": tcm["call_id"],
+                            "name": tcm["name"],
+                            "arguments": tcm["arguments"],
+                            "status": "completed",
+                        },
+                    },
+                )
             break
 
     # response.completed finale
-    yield _sse_event("response.completed", {
-        "type": "response.completed",
-        "response": {
-            "id": resp_id,
-            "object": "response",
-            "created_at": created_ts,
-            "model": model,
-            "output": [],
-            "status": "completed",
+    yield _sse_event(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "response": {
+                "id": resp_id,
+                "object": "response",
+                "created_at": created_ts,
+                "model": model,
+                "output": [],
+                "status": "completed",
+            },
         },
-    })
+    )
 
     await resp.aclose()
 
 
 # ── Handler principale ─────────────────────────────────────────────────
+
 
 async def handle_responses(
     request: Request,
@@ -479,10 +640,19 @@ async def handle_responses(
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
     # Log per debug
-    state.log_cb(f"  responses: model={body.get('model','?')} stream={body.get('stream',False)} tools={len(body.get('tools',[]))}")
+    state.log_cb(
+        f"  responses: model={body.get('model', '?')} stream={body.get('stream', False)} tools={len(body.get('tools', []))}"
+    )
 
     model_override = state.active_model
     chat_payload = _build_chat_payload(body, model_override)
+
+    # Auto-compaction: history troppo lunga -> riassunto (fallback trim).
+    from .compaction import maybe_compact
+
+    chat_payload["messages"] = await maybe_compact(
+        chat_payload["messages"], state=state, client=client, log=state.log_cb
+    )
 
     want_stream = body.get("stream", False)
 
@@ -495,7 +665,14 @@ async def handle_responses(
     if want_stream:
         chat_payload["stream"] = True
         return StreamingResponse(
-            _stream_responses(state, chat_payload, model_override or chat_payload["model"], client, keys, request),
+            _stream_responses(
+                state,
+                chat_payload,
+                model_override or chat_payload["model"],
+                client,
+                keys,
+                request,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -517,7 +694,9 @@ async def handle_responses(
             "User-Agent": "openvidia/2.0",
         }
         try:
-            req = client.build_request("POST", upstream, json=chat_payload, headers=hdrs)
+            req = client.build_request(
+                "POST", upstream, json=chat_payload, headers=hdrs
+            )
             resp = await client.send(req)
         except httpx.HTTPError:
             continue
@@ -540,5 +719,7 @@ async def handle_responses(
     chat_data = resp.json()
     await resp.aclose()
 
-    responses_data = _chat_response_to_responses(chat_data, model_override or chat_payload["model"])
+    responses_data = _chat_response_to_responses(
+        chat_data, model_override or chat_payload["model"]
+    )
     return JSONResponse(responses_data)

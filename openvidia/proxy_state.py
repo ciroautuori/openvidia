@@ -30,7 +30,7 @@ COOLDOWN_DURATIONS: Dict[int, float] = {
     401: 3600.0,  # unauthorized — dead key
     403: 3600.0,  # forbidden — dead key
     404: 120.0,   # not found — model not on this key
-    429: 60.0,    # rate limited (Retry-After overrides this)
+    429: 180.0,   # rate limited (Retry-After overrides this)
 }
 DEFAULT_COOLDOWN = 30.0
 

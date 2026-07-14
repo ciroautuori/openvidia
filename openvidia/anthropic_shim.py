@@ -14,6 +14,7 @@ ANTHROPIC_BASE_URL a localhost:1919.
 
 Niente astrazioni — solo traduzione di payload.
 """
+
 from __future__ import annotations
 
 import json
@@ -24,7 +25,100 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+
 from .proxy_state import ProxyState
+
+
+# ── Sanitize chat/completions messages (defensive) ────────────────────
+def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
+    """
+    Ensure every message is a valid OpenAI chat/completions message so
+    upstream never rejects a request with::
+
+        data did not match any variant of untagged enum
+        ChatCompletionRequestToolMessageContent
+
+    Rules applied:
+      - content must be a str (or None only when tool_calls are present on an
+        assistant message). Lists are flattened to text where possible.
+      - tool messages must have non-null string content and a tool_call_id.
+      - assistant messages with tool_calls get content coerced to "" (never
+        None) — NVIDIA NIM rejects content:null on non-tool messages.
+      - drop empty/unknown roles.
+    """
+    out: list[dict] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role not in ("system", "user", "assistant", "tool"):
+            continue
+        content = m.get("content")
+        tool_calls = m.get("tool_calls")
+
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    if part.get("type") in ("text", "input_text", "output_text"):
+                        parts.append(str(part.get("text", "")))
+                    else:
+                        parts.append(json.dumps(part, ensure_ascii=False))
+            content = chr(10).join(p for p in parts if p)
+        elif isinstance(content, dict):
+            content = json.dumps(content, ensure_ascii=False)
+        elif content is None:
+            content = ""
+        elif not isinstance(content, str):
+            content = str(content)
+
+        if role == "tool":
+            tcid = m.get("tool_call_id") or ""
+            if not tcid:
+                tcid = f"call_{uuid.uuid4().hex[:24]}"
+            if not content:
+                content = " "
+            out.append({"role": "tool", "tool_call_id": tcid, "content": content})
+            continue
+
+        if role == "assistant" and tool_calls:
+            clean_calls = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                args = fn.get("arguments", "")
+                if not isinstance(args, str):
+                    args = json.dumps(args, ensure_ascii=False)
+                if not args:
+                    args = "{}"
+                clean_calls.append(
+                    {
+                        "id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {
+                            "name": fn.get("name", ""),
+                            "arguments": args,
+                        },
+                    }
+                )
+            if not clean_calls:
+                out.append({"role": "assistant", "content": content or " "})
+                continue
+            out.append(
+                {
+                    "role": "assistant",
+                    "content": content or "",
+                    "tool_calls": clean_calls,
+                }
+            )
+            continue
+
+        out.append({"role": role, "content": content or " "})
+    return out
+
 
 UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
 
@@ -96,14 +190,16 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
 
             elif btype == "tool_use":
                 # Assistant ha chiamato un tool -> diventa tool_calls nel messaggio assistant
-                tool_calls.append({
-                    "id": block.get("id", f"call_{uuid.uuid4().hex[:24]}"),
-                    "type": "function",
-                    "function": {
-                        "name": block.get("name", ""),
-                        "arguments": json.dumps(block.get("input", {})),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": block.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": json.dumps(block.get("input", {})),
+                        },
+                    }
+                )
 
             elif btype == "tool_result":
                 # Risultato di un tool -> diventa messaggio role:tool
@@ -115,11 +211,13 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
                     )
                 elif isinstance(tr_content, dict):
                     tr_content = json.dumps(tr_content)
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": block.get("tool_use_id", ""),
-                    "content": str(tr_content),
-                })
+                tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id", ""),
+                        "content": str(tr_content),
+                    }
+                )
 
             elif btype == "image":
                 # NVIDIA NIM non supporta vision: placeholder testuale cosi' il
@@ -167,14 +265,18 @@ def _anthropic_tools_to_chat_tools(tools: list[dict]) -> list[dict]:
         if not name:
             continue
 
-        chat_tools.append({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": tool.get("description", ""),
-                "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
-            },
-        })
+        chat_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get(
+                        "input_schema", {"type": "object", "properties": {}}
+                    ),
+                },
+            }
+        )
     return chat_tools
 
 
@@ -223,6 +325,7 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
     if stop:
         payload["stop"] = stop
 
+    payload["messages"] = _sanitize_chat_messages(payload["messages"])
     return payload
 
 
@@ -244,12 +347,14 @@ def _chat_to_anthropic_response(chat_data: dict, model: str) -> dict:
             tool_input = json.loads(fn.get("arguments", "{}"))
         except json.JSONDecodeError:
             tool_input = {}
-        content_blocks.append({
-            "type": "tool_use",
-            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
-            "name": fn.get("name", ""),
-            "input": tool_input,
-        })
+        content_blocks.append(
+            {
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                "name": fn.get("name", ""),
+                "input": tool_input,
+            }
+        )
 
     # Text content -> text block
     text = msg.get("content")
@@ -305,19 +410,22 @@ async def _stream_anthropic(
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     # message_start
-    yield _sse_event("message_start", {
-        "type": "message_start",
-        "message": {
-            "id": msg_id,
-            "type": "message",
-            "role": "assistant",
-            "model": model,
-            "content": [],
-            "stop_reason": None,
-            "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+    yield _sse_event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
         },
-    })
+    )
 
     # Key rotation (stesso pattern della Responses shim)
     resp = None
@@ -331,7 +439,9 @@ async def _stream_anthropic(
             "User-Agent": "openvidia/2.0",
         }
         try:
-            req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
+            req = client.build_request(
+                "POST", UPSTREAM, json=chat_payload, headers=hdrs
+            )
             resp = await client.send(req, stream=True)
         except httpx.HTTPError:
             continue
@@ -347,10 +457,16 @@ async def _stream_anthropic(
         state.log_cb(f"  anthropic shim: key HTTP {err_status}")
         if err_status in _CLIENT_ERR:
             # deterministico: errore al client, niente rotazione ne' cooldown
-            yield _sse_event("error", {
-                "type": "error",
-                "error": {"type": "invalid_request_error", "message": _extract_err(err_raw, err_status)},
-            })
+            yield _sse_event(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": _extract_err(err_raw, err_status),
+                    },
+                },
+            )
             return
         state.mark_key_failed(k, status=err_status)
 
@@ -394,16 +510,22 @@ async def _stream_anthropic(
             if not text_block_started:
                 text_block_started = True
                 text_block_index = 0
-                yield _sse_event("content_block_start", {
-                    "type": "content_block_start",
+                yield _sse_event(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": text_block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
+            yield _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
                     "index": text_block_index,
-                    "content_block": {"type": "text", "text": ""},
-                })
-            yield _sse_event("content_block_delta", {
-                "type": "content_block_delta",
-                "index": text_block_index,
-                "delta": {"type": "text_delta", "text": text_content},
-            })
+                    "delta": {"type": "text_delta", "text": text_content},
+                },
+            )
             text_full += text_content
 
         # Tool call deltas
@@ -422,41 +544,56 @@ async def _stream_anthropic(
                     "arguments": "",
                     "block_idx": block_idx,
                 }
-                yield _sse_event("content_block_start", {
-                    "type": "content_block_start",
-                    "index": block_idx,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": toolu_id,
-                        "name": tc.get("function", {}).get("name", ""),
-                        "input": {},
+                yield _sse_event(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_idx,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": toolu_id,
+                            "name": tc.get("function", {}).get("name", ""),
+                            "input": {},
+                        },
                     },
-                })
+                )
             tcm = tool_map[idx]
             args_delta = tc.get("function", {}).get("arguments", "")
             if args_delta:
                 tcm["arguments"] += args_delta
-                yield _sse_event("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": tcm["block_idx"],
-                    "delta": {"type": "input_json_delta", "partial_json": args_delta},
-                })
+                yield _sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": tcm["block_idx"],
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": args_delta,
+                        },
+                    },
+                )
 
         # Finish
         finish = choice.get("finish_reason")
         if finish:
             # Chiudi text block
             if text_block_started:
-                yield _sse_event("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": text_block_index,
-                })
+                yield _sse_event(
+                    "content_block_stop",
+                    {
+                        "type": "content_block_stop",
+                        "index": text_block_index,
+                    },
+                )
             # Chiudi tool blocks
             for idx, tcm in tool_map.items():
-                yield _sse_event("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": tcm["block_idx"],
-                })
+                yield _sse_event(
+                    "content_block_stop",
+                    {
+                        "type": "content_block_stop",
+                        "index": tcm["block_idx"],
+                    },
+                )
 
             # stop_reason mapping
             stop_map = {
@@ -467,37 +604,52 @@ async def _stream_anthropic(
             stop_reason = stop_map.get(finish, "end_turn")
 
             # message_delta con stop_reason + usage
-            yield _sse_event("message_delta", {
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": stop_reason,
-                    "stop_sequence": None,
+            yield _sse_event(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": stop_reason,
+                        "stop_sequence": None,
+                    },
+                    "usage": {"output_tokens": len(text_full) // 4},  # stimato
                 },
-                "usage": {"output_tokens": len(text_full) // 4},  # stimato
-            })
+            )
 
             # message_stop
-            yield _sse_event("message_stop", {
-                "type": "message_stop",
-            })
+            yield _sse_event(
+                "message_stop",
+                {
+                    "type": "message_stop",
+                },
+            )
             break
 
     # Se non ricevuto finish, chiudi comunque
     if text_block_started:
-        yield _sse_event("content_block_stop", {
-            "type": "content_block_stop",
-            "index": text_block_index,
-        })
+        yield _sse_event(
+            "content_block_stop",
+            {
+                "type": "content_block_stop",
+                "index": text_block_index,
+            },
+        )
     for idx, tcm in tool_map.items():
-        yield _sse_event("content_block_stop", {
-            "type": "content_block_stop",
-            "index": tcm["block_idx"],
-        })
-        yield _sse_event("message_delta", {
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-            "usage": {"output_tokens": 0},
-        })
+        yield _sse_event(
+            "content_block_stop",
+            {
+                "type": "content_block_stop",
+                "index": tcm["block_idx"],
+            },
+        )
+        yield _sse_event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            },
+        )
         yield _sse_event("message_stop", {"type": "message_stop"})
 
     await resp.aclose()
@@ -521,7 +673,10 @@ async def handle_anthropic_messages(
         body = json.loads(raw)
     except json.JSONDecodeError:
         return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON"}},
+            {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "invalid JSON"},
+            },
             status_code=400,
         )
 
@@ -538,13 +693,16 @@ async def handle_anthropic_messages(
         if isinstance(b, dict) and b.get("type") == "image"
     )
     if n_img:
-        state.log_cb(f"  ⚠ anthropic: {n_img} immagine/i omessa/e (NVIDIA NIM no-vision)")
+        state.log_cb(
+            f"  ⚠ anthropic: {n_img} immagine/i omessa/e (NVIDIA NIM no-vision)"
+        )
 
     model_override = state.active_model
     chat_payload = _build_chat_payload(body, model_override)
 
     # Auto-compaction: se la history supera il budget, riassumi (fallback trim).
     from .compaction import maybe_compact
+
     chat_payload["messages"] = await maybe_compact(
         chat_payload["messages"], state=state, client=client, log=state.log_cb
     )
@@ -556,7 +714,10 @@ async def handle_anthropic_messages(
         keys = list(state.keys)
     if not keys:
         return JSONResponse(
-            {"type": "error", "error": {"type": "api_error", "message": "no keys available"}},
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": "no keys available"},
+            },
             status_code=503,
         )
 
@@ -564,7 +725,12 @@ async def handle_anthropic_messages(
         chat_payload["stream"] = True
         return StreamingResponse(
             _stream_anthropic(
-                state, chat_payload, model_override or chat_payload["model"], client, keys, request
+                state,
+                chat_payload,
+                model_override or chat_payload["model"],
+                client,
+                keys,
+                request,
             ),
             media_type="text/event-stream",
             headers={
@@ -586,7 +752,9 @@ async def handle_anthropic_messages(
             "User-Agent": "openvidia/2.0",
         }
         try:
-            req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
+            req = client.build_request(
+                "POST", UPSTREAM, json=chat_payload, headers=hdrs
+            )
             resp = await client.send(req)
         except httpx.HTTPError:
             continue
@@ -600,8 +768,13 @@ async def handle_anthropic_messages(
         if err_status in _CLIENT_ERR:
             # deterministico: errore al client, niente rotazione ne' cooldown
             return JSONResponse(
-                {"type": "error",
-                 "error": {"type": "invalid_request_error", "message": _extract_err(err_raw, err_status)}},
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": _extract_err(err_raw, err_status),
+                    },
+                },
                 status_code=err_status,
             )
         state.mark_key_failed(k, status=err_status)
@@ -609,7 +782,10 @@ async def handle_anthropic_messages(
 
     if resp is None or used_key is None:
         return JSONResponse(
-            {"type": "error", "error": {"type": "api_error", "message": "all keys failed"}},
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": "all keys failed"},
+            },
             status_code=503,
         )
 
@@ -620,5 +796,7 @@ async def handle_anthropic_messages(
     chat_data = resp.json()
     await resp.aclose()
 
-    anthropic_data = _chat_to_anthropic_response(chat_data, model_override or chat_payload["model"])
+    anthropic_data = _chat_to_anthropic_response(
+        chat_data, model_override or chat_payload["model"]
+    )
     return JSONResponse(anthropic_data)

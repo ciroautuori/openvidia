@@ -64,6 +64,8 @@ async def _health_check_all(state: ProxyState, client: httpx.AsyncClient, force:
     for key in state.keys:
         if not force and not state.is_key_on_cooldown(key):
             continue
+        if not force and state.cooldown_remaining(key) > 90:
+            continue
         healthy = await _check_key_health(client, key)
         if healthy:
             state.clear_cooldown_and_restore(key)
@@ -72,7 +74,7 @@ async def _health_check_all(state: ProxyState, client: httpx.AsyncClient, force:
             pass
         else:
             state.mark_key_failed(key)
-    n_unhealthy = sum(1 for k in state.keys if state.is_key_on_cooldown(key))
+    n_unhealthy = sum(1 for k in state.keys if state.is_key_on_cooldown(k))
     all_ok = len(state.keys) - n_unhealthy
     state.log_cb(
         f"⚕ health: {all_ok}/{len(state.keys)} OK"
