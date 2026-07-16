@@ -8,6 +8,7 @@ Two authentication modes:
 Both navigate to the API key settings page, generate a fresh ``nvapi-`` key,
 and optionally delete an old one. Runs headless Chromium via Playwright.
 """
+
 import json
 import logging
 import time
@@ -24,13 +25,19 @@ TIMEOUT = 30_000  # ms
 
 # ── Cookie helpers (legacy) ──────────────────────────────────────────
 
+
 def _cookies_from_json(raw: str) -> List[Dict[str, Any]]:
     data = json.loads(raw)
     if isinstance(data, dict):
         data = [data]
     mapping = {
-        "no_restriction": "None", "lax": "Lax", "strict": "Strict",
-        "none": "None", "Lax": "Lax", "Strict": "Strict", "": "Lax",
+        "no_restriction": "None",
+        "lax": "Lax",
+        "strict": "Strict",
+        "none": "None",
+        "Lax": "Lax",
+        "Strict": "Strict",
+        "": "Lax",
     }
     out = []
     for c in data:
@@ -50,6 +57,7 @@ def _cookies_from_json(raw: str) -> List[Dict[str, Any]]:
 
 
 # ── Browser factory ─────────────────────────────────────────────────
+
 
 def _browser():
     p = sync_playwright().start()
@@ -103,6 +111,7 @@ def _page(ctx: BrowserContext) -> Page:
 
 
 # ── Login flow ──────────────────────────────────────────────────────
+
 
 def login_generate_key(email: str, password: str, old_key: Optional[str] = None) -> str:
     """
@@ -207,6 +216,7 @@ def _fill_and_next(page: Page, value: str):
 
 # ── Chrome channel (system Chrome session) ─────────────────────────
 
+
 def chrome_channel_generate_key(
     old_key: Optional[str] = None,
     user_data_dir: Optional[str] = None,
@@ -244,7 +254,7 @@ def chrome_channel_generate_key(
         raise RuntimeError(f"Chrome channel key generation failed: {e}") from e
     finally:
         if is_persistent:
-            ctx.close()   # launch_persistent_context returns context directly
+            ctx.close()  # launch_persistent_context returns context directly
         else:
             ctx.close()
             if browser:
@@ -258,8 +268,10 @@ def chrome_channel_generate_key(
 
 # ── Legacy cookie auth ──────────────────────────────────────────────
 
-def generate_key(cookie_json: str, old_key: Optional[str] = None,
-                 email: str = "", password: str = "") -> str:
+
+def generate_key(
+    cookie_json: str, old_key: Optional[str] = None, email: str = "", password: str = ""
+) -> str:
     """Generate API key — cookies first, fallback to email+password login.
 
     If *cookie_json* is provided and valid, uses cookie injection.
@@ -314,6 +326,7 @@ def generate_key(cookie_json: str, old_key: Optional[str] = None,
 
 # ── Shared key generation / deletion ─────────────────────────────────
 
+
 def _do_generate(page: Page) -> str:
     """Click 'Generate API Key' and extract the new key value."""
     gen_btn = page.locator(
@@ -355,7 +368,11 @@ def _do_generate(page: Page) -> str:
         raw = key_text.text_content() or ""
     else:
         tag = key_input.evaluate("el => el.tagName.toLowerCase()")
-        raw = key_input.input_value() if tag == "input" or tag == "textarea" else (key_input.text_content() or "")
+        raw = (
+            key_input.input_value()
+            if tag == "input" or tag == "textarea"
+            else (key_input.text_content() or "")
+        )
 
     key = raw.strip().split("\n")[0].strip()
     if not key.startswith("nvapi-"):

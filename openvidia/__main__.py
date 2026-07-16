@@ -13,6 +13,7 @@ Dashboard + API at http://localhost:1919
 Edit keys via ~/.config/openvidia/keys.json or dashboard Keys tab.
 Keys auto-extracted from accounts.json if keys.json is empty.
 """
+
 import asyncio
 import json
 import os
@@ -24,16 +25,20 @@ from . import config
 from .proxy_state import ProxyStats
 from .server_manager import start
 
+# ---------------------------------------------------------------------------
+# Configuration — entrypoint constants
+# ---------------------------------------------------------------------------
 PORT = 1919
 ENV_VAR = "OPENVIDIA_API_KEY"
 ENV_VAL = "ignored"
-_tray_ref = None  # Riferimento globale al tray (anti-GC)
-_tray_hide = None  # Riferimento alla funzione hide per close-to-tray
+_tray_ref = None  # Global tray reference (anti-GC)
+_tray_hide = None  # Global hide-function reference for close-to-tray
 
 
 def _kill_stale_port(port: int):
-    """Termina qualsiasi processo in ascolto sulla porta (multipiattaforma via psutil)."""
+    """Kill any process listening on the given port (cross-platform via psutil)."""
     import time as _time
+
     try:
         import psutil
     except ImportError:
@@ -52,7 +57,7 @@ def _kill_stale_port(port: int):
     if killed:
         print(f"● Killed stale process on port {port}: {', '.join(killed)}", flush=True)
 
-    # Aspetta che la porta si liberi
+    # Wait for the port to become free
     for _ in range(30):
         conns = []
         try:
@@ -83,6 +88,7 @@ def _extract_keys_from_accounts() -> list:
 
 
 def _setup_opencode():
+    """Configure the opencode CLI (~/.config/opencode/opencode.json) to use OpenVidia."""
     oc_path = config.opencode_config_path()
     if not oc_path.exists():
         print(f"ℹ opencode not found at {oc_path} — skipping")
@@ -96,9 +102,11 @@ def _setup_opencode():
     changed = False
     providers = cfg.setdefault("provider", {})
 
-    # Remove orphan nvidia provider if it points to localhost
+    # Remove the orphan nvidia provider if it points to localhost
     nv = providers.get("nvidia", {})
-    if isinstance(nv, dict) and nv.get("options", {}).get("baseURL", "").startswith("http://localhost"):
+    if isinstance(nv, dict) and nv.get("options", {}).get("baseURL", "").startswith(
+        "http://localhost"
+    ):
         del providers["nvidia"]
         changed = True
 
@@ -121,26 +129,26 @@ def _setup_opencode():
             changed = True
             print("✓ Added OpenVidia model to opencode provider")
 
-    # Compaction auto per modelli NVIDIA (contesto più piccolo di Claude)
+    # Auto-compaction for NVIDIA models (smaller context than Claude)
     comp = cfg.get("compaction")
     if not isinstance(comp, dict) or not comp.get("auto") or not comp.get("prune"):
         cfg["compaction"] = {"auto": True, "prune": True, "reserved": 8000}
         changed = True
         print("✓ Enabled auto-compaction (prune=true, reserved=8000)")
 
-    # Modello predefinito → openvidia/openvidia (provider/model_id)
+    # Default model → openvidia/openvidia (provider/model_id)
     if cfg.get("model") != "openvidia/openvidia":
         cfg["model"] = "openvidia/openvidia"
         changed = True
         print("✓ Default model set to openvidia/openvidia")
 
-    # Small model per task leggeri (titoli, etc.) — stesso provider
+    # Small model for lightweight tasks (titles, etc.) — same provider
     if not cfg.get("small_model"):
         cfg["small_model"] = "openvidia/openvidia"
         changed = True
         print("✓ Small model set to openvidia/openvidia")
 
-    # Instructions: punta ad AGENTS.md se esiste nel progetto
+    # Instructions: point to AGENTS.md if it exists in the project
     agents_md = Path.cwd() / "AGENTS.md"
     if agents_md.exists():
         instr = cfg.get("instructions", [])
@@ -160,7 +168,7 @@ def _setup_opencode():
 
 
 def _ensure_env_var():
-    """Assicura che OPENVIDIA_API_KEY=ignored sia nel file rc della shell."""
+    """Ensure OPENVIDIA_API_KEY=ignored is in the shell rc file."""
     shell = os.environ.get("SHELL", "")
     home = Path.home()
     rc = home / ".zshrc"
@@ -191,7 +199,7 @@ def _ensure_env_var():
 
 
 def _setup_codex():
-    """Configura Codex CLI (~/.codex/config.toml) per usare OpenVidia."""
+    """Configure the Codex CLI (~/.codex/config.toml) to use OpenVidia."""
     codex_dir = Path.home() / ".codex"
     if not codex_dir.exists():
         print("ℹ Codex CLI not found — skipping")
@@ -202,7 +210,9 @@ def _setup_codex():
 
     changed = False
     needs_model = not re.search(r'^model\s*=\s*"openvidia"', content, re.MULTILINE)
-    needs_provider = not re.search(r'^model_provider\s*=\s*"openvidia"', content, re.MULTILINE)
+    needs_provider = not re.search(
+        r'^model_provider\s*=\s*"openvidia"', content, re.MULTILINE
+    )
     needs_block = "[model_providers.openvidia]" not in content
 
     if needs_model or needs_provider or needs_block:
@@ -215,7 +225,7 @@ def _setup_codex():
         for line in lines:
             stripped = line.strip()
 
-            # Salta vecchie righe model= / model_provider= per sovrascriverle
+            # Skip old model= / model_provider= lines so they get overwritten
             if stripped.startswith("model ") or stripped.startswith("model="):
                 if not model_set:
                     new_lines.append('model = "openvidia"')
@@ -223,7 +233,9 @@ def _setup_codex():
                     if needs_model:
                         changed = True
                     continue
-            if stripped.startswith("model_provider ") or stripped.startswith("model_provider="):
+            if stripped.startswith("model_provider ") or stripped.startswith(
+                "model_provider="
+            ):
                 if not provider_set:
                     new_lines.append('model_provider = "openvidia"')
                     provider_set = True
@@ -231,24 +243,28 @@ def _setup_codex():
                         changed = True
                     continue
 
-            # Salta vecchio blocco [model_providers.openvidia] se presente
+            # Skip the old [model_providers.openvidia] block if present
             if stripped == "[model_providers.openvidia]":
                 in_openvidia_block = True
                 continue
-            if in_openvidia_block and stripped.startswith("[") and stripped != "[model_providers.openvidia]":
+            if (
+                in_openvidia_block
+                and stripped.startswith("[")
+                and stripped != "[model_providers.openvidia]"
+            ):
                 in_openvidia_block = False
             if in_openvidia_block:
                 continue
 
             new_lines.append(line)
 
-        # Aggiungi model/model_provider in cima se non ancora messi
+        # Prepend model/model_provider if not yet set
         if not model_set:
-            new_lines.insert(0, f'model = "openvidia"')
+            new_lines.insert(0, 'model = "openvidia"')
         if not provider_set:
-            new_lines.insert(1, f'model_provider = "openvidia"')
+            new_lines.insert(1, 'model_provider = "openvidia"')
 
-        # Aggiungi blocco provider alla fine
+        # Append provider block at the end
         new_lines.append("")
         new_lines.append("# Provider custom: openvidia (NVIDIA NIM multi-key proxy)")
         new_lines.append("[model_providers.openvidia]")
@@ -267,12 +283,12 @@ def _setup_codex():
 
     # Also set env var in auth.json if Codex needs it
     _ensure_env_var()
-    print(f"✓ Codex CLI ready — run: codex --model openvidia")
+    print("✓ Codex CLI ready — run: codex --model openvidia")
     return True
 
 
 def _setup_grok():
-    """Configura Grok CLI (~/.grok/config.toml) per usare OpenVidia."""
+    """Configure the Grok CLI (~/.grok/config.toml) to use OpenVidia."""
     grok_dir = Path.home() / ".grok"
     if not grok_dir.exists():
         print("ℹ Grok CLI not found — skipping")
@@ -281,7 +297,7 @@ def _setup_grok():
     cfg_path = grok_dir / "config.toml"
     content = cfg_path.read_text() if cfg_path.exists() else ""
 
-    has_model = re.search(r'^\[model\.openvidia\]', content, re.MULTILINE)
+    has_model = re.search(r"^\[model\.openvidia\]", content, re.MULTILINE)
     has_default = re.search(r'^default\s*=\s*"openvidia"', content, re.MULTILINE)
 
     if has_model and has_default:
@@ -306,7 +322,7 @@ context_window = 128000
     for line in lines:
         stripped = line.strip()
 
-        # Track [models] section
+        # Track the [models] section
         if stripped == "[models]":
             in_models_section = True
             new_lines.append(line)
@@ -314,18 +330,24 @@ context_window = 128000
         elif stripped.startswith("[") and stripped != "[models]":
             in_models_section = False
 
-        # Replace default model in [models] section
-        if in_models_section and (stripped.startswith("default ") or stripped.startswith("default=")):
+        # Replace the default model inside the [models] section
+        if in_models_section and (
+            stripped.startswith("default ") or stripped.startswith("default=")
+        ):
             if not default_set:
                 new_lines.append('default = "openvidia"')
                 default_set = True
                 continue
 
-        # Skip old [model.openvidia] block
+        # Skip the old [model.openvidia] block
         if stripped == "[model.openvidia]":
             skip_old_openvidia = True
             continue
-        if skip_old_openvidia and stripped.startswith("[") and stripped != "[model.openvidia]":
+        if (
+            skip_old_openvidia
+            and stripped.startswith("[")
+            and stripped != "[model.openvidia]"
+        ):
             skip_old_openvidia = False
         if skip_old_openvidia:
             continue
@@ -333,15 +355,15 @@ context_window = 128000
         new_lines.append(line)
 
     if not default_set:
-        # Ensure [models] section exists with default
+        # Ensure a [models] section exists with the default
         if "[models]" not in "\n".join(new_lines):
             new_lines.insert(0, "[models]")
             new_lines.insert(1, 'default = "openvidia"')
             new_lines.insert(2, "")
         else:
-            # Insert after [models] header
-            for i, l in enumerate(new_lines):
-                if l.strip() == "[models]":
+            # Insert right after the [models] header
+            for i, line in enumerate(new_lines):
+                if line.strip() == "[models]":
                     new_lines.insert(i + 1, 'default = "openvidia"')
                     break
         default_set = True
@@ -356,7 +378,7 @@ context_window = 128000
 
 
 def _setup_cmd():
-    """Setup completo: configura tutte le CLI trovate (opencode, Codex, Grok)."""
+    """Full setup: configure every detected CLI (opencode, Codex, Grok)."""
     print("╔════════════════════════════════════════════╗")
     print("║   OpenVidia — Setup CLI auto-config        ║")
     print("╚════════════════════════════════════════════╝")
@@ -375,20 +397,21 @@ def _setup_cmd():
     print()
 
     print("╔════════════════════════════════════════════╗")
-    print("║   Setup completato!                       ║")
+    print("║   Setup complete!                         ║")
     print("╠════════════════════════════════════════════╣")
     print(f"║   Proxy:       http://localhost:{PORT}/v1")
     print(f"║   Dashboard:   http://localhost:{PORT}")
     print("║                                            ║")
     print("║   opencode → /model openvidia              ║")
     print("║   codex    → codex --model openvidia       ║")
-    print("║   grok     → grok --model openvidia        ║")
+    print("║   grok     → grok -model openvidia         ║")
     print("╚════════════════════════════════════════════╝")
 
     sys.exit(0)
 
 
 async def main_async():
+    """Foreground entrypoint: start the proxy on the event loop."""
     _kill_stale_port(PORT)
     _setup_opencode()
     _setup_codex()
@@ -408,12 +431,21 @@ async def main_async():
         print(msg, flush=True)
 
     web_dir = Path(__file__).resolve().parent.parent / "web"
-    srv = await start(PORT, keys, log, stats, config.index_path(), web_dir=web_dir, initial_model=saved_model)
+    srv = await start(
+        PORT,
+        keys,
+        log,
+        stats,
+        config.index_path(),
+        web_dir=web_dir,
+        initial_model=saved_model,
+    )
     srv.state.log_cb(f"● OpenVidia running on :{PORT} ({len(keys)} keys)")
 
-    # AccountManager: auto-rigenerazione chiavi quando muoiono (dal VECCHIO)
+    # AccountManager: auto-regenerate keys when they die
     try:
         from .account_manager import AccountManager
+
         am = AccountManager(srv.state, config.accounts_path())
         am.set_log_cb(log)
         am.load()
@@ -421,11 +453,11 @@ async def main_async():
         asyncio.create_task(am.health_check_loop())
         srv.state.log_cb(f"● AccountManager loaded ({len(am.accounts)} accounts)")
     except ImportError:
-        pass  # playwright/websockets non installati — auto-rigenerazione disabilitata
+        pass  # playwright/websockets not installed — auto-regen disabled
     except Exception as e:
         srv.state.log_cb(f"⚠ AccountManager init failed: {e}")
 
-    # foreground = solo log, niente UI
+    # foreground = logs only, no UI
     try:
         while True:
             await asyncio.sleep(3600)
@@ -437,9 +469,10 @@ async def main_async():
 
 
 def _kill_proxy_by_port(port: int) -> None:
-    """Termina il processo in ascolto sulla porta — usato da Quit del tray."""
+    """Kill the process listening on the port — used by the tray Quit action."""
     try:
         import psutil
+
         for conn in psutil.net_connections():
             if conn.laddr.port == port and conn.status == "LISTEN" and conn.pid:
                 psutil.Process(conn.pid).terminate()
@@ -448,10 +481,10 @@ def _kill_proxy_by_port(port: int) -> None:
 
 
 def _make_signaller(icon_path, window, port):
-    """Crea un QObject nel main thread con segnale 'create'.
+    """Create a QObject in the main thread with a 'create' signal.
 
-    L'emit cross-thread atterra sul Qt main loop via QueuedConnection,
-    eseguendo _create_tray nel thread giusto.
+    The cross-thread emit is dispatched onto the Qt main loop via
+    QueuedConnection, so _create_tray runs in the right thread.
     """
     try:
         from PyQt6.QtCore import QObject, pyqtSignal
@@ -467,11 +500,11 @@ def _make_signaller(icon_path, window, port):
 
 
 def _tray_waiter_factory(signaller, window):
-    """Crea la funzione per webview.start(func=...).
+    """Build the function passed to webview.start(func=...).
 
-    1) Aspetta QCoreApplication (pywebview l'ha creato)
-    2) Aspetta la finestra mostrata
-    3) Emette segnale cross-thread -> tray sul Qt main loop
+    1) Wait for the QCoreApplication (pywebview creates it)
+    2) Wait for the window shown event
+    3) Emit the cross-thread signal -> tray on the Qt main loop
     """
     import time as _time
 
@@ -494,10 +527,11 @@ def _tray_waiter_factory(signaller, window):
 
 
 def _create_tray(icon_path: str, window, port: int):
-    """Crea QSystemTrayIcon (eseguito sul Qt main loop).
+    """Create a QSystemTrayIcon (executed on the Qt main loop).
 
-    Usa window.native (BrowserView/QMainWindow) per show/hide diretto,
-    bypassando i decorator pywebview."""
+    Uses window.native (BrowserView/QMainWindow) for direct show/hide,
+    bypassing the pywebview decorators.
+    """
 
     from PyQt6.QtCore import QCoreApplication
     from PyQt6.QtGui import QAction, QIcon
@@ -505,11 +539,11 @@ def _create_tray(icon_path: str, window, port: int):
 
     app = QCoreApplication.instance()
     if app is None:
-        print("⚠ Tray: nessun QApplication", flush=True)
+        print("⚠ Tray: no QApplication", flush=True)
         return
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
-        print("⚠ Tray: non disponibile su questo desktop", flush=True)
+        print("⚠ Tray: not available on this desktop", flush=True)
         return
 
     def _show_window():
@@ -544,7 +578,7 @@ def _create_tray(icon_path: str, window, port: int):
 
     tray.setContextMenu(menu)
     tray.show()
-    print("● Tray icon attiva", flush=True)
+    print("● Tray icon active", flush=True)
 
     def _on_activated(reason):
         if reason in (
@@ -555,19 +589,20 @@ def _create_tray(icon_path: str, window, port: int):
 
     tray.activated.connect(_on_activated)
 
-    # Riferimento globale per evitare garbage collection di tray/menu/azioni
+    # Global reference to prevent garbage collection of tray/menu/actions
     global _tray_ref, _tray_hide
     _tray_ref = (tray, menu, show_action, quit_action, _show_window, _on_activated)
     _tray_hide = _hide_window
 
 
 def open_desk(port: int) -> None:
-    """Apre la dashboard in una finestra nativa pywebview con system tray."""
+    """Open the dashboard in a native pywebview window with a system tray."""
     try:
         import webview
     except ImportError:
-        print("⚠ pywebview non installato — apertura browser", flush=True)
+        print("⚠ pywebview not installed — opening in browser", flush=True)
         from .webui import auto_open
+
         auto_open(port)
         return
 
@@ -589,7 +624,7 @@ def open_desk(port: int) -> None:
     signaller = _make_signaller(icon_path, window, port)
 
     def on_closing():
-        """Close-to-tray: nasconde la finestra, NON uccide il proxy."""
+        """Close-to-tray: hide the window, do NOT kill the proxy."""
         try:
             h = _tray_hide
             if h is not None:
@@ -610,7 +645,7 @@ def open_desk(port: int) -> None:
             icon=icon_path,
         )
     else:
-        # Fallback: niente tray, close = kill proxy
+        # Fallback: no tray, close = kill proxy
         def kill_proxy():
             _kill_proxy_by_port(port)
             print("● Desk closed — proxy terminated", flush=True)
@@ -621,6 +656,7 @@ def open_desk(port: int) -> None:
 
 
 def main():
+    """CLI entrypoint: dispatch on argv[1]."""
     if len(sys.argv) > 1:
         if sys.argv[1] == "setup":
             _setup_cmd()
@@ -631,15 +667,17 @@ def main():
 
     import subprocess as _sp
     import time as _time
+
     _kill_stale_port(PORT)
 
     _sp.Popen(
         [sys.executable, "-m", "openvidia", "foreground"],
-        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+        stdout=_sp.DEVNULL,
+        stderr=_sp.DEVNULL,
         stdin=_sp.DEVNULL,
     )
 
-    # Desk app — finestra nativa compatta
+    # Desk app — compact native window
     _time.sleep(3)
     open_desk(PORT)
 

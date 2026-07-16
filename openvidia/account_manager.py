@@ -10,6 +10,7 @@ as failed (401/403/404), the account manager generates a fresh key:
 
 The new key is swapped into the proxy pool transparently.
 """
+
 import asyncio
 import json
 import logging
@@ -111,6 +112,7 @@ class AccountManager:
     def save(self):
         """Persist accounts to disk."""
         from .config import atomic_write
+
         data = [a.to_dict() for a in self.accounts]
         atomic_write(self.accounts_path, json.dumps(data, indent=2))
 
@@ -139,10 +141,14 @@ class AccountManager:
 
     # ── account CRUD ──────────────────────────────────────────────────
 
-    def add_account(self, name: str, email: str = "", password: str = "", cookie_json: str = "") -> Account:
+    def add_account(
+        self, name: str, email: str = "", password: str = "", cookie_json: str = ""
+    ) -> Account:
         if any(a.name == name for a in self.accounts):
             raise ValueError(f"Account {name!r} already exists")
-        acct = Account(name=name, email=email, password=password, cookie_json=cookie_json)
+        acct = Account(
+            name=name, email=email, password=password, cookie_json=cookie_json
+        )
         self.accounts.append(acct)
         self.save()
         auth = "🔑" if acct.has_credentials else "🍪"
@@ -161,7 +167,9 @@ class AccountManager:
         self.save()
         self._log_cb(f"➖ Account {name!r} removed ({len(acct.keys)} keys)")
 
-    def update_account(self, name: str, email: str = "", password: str = "", cookie_json: str = ""):
+    def update_account(
+        self, name: str, email: str = "", password: str = "", cookie_json: str = ""
+    ):
         acct = self._find(name)
         if acct is None:
             raise ValueError(f"Account {name!r} not found")
@@ -179,7 +187,9 @@ class AccountManager:
             {
                 "name": a.name,
                 "key_count": len(a.keys),
-                "auth_type": "🔑 email" if a.has_credentials else ("🍪 cookies" if a.cookie_json else "⚠ none"),
+                "auth_type": "🔑 email"
+                if a.has_credentials
+                else ("🍪 cookies" if a.cookie_json else "⚠ none"),
                 "email": a.email if a.has_credentials else "",
                 "cookies_preview": a.cookie_json[:80] if a.cookie_json else "",
                 "has_credentials": a.has_credentials,
@@ -209,7 +219,9 @@ class AccountManager:
                 self._replenishing.discard(key)
             return
 
-        self._log_cb(f"🔄 Replenish key {key[:12]}… (account {self.accounts[idx].name})")
+        self._log_cb(
+            f"🔄 Replenish key {key[:12]}… (account {self.accounts[idx].name})"
+        )
 
         try:
             asyncio.create_task(self._do_replenish(key, idx))
@@ -227,10 +239,14 @@ class AccountManager:
             # Fallback: Playwright with email+password
             if not new_key and acct.has_credentials:
                 self._log_cb(f"  CDP failed — trying Playwright for {acct.name}")
-                new_key = await asyncio.to_thread(self._generate_and_swap_pw, old_key, acct_idx)
+                new_key = await asyncio.to_thread(
+                    self._generate_and_swap_pw, old_key, acct_idx
+                )
             elif not new_key and acct.cookie_json:
                 self._log_cb(f"  CDP failed — trying cookie auth for {acct.name}")
-                new_key = await asyncio.to_thread(self._generate_and_swap_pw, old_key, acct_idx)
+                new_key = await asyncio.to_thread(
+                    self._generate_and_swap_pw, old_key, acct_idx
+                )
 
             if new_key:
                 self._log_cb(f"✅ Replenished: {old_key[:12]}… → {new_key[:12]}…")
@@ -258,8 +274,9 @@ class AccountManager:
 
     # ── CDP replenish (primary) ──────────────────────────────────────
 
-    async def _generate_and_swap_cdp(self, acct_name: str, old_key: str,
-                                     acct_idx: int) -> Optional[str]:
+    async def _generate_and_swap_cdp(
+        self, acct_name: str, old_key: str, acct_idx: int
+    ) -> Optional[str]:
         """Generate key via CDP for *acct_name* and swap it in."""
         from .cdp_keygen import read_ws_url
         import websockets
@@ -270,25 +287,33 @@ class AccountManager:
             return None
 
         try:
-            async with websockets.connect(ws_url, max_size=2 ** 24,
-                                          open_timeout=10) as ws:
+            async with websockets.connect(
+                ws_url, max_size=2**24, open_timeout=10
+            ) as ws:
                 # ── Find the right target ──────────────────────────────
                 await ws.send(json.dumps({"id": 1, "method": "Target.getTargets"}))
                 resp = await asyncio.wait_for(ws.recv(), timeout=5)
                 resp_data = json.loads(resp) if isinstance(resp, (str, bytes)) else resp
                 targets = resp_data.get("result", {}).get("targetInfos", [])
 
-                api_pages = [t for t in targets
-                             if t.get("type") == "page"
-                             and "settings/api-keys" in t.get("url", "")]
+                api_pages = [
+                    t
+                    for t in targets
+                    if t.get("type") == "page"
+                    and "settings/api-keys" in t.get("url", "")
+                ]
 
             # ── Scan each context for the matching account ─────────────
             for t in api_pages:
                 ctx = t.get("browserContextId", "")[:12]
                 try:
                     new_key = await self._cdp_generate_for_target(
-                        ws_url, t["targetId"], t.get("browserContextId", ""),
-                        acct_name, old_key, acct_idx,
+                        ws_url,
+                        t["targetId"],
+                        t.get("browserContextId", ""),
+                        acct_name,
+                        old_key,
+                        acct_idx,
                     )
                     if new_key:
                         return new_key
@@ -303,14 +328,21 @@ class AccountManager:
             self._log_cb(f"  CDP error: {e}")
             return None
 
-    async def _cdp_generate_for_target(self, ws_url: str, target_id: str,
-                                        ctx_id: str, acct_name: str,
-                                        old_key: str, acct_idx: int) -> Optional[str]:
+    async def _cdp_generate_for_target(
+        self,
+        ws_url: str,
+        target_id: str,
+        ctx_id: str,
+        acct_name: str,
+        old_key: str,
+        acct_idx: int,
+    ) -> Optional[str]:
         """Attach to a single CDP target, verify account match, generate key."""
         import websockets
 
-        async with websockets.connect(ws_url, max_size=2 ** 24,
-                                      open_timeout=10) as ws:
+        async with websockets.connect(ws_url, max_size=2**24, open_timeout=10) as ws:
+            from .cdp_keygen import attach_and_get_sid, generate_one_key
+
             sid = await attach_and_get_sid(ws, target_id)
             if not sid:
                 return None
@@ -321,12 +353,19 @@ class AccountManager:
             if not await is_authenticated(ws, sid):
                 return None
 
-            page_name = (await _eval_val(ws, sid, """
+            page_name = (
+                await _eval_val(
+                    ws,
+                    sid,
+                    """
                 (() => {
                     const m = document.body.innerText.match(/within ([^\n]+)/);
                     return m ? m[1].trim() : '';
                 })();
-            """, msg_id=401)) or ""
+            """,
+                    msg_id=401,
+                )
+            ) or ""
 
             if acct_name.lower() not in page_name.lower():
                 return None
@@ -349,12 +388,14 @@ class AccountManager:
         # 1. Chrome channel with isolated profile per account
         try:
             from .key_factory import chrome_channel_generate_key
+
             profile_dir = str(
                 Path.home() / ".config" / "openvidia" / "profiles" / acct.name
             )
             self._log_cb(f"  Opening Chrome profile for {acct.name}…")
             new_key = chrome_channel_generate_key(
-                old_key=old_key, user_data_dir=profile_dir,
+                old_key=old_key,
+                user_data_dir=profile_dir,
             )
             if new_key:
                 self._swap_key(old_key, new_key, acct_idx)
@@ -365,6 +406,7 @@ class AccountManager:
         # 2. email+password login
         if acct.has_credentials:
             from .key_factory import login_generate_key as gf
+
             new_key = gf(acct.email, acct.password, old_key=old_key)
             if new_key:
                 self._swap_key(old_key, new_key, acct_idx)
@@ -373,6 +415,7 @@ class AccountManager:
         # 3. cookie injection (legacy, cookies expire quickly)
         if acct.cookie_json:
             from .key_factory import generate_key as gf
+
             new_key = gf(acct.cookie_json, old_key=old_key)
             if new_key:
                 self._swap_key(old_key, new_key, acct_idx)

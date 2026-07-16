@@ -1,19 +1,13 @@
 """
-Auto-compaction: la history non fa MAI fallire una richiesta per context overflow.
+Auto-compaction: history never makes a request fail from context overflow.
 
-Strategia SUMMARIZE + cache roll-forward + fallback TRIM:
-- se la history stimata supera il budget del modello, i messaggi vecchi
-  (tutto tranne i system iniziali + gli ultimi KEEP_RECENT) vengono riassunti
-  con UNA call upstream e sostituiti da un blocco system "riassunto".
-- il riassunto e' cache-ato per conversazione (roll-forward): a ogni turno si
-  riassumono solo i messaggi NUOVI oltre a quelli gia' coperti dal riassunto
-  precedente, non da capo → una sola call e piccola, non 2x a ogni messaggio.
-- se il riassunto fallisce (chiavi giu' / timeout / 400 troppo lungo) → TRIM
-  deterministico: la richiesta passa comunque e NON si blocca mai.
-
-Zero astrazioni: funzioni pure + un dict di cache in-process.
-Config opzionale (no-env): config_dir()/compaction.json.
+The conversation history is summarized in-place when it exceeds the model's
+budget. We keep a small rolling cache so each turn only summarizes newly
+added messages, not the whole history. If the summarization call fails for
+any reason (keys down, timeout, upstream 400), we fall back to deterministic
+trimming so the request still goes through.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -26,9 +20,9 @@ UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 _DEFAULTS = {
     "enabled": True,
-    "budget_tokens": 100_000,    # soglia di attivazione (stima ~4 char/token)
-    "keep_recent": 8,            # messaggi finali tenuti verbatim
-    "summary_max_tokens": 1024,  # cap output del riassunto
+    "budget_tokens": 100_000,  # activation threshold (~4 chars/token)
+    "keep_recent": 8,  # final messages kept verbatim
+    "summary_max_tokens": 1024,  # cap on summarized output
 }
 
 
@@ -43,7 +37,7 @@ def _settings() -> dict:
 
 
 def estimate_tokens(messages: list[dict]) -> int:
-    """Stima grezza: ~4 char/token sul JSON serializzato."""
+    """Rough token estimate: ~4 chars/token on the serialized JSON."""
     try:
         return len(json.dumps(messages, ensure_ascii=False)) // 4
     except (TypeError, ValueError):
@@ -51,7 +45,7 @@ def estimate_tokens(messages: list[dict]) -> int:
 
 
 def _split(messages: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Divide in (system iniziali, resto della conversazione)."""
+    """Split into (leading system messages, the rest of the conversation)."""
     i = 0
     while i < len(messages) and messages[i].get("role") == "system":
         i += 1
@@ -73,46 +67,35 @@ def _render(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-_CONV_KEY_PREFIX_MSGS = 4  # quanti messaggi iniziali di `rest` entrano nell'identita'
+_CONV_KEY_PREFIX_MSGS = (
+    4  # initial messages of `rest` used for the conversation identity
+)
 
 
 def _conv_key(system_block: list[dict], rest: list[dict]) -> str:
     """
-    Identita' 'stabile' della conversazione: system + primi N messaggi.
+    Stable identity for a conversation: system prompt + first N messages.
 
-    Usare solo rest[:1] (un unico messaggio) collide facilmente quando piu'
-    conversazioni condividono lo stesso system prompt fisso e lo stesso
-    primo messaggio (tipico con tool automatizzati come Codex/opencode che
-    mandano sempre lo stesso prompt iniziale) → riassunti incrociati fra
-    conversazioni scorrelate. Usare piu' messaggi iniziali riduce
-    drasticamente le collisioni senza cambiare la logica di roll-forward
-    (il roll-forward si basa comunque su `covered_count`, non sulla key).
+    Using only rest[:1] (one message) collides across conversations sharing
+    the same system prompt and first message — typical for automated tools.
+    Using the first 4 instead keeps collisions vanishingly rare without
+    changing the roll-forward logic (which keys on `covered_count`, not here).
     """
     h = hashlib.sha256()
     for m in system_block + rest[:_CONV_KEY_PREFIX_MSGS]:
         h.update(_render([m]).encode("utf-8", "replace"))
-    # Include anche il conteggio dei messaggi nel prefisso: due conversazioni
-    # la cui "rest" e' piu' corta del prefisso (es. rest ha 1 solo messaggio)
-    # non collidono con una che ne ha di piu' ma stesso contenuto iniziale.
     h.update(str(min(len(rest), _CONV_KEY_PREFIX_MSGS)).encode())
     return h.hexdigest()
 
 
 def _fingerprint(msgs: list[dict]) -> str:
-    """Fingerprint corto di una sequenza di messaggi, per verificare che una
-    entry di cache corrisponda davvero alla stessa continuazione prima di
-    riusarla (difesa aggiuntiva in caso di collisione residua su _conv_key)."""
+    """Short fingerprint of a message sequence to guard against cache collisions."""
     h = hashlib.sha256()
     for m in msgs:
         h.update(_render([m]).encode("utf-8", "replace"))
     return h.hexdigest()[:16]
 
 
-# conv_key -> (covered_count, summary_text, fingerprint_dei_msg_coperti)
-#   covered_count = quanti messaggi di `rest` sono gia' inclusi nel riassunto
-#   fingerprint   = hash dei primi messaggi coperti, per rilevare collisioni
-#                   residue su _conv_key (due conversazioni diverse che
-#                   finiscono comunque con la stessa chiave)
 _rolling: dict[str, tuple[int, str, str]] = {}
 _ROLLING_CAP = 256
 
@@ -124,18 +107,24 @@ def _pick_key(state) -> Optional[str]:
     return None
 
 
-async def _summarize(client, key: str, model: str, prev_summary: Optional[str],
-                     new_msgs: list[dict], max_tokens: int) -> str:
+async def _summarize(
+    client,
+    key: str,
+    model: str,
+    prev_summary: Optional[str],
+    new_msgs: list[dict],
+    max_tokens: int,
+) -> str:
     sys = (
-        "Sei un compressore di cronologia conversazioni. Produci un riassunto "
-        "conciso ma denso che preservi: decisioni prese, fatti, modifiche a file "
-        "e relativi percorsi, stato del task corrente, valori/parametri importanti. "
-        "Niente preamboli: restituisci solo il riassunto."
+        "You are a conversation history compressor. Produce a concise but dense "
+        "summary that preserves decisions, facts, file modifications and their "
+        "paths, the current state of the task, and important values/parameters. "
+        "No preambles — return only the summary."
     )
     user = ""
     if prev_summary:
-        user += "Riassunto finora:\n" + prev_summary + "\n\n"
-    user += "Nuovi messaggi da integrare nel riassunto:\n" + _render(new_msgs)
+        user += "Previous summary:\n" + prev_summary + "\n\n"
+    user += "New messages to integrate into the summary:\n" + _render(new_msgs)
 
     payload = {
         "model": model,
@@ -161,14 +150,18 @@ async def _summarize(client, key: str, model: str, prev_summary: Optional[str],
     finally:
         await resp.aclose()
 
-    txt = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content") or ""
+    txt = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get(
+        "content"
+    ) or ""
     if not txt.strip():
         raise RuntimeError("summarize empty")
     return txt.strip()
 
 
-def _trim(system_block: list[dict], rest: list[dict], budget: int, keep_recent: int) -> list[dict]:
-    """Fallback deterministico: system + primo msg + ultimi finche' stanno nel budget."""
+def _trim(
+    system_block: list[dict], rest: list[dict], budget: int, keep_recent: int
+) -> list[dict]:
+    """Deterministic fallback: keep system + first msg + as many recent as fit."""
     head = rest[:1]
     total = estimate_tokens(system_block + head)
     tail: list[dict] = []
@@ -178,15 +171,16 @@ def _trim(system_block: list[dict], rest: list[dict], budget: int, keep_recent: 
             break
         tail.insert(0, m)
         total += t
-    notice = {"role": "system", "content": "[messaggi precedenti omessi per rientrare nel contesto]"}
+    notice = {"role": "system", "content": "[previous messages omitted to fit context]"}
     return system_block + head + [notice] + tail
 
 
-async def maybe_compact(messages: list[dict], *, state, client,
-                        log: Callable[[str], None]) -> list[dict]:
+async def maybe_compact(
+    messages: list[dict], *, state, client, log: Callable[[str], None]
+) -> list[dict]:
     """
-    Ritorna la lista di messaggi compattata se serve, altrimenti quella originale
-    (stessa reference → il chiamante puo' evitare di ri-serializzare).
+    Return compacted messages if needed, otherwise the original list
+    (same reference — caller can skip re-serializing).
     """
     cfg = _settings()
     if not cfg["enabled"] or not isinstance(messages, list) or len(messages) < 4:
@@ -198,12 +192,11 @@ async def maybe_compact(messages: list[dict], *, state, client,
     keep_recent = cfg["keep_recent"]
     system_block, rest = _split(messages)
     if len(rest) <= keep_recent + 1:
-        return messages  # niente di comprimibile
+        return messages
 
     old = rest[:-keep_recent]
     tail = rest[-keep_recent:]
 
-    # roll-forward: riassumi solo i messaggi nuovi oltre a quelli gia' coperti
     ck = _conv_key(system_block, rest)
     prev = _rolling.get(ck)
     fp_check_len = min(len(old), _CONV_KEY_PREFIX_MSGS)
@@ -213,11 +206,16 @@ async def maybe_compact(messages: list[dict], *, state, client,
         new_msgs = old[covered:]
         base = prev_summary
         if not new_msgs:
-            block = {"role": "system", "content": "Riassunto conversazione precedente:\n" + prev_summary}
+            block = {
+                "role": "system",
+                "content": "Previous conversation summary:\n" + prev_summary,
+            }
             return system_block + [block] + tail
     else:
         if prev and prev[2] != current_fp:
-            log("⧉ compaction: collisione cache rilevata (fingerprint mismatch) → riassunto da zero")
+            log(
+                "⧉ compaction: cache collision detected (fingerprint mismatch) → summarize from scratch"
+            )
         new_msgs = old
         base = None
 
@@ -225,18 +223,24 @@ async def maybe_compact(messages: list[dict], *, state, client,
     key = _pick_key(state)
     if key is not None:
         try:
-            summary = await _summarize(client, key, model, base, new_msgs, cfg["summary_max_tokens"])
+            summary = await _summarize(
+                client, key, model, base, new_msgs, cfg["summary_max_tokens"]
+            )
             if len(_rolling) >= _ROLLING_CAP:
                 _rolling.clear()
             _rolling[ck] = (len(old), summary, current_fp)
-            log(f"⧉ compaction: riassunti {len(old)} msg → {len(summary)} char (tenuti {len(tail)} recenti)")
-            block = {"role": "system", "content": "Riassunto conversazione precedente:\n" + summary}
+            log(
+                f"⧉ compaction: summarized {len(old)} msg → {len(summary)} char (kept {len(tail)} recent)"
+            )
+            block = {
+                "role": "system",
+                "content": "Previous conversation summary:\n" + summary,
+            }
             return system_block + [block] + tail
-        except Exception as e:  # noqa: BLE001 — qualsiasi errore → trim, non bloccare
-            # NON marchiamo la chiave failed: un 400 "troppo lungo" non e' colpa della chiave.
-            log(f"⧉ compaction: summarize fallito ({e}) → trim fallback")
+        except Exception as e:  # noqa: BLE001 — any failure → trim, never block
+            log(f"⧉ compaction: summarize failed ({e}) → trim fallback")
     else:
-        log("⧉ compaction: nessuna chiave sana → trim fallback")
+        log("⧉ compaction: no healthy key → trim fallback")
 
     trimmed = _trim(system_block, rest, budget, keep_recent)
     log(f"⧉ compaction: trim → {len(trimmed)} msg (~{estimate_tokens(trimmed)} tok)")

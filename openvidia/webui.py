@@ -1,3 +1,13 @@
+"""Embedded control panel served by the proxy itself.
+
+A thin FastAPI router mounted on the same process that runs the proxy:
+serves the static dashboard bundle plus a small REST/SSE surface for
+key management, stats, presets and live logs. All mutators persist via
+``config`` so state survives restarts; reads mirror ``ProxyState``.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import sys
@@ -16,45 +26,74 @@ from .proxy_state import ProxyState
 UPSTREAM_BASE = "https://integrate.api.nvidia.com/v1/"
 
 
+# --------------------------------------------------------------------------- #
+# Static dashboard bundle
+# --------------------------------------------------------------------------- #
+
+
 def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
+    """Register the dashboard + management API on ``app``.
+
+    Routes are closures over ``state`` and ``web_dir`` so the single
+    ``ProxyState`` instance stays the source of truth for both the proxy
+    and the UI.
+    """
 
     @app.get("/")
-    async def index():
+    async def index() -> HTMLResponse:
         p = web_dir / "index.html"
         if not p.exists():
-            return HTMLResponse("<h1>OpenVidia</h1><p>UI not found</p>", status_code=404)
+            return HTMLResponse(
+                "<h1>OpenVidia</h1><p>UI not found</p>", status_code=404
+            )
         return HTMLResponse(p.read_text())
 
     @app.get("/styles.css")
-    async def styles():
+    async def styles() -> Response:
         p = web_dir / "styles.css"
-        return Response(content=p.read_bytes(), media_type="text/css") if p.exists() else Response("", status_code=404)
+        return (
+            Response(content=p.read_bytes(), media_type="text/css")
+            if p.exists()
+            else Response("", status_code=404)
+        )
 
     @app.get("/main.js")
-    async def main_js():
+    async def main_js() -> Response:
         p = web_dir / "main.js"
-        return Response(content=p.read_bytes(), media_type="application/javascript") if p.exists() else Response("", status_code=404)
+        return (
+            Response(content=p.read_bytes(), media_type="application/javascript")
+            if p.exists()
+            else Response("", status_code=404)
+        )
 
     @app.get("/logo.png")
-    async def logo():
+    async def logo() -> Response:
         for p in [web_dir / "logo.png", web_dir / "assets" / "logo.png"]:
             if p.exists():
                 return Response(content=p.read_bytes(), media_type="image/png")
         return Response("", status_code=404)
 
     @app.get("/favicon.ico")
-    async def favicon():
-        for p in [web_dir / "favicon.ico", web_dir / "assets" / "favicon.ico", web_dir / "assets" / "logo.png"]:
+    async def favicon() -> Response:
+        for p in [
+            web_dir / "favicon.ico",
+            web_dir / "assets" / "favicon.ico",
+            web_dir / "assets" / "logo.png",
+        ]:
             if p.exists():
                 return Response(content=p.read_bytes(), media_type="image/x-icon")
         return Response("", status_code=404)
 
+    # ----------------------------------------------------------------------- #
+    # Health & status
+    # ----------------------------------------------------------------------- #
+
     @app.get("/health")
-    async def health():
+    async def health() -> dict:
         return {"status": "ok", "keys": len(state.keys), "port": state.port}
 
     @app.get("/api/status")
-    async def api_status():
+    async def api_status() -> dict:
         async with state.lock:
             on_cooldown = sum(1 for k in state.keys if state.is_key_on_cooldown(k))
         return {
@@ -65,7 +104,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         }
 
     @app.get("/api/stats")
-    async def api_stats():
+    async def api_stats() -> dict:
         async with state.lock:
             on_cooldown = sum(1 for k in state.keys if state.is_key_on_cooldown(k))
             total_rpm = sum(state.key_rpm(k) for k in state.keys)
@@ -78,17 +117,21 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
             "total_rpm": total_rpm,
         }
 
+    # ----------------------------------------------------------------------- #
+    # Accounts (legacy single-bucket surface kept for UI compat)
+    # ----------------------------------------------------------------------- #
+
     @app.get("/api/accounts")
-    async def api_get_accounts():
+    async def api_get_accounts() -> dict:
         keys = list(state.keys)
         accounts = [{"name": "Default", "keys": keys}]
         return {"accounts": accounts, "active_account": ""}
 
     @app.post("/api/accounts")
-    async def api_save_accounts(request: Request):
+    async def api_save_accounts(request: Request) -> dict:
         body = await request.json()
         accounts = body.get("accounts", [])
-        keys = []
+        keys: list[str] = []
         for acct in accounts:
             keys.extend(acct.get("keys", []))
         async with state.lock:
@@ -97,17 +140,21 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         return {"ok": True}
 
     @app.post("/api/accounts/active")
-    async def api_set_active_account(request: Request):
-        body = await request.json()
+    async def api_set_active_account(request: Request) -> dict:
+        await request.json()
         return {"ok": True}
 
+    # ----------------------------------------------------------------------- #
+    # Keys CRUD
+    # ----------------------------------------------------------------------- #
+
     @app.get("/api/keys")
-    async def api_get_keys():
+    async def api_get_keys() -> dict:
         async with state.lock:
             return {"keys": list(state.keys)}
 
     @app.post("/api/keys")
-    async def api_save_keys(request: Request):
+    async def api_save_keys(request: Request) -> dict:
         body = await request.json()
         keys = body.get("keys", [])
         async with state.lock:
@@ -116,7 +163,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         return {"ok": True}
 
     @app.post("/api/keys/add")
-    async def api_add_key(request: Request):
+    async def api_add_key(request: Request) -> dict:
         body = await request.json()
         key = body.get("key", "")
         if not key:
@@ -128,11 +175,13 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         return {"ok": True, "keys": keys}
 
     @app.post("/api/keys/remove")
-    async def api_remove_key(request: Request):
+    async def api_remove_key(request: Request) -> dict:
         body = await request.json()
         idx = body.get("index")
         key = body.get("key", "")
         async with state.lock:
+            # Allow removal by index or by value; index wins when both are
+            # provided and in range, matching what the dashboard sends.
             if idx is not None and 0 <= idx < len(state.keys):
                 state.keys = [k for i, k in enumerate(state.keys) if i != idx]
             elif key:
@@ -141,28 +190,39 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         config.save_keys_file(keys)
         return {"ok": True, "keys": keys}
 
+    # ----------------------------------------------------------------------- #
+    # Per-key live stats (cooldown, RPM, validity, freshness)
+    # ----------------------------------------------------------------------- #
+
     @app.get("/api/keys/stats")
-    async def api_key_stats():
+    async def api_key_stats() -> dict:
         async with state.lock:
-            stats = {}
+            stats: dict[str, dict] = {}
             now = time.time()
             for i, k in enumerate(state.keys):
                 u = state.stats.key_usage.get(k)
-                entry = {}
+                entry: dict = {}
                 if u:
-                    entry.update({
-                        "requests": u.requests,
-                        "success": u.success,
-                        "failed": u.failed,
-                        "last_used": u.last_used,
-                        "last_error": u.last_error,
-                        "freshness": "fresh" if (now - u.last_used) < 120 else
-                                     "stale" if u.last_used > 0 else "unused",
-                    })
-                # Cooldown / RPM / validità
+                    entry.update(
+                        {
+                            "requests": u.requests,
+                            "success": u.success,
+                            "failed": u.failed,
+                            "last_used": u.last_used,
+                            "last_error": u.last_error,
+                            "freshness": "fresh"
+                            if (now - u.last_used) < 120
+                            else "stale"
+                            if u.last_used > 0
+                            else "unused",
+                        }
+                    )
+                # Cooldown remaining, current RPM, last probe validity.
                 cd_rem = state.cooldown_remaining(k)
                 entry["cooldown"] = round(cd_rem, 1) if cd_rem > 0 else 0
-                entry["cooldown_reason"] = state.cooldown_reason(k) if cd_rem > 0 else ""
+                entry["cooldown_reason"] = (
+                    state.cooldown_reason(k) if cd_rem > 0 else ""
+                )
                 entry["rpm"] = state.key_rpm(k)
                 ks = state.key_states.get(k)
                 entry["is_valid"] = ks.is_valid if ks else True
@@ -172,52 +232,66 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
                 "key_stats": stats,
             }
 
+    # ----------------------------------------------------------------------- #
+    # Active model
+    # ----------------------------------------------------------------------- #
+
     @app.get("/api/model")
-    async def api_get_model():
+    async def api_get_model() -> dict:
         return {"model": state.active_model or ""}
 
     @app.post("/api/model")
-    async def api_set_model(request: Request):
+    async def api_set_model(request: Request) -> dict:
         body = await request.json()
         m = body.get("model", "") or None
         state.active_model = m
         config.save_active_model(m or "")
         return {"ok": True, "model": m or ""}
 
+    # ----------------------------------------------------------------------- #
+    # Lifecycle: stop / start / restart
+    # ----------------------------------------------------------------------- #
+
     @app.post("/api/stop")
-    async def api_stop():
+    async def api_stop() -> dict:
         state.running = False
         config.save_stop_flag()
         return {"ok": True, "status": "stopped"}
 
     @app.post("/api/start")
-    async def api_start():
+    async def api_start() -> dict:
         state.running = True
         config.clear_stop_flag()
         return {"ok": True, "status": "running"}
 
     @app.post("/api/restart")
-    async def api_restart():
+    async def api_restart() -> dict:
         import os as _os
         import signal as _signal
         import subprocess as _sp
-        # Spawn the new process first, then kill the old one.
-        # SIGKILL non esiste su Windows (solo POSIX): li' os.kill con
-        # SIGTERM termina il processo (Windows non ha una vera distinzione
-        # SIGTERM/SIGKILL — os.kill lo mappa a TerminateProcess).
+
+        # Spawn the replacement process first, then kill the current one so
+        # there is no window where no proxy is listening. SIGKILL is POSIX
+        # only: on Windows os.kill maps SIGTERM to TerminateProcess anyway.
         _kill_sig = _signal.SIGKILL if sys.platform != "win32" else _signal.SIGTERM
 
-        def _do_restart():
+        def _do_restart() -> None:
             import time as _time
+
             _time.sleep(0.3)
             _sp.Popen([sys.executable, "-m", "openvidia"] + sys.argv[1:])
             _time.sleep(0.5)
             _os.kill(_os.getpid(), _kill_sig)
+
         threading.Thread(target=_do_restart, daemon=True).start()
         return {"ok": True, "restarting": True}
 
+    # ----------------------------------------------------------------------- #
+    # Model probe — fire a 5-token chat completion against upstream
+    # ----------------------------------------------------------------------- #
+
     @app.post("/api/test-model")
-    async def api_test_model(request: Request):
+    async def api_test_model(request: Request) -> dict:
         body = await request.json()
         model_id = body.get("model", "")
         if not model_id:
@@ -228,49 +302,78 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         if not keys:
             return {"ok": False, "error": "no keys"}
 
-        payload = {"model": model_id, "messages": [{"role": "user", "content": "ok"}], "max_completion_tokens": 5}
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "ok"}],
+            "max_completion_tokens": 5,
+        }
         async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as client:
             for key in keys:
                 try:
                     r = await client.post(
                         UPSTREAM_BASE + "chat/completions",
-                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Content-Type": "application/json",
+                        },
                         json=payload,
                     )
                     if r.is_success:
                         d = r.json()
-                        txt = d.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        txt = (
+                            d.get("choices", [{}])[0]
+                            .get("message", {})
+                            .get("content", "")
+                        )
                         return {"ok": True, "model": model_id, "response": txt[:100]}
+                    # 400/429 are key/model-level rejections worth surfacing;
+                    # everything else is treated as transient and skipped.
                     if r.status_code != 400 and r.status_code != 429:
                         continue
                 except httpx.HTTPError:
                     continue
-                return {"ok": False, "model": model_id, "error": "unavailable", "detail": r.text[:200]}
+                return {
+                    "ok": False,
+                    "model": model_id,
+                    "error": "unavailable",
+                    "detail": r.text[:200],
+                }
 
         return {"ok": False, "model": model_id, "error": "all keys failed"}
 
+    # ----------------------------------------------------------------------- #
+    # Presets (saved key sets)
+    # ----------------------------------------------------------------------- #
+
     @app.get("/api/presets")
-    async def api_get_presets():
+    async def api_get_presets() -> dict:
         return {"presets": config.load_saved_presets()}
 
     @app.post("/api/presets")
-    async def api_save_presets(request: Request):
+    async def api_save_presets(request: Request) -> dict:
         body = await request.json()
         presets = body.get("presets", [])
         config.save_presets_file(presets)
         return {"ok": True}
 
-    @app.get("/api/logs/stream")
-    async def log_stream(request: Request):
-        async def event_generator():
-            q = asyncio.Queue()
+    # ----------------------------------------------------------------------- #
+    # Live log stream (SSE)
+    # ----------------------------------------------------------------------- #
 
-            # Invia lo storico attuale
+    @app.get("/api/logs/stream")
+    async def log_stream(request: Request) -> StreamingResponse:
+        async def event_generator():
+            q: asyncio.Queue[str] = asyncio.Queue()
+
+            # Replay the current buffer first so a reconnect doesn't lose
+            # the recent history visible before the connection opened.
             buf = list(state.log_buffer)
             for msg in buf:
                 yield f"data: {json.dumps({'msg': msg})}\n\n"
 
-            # Registra la coda per i nuovi log live (push, non polling)
+            # Register for live push (no polling) and stream until the
+            # client disconnects; heartbeats keep the socket warm during
+            # quiet periods without violating the SSE contract.
             state.listeners.add(q)
             try:
                 while True:
@@ -283,8 +386,19 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
                         yield ": heartbeat\n\n"
             finally:
                 state.listeners.discard(q)
+
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+# --------------------------------------------------------------------------- #
+# Convenience: open the dashboard in the user's default browser
+# --------------------------------------------------------------------------- #
+
+
 def auto_open(port: int = 3940) -> None:
+    """Best-effort browser launch 1.5 s after call.
+
+    The delay gives the proxy a head start so the browser doesn't race
+    the listener and show a connection-refused page on slow machines.
+    """
     threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{port}")).start()

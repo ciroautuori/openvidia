@@ -1,3 +1,7 @@
+"""Cross-platform config paths and atomic file helpers."""
+
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -6,7 +10,7 @@ from typing import List
 
 
 def config_dir() -> Path:
-    """Directory di config multipiattaforma."""
+    """Platform-specific config directory."""
     if sys.platform == "win32":
         d = Path(os.environ.get("APPDATA", Path.home())) / "openvidia"
     elif sys.platform == "darwin":
@@ -43,6 +47,7 @@ def load_saved_keys_file() -> List[str]:
 
 
 def atomic_write(path: Path, content: str) -> None:
+    """Write to a temp file then rename — crash-safe, atomic on POSIX."""
     tmp = path.with_suffix(".tmp")
     tmp.write_text(content)
     tmp.rename(path)

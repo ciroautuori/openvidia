@@ -1,14 +1,17 @@
 """
-Shim Responses API → chat/completions.
+Responses API → chat/completions shim.
 
-Traduce /v1/responses (l'API usata da Codex CLI) in /v1/chat/completions
-(che openvidia gia' sa inoltrare a NVIDIA NIM). Bidirezionale:
-  - request:  input (string|items[]) → messages[]
-  - response: chat completion → output items (text, function_call)
-  - streaming: SSE chat chunks → SSE Responses events
-  - tools:    function definitions → chat tools, e ritorno
+Translates /v1/responses (the API used by Codex CLI) into
+/v1/chat/completions, which the proxy already knows how to forward to NVIDIA
+NIM. The translation is bidirectional:
 
-Niente astrazioni — solo traduzione di payload.
+  - request:  input (string | items[])        → messages[]
+  - response: chat completion                  → output items (text, function_call)
+  - streaming: SSE chat chunks                  → SSE Responses events
+  - tools:    function definitions             → chat tools, and back
+
+No abstractions — just payload translation. All names, signatures and control
+flow are frozen; only prose (docstrings/comments) is reformatted.
 """
 
 from __future__ import annotations
@@ -23,25 +26,27 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 
-from .proxy_state import ProxyState, persist_index
+from .proxy_state import ProxyState
 
 
-# ── Sanitize chat/completions messages (defensive) ────────────────────
+# ── Defensive sanitization of chat/completions messages ────────────────
 def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
     """
-    Ensure every message is a valid OpenAI chat/completions message so
+    Guarantee every message is a valid OpenAI chat/completions message so
     upstream never rejects a request with::
 
         data did not match any variant of untagged enum
         ChatCompletionRequestToolMessageContent
 
-    Rules applied:
-      - content must be a str (or None only when tool_calls are present on an
-        assistant message). Lists are flattened to text where possible.
-      - tool messages must have non-null string content and a tool_call_id.
-      - assistant messages with tool_calls get content coerced to "" (never
-        None) — NVIDIA NIM rejects content:null on non-tool messages.
-      - drop empty/unknown roles.
+    Coercion rules:
+      - content is forced to str. Lists are flattened to text; dicts are
+        JSON-encoded; None becomes "" (or " " for tool/user fallbacks).
+      - tool messages require a non-null string content and a tool_call_id;
+        if the caller forgot the id we synthesize one (NVIDIA enforces the
+        match against a prior assistant tool_calls entry).
+      - assistant messages carrying tool_calls get content coerced to ""
+        (never None) — NVIDIA NIM rejects content:null on non-tool messages.
+      - Unknown roles are dropped silently.
     """
     out: list[dict] = []
     for m in messages:
@@ -53,8 +58,9 @@ def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
         content = m.get("content")
         tool_calls = m.get("tool_calls")
 
-        # Flatten list/array content to a text string (tool_call_output arrays,
-        # Codex content parts, multimodal that we reduce to text).
+        # Flatten array-shaped content to a text string. Sources include
+        # tool_call_output arrays, Codex content parts, and multimodal
+        # payloads we reduce to plain text.
         if isinstance(content, list):
             parts: list[str] = []
             for part in content:
@@ -76,8 +82,8 @@ def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
         if role == "tool":
             tcid = m.get("tool_call_id") or ""
             if not tcid:
-                # Recover from tool_calls present on a previous assistant message:
-                # NVIDIA requires a matching tool_call_id; if absent, synthesize.
+                # No matching tool_call_id → synthesize one so the upstream
+                # schema validator accepts the tool response.
                 tcid = f"call_{uuid.uuid4().hex[:24]}"
             if not content:
                 content = " "
@@ -107,7 +113,7 @@ def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
                     }
                 )
             if not clean_calls:
-                # Malformed tool_calls: treat as plain assistant text.
+                # Malformed tool_calls: degrade to a plain assistant text turn.
                 out.append({"role": "assistant", "content": content or " "})
                 continue
             out.append(
@@ -128,11 +134,11 @@ def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
 
 def _input_to_messages(input_data: Any) -> list[dict]:
     """
-    Responses API accetta `input` come:
-      - stringa singola → un messaggio user
-      - array di InputItems (message, function_call, function_call_output)
-    Codex CLI invia messaggi con role="developer" (→ system) e
-    content parts con type="input_text" (→ text).
+    Convert the Responses API `input` field into chat/completions messages.
+
+    `input` is either a bare string (→ single user message) or an array of
+    InputItems. Codex CLI sends messages with role="developer" (mapped to
+    "system") and content parts with type="input_text" (mapped to plain text).
     """
     if isinstance(input_data, str):
         return [{"role": "user", "content": input_data}]
@@ -143,13 +149,13 @@ def _input_to_messages(input_data: Any) -> list[dict]:
 
         if typ == "message":
             role = item.get("role", "user")
-            # Codex usa "developer" → mappa a "system" per chat/completions
+            # Codex uses "developer" → remap to "system" for chat/completions.
             if role == "developer":
                 role = "system"
             content = item.get("content", "")
-            # content puo' essere stringa o array di content_part
+            # content may be a string or an array of content parts.
             if isinstance(content, list):
-                # Codex usa type="input_text", OpenAI standard usa type="text"
+                # Codex uses type="input_text"; OpenAI standard uses type="text".
                 text_parts = [
                     p.get("text", "")
                     for p in content
@@ -159,7 +165,7 @@ def _input_to_messages(input_data: Any) -> list[dict]:
             messages.append({"role": role, "content": content})
 
         elif typ == "function_call_output":
-            # Risultato di una tool call precedente — va come messaggio tool
+            # Result of a prior tool call — emit as a tool message.
             call_id = item.get("call_id", "")
             output = item.get("output", "")
             if isinstance(output, dict):
@@ -169,8 +175,8 @@ def _input_to_messages(input_data: Any) -> list[dict]:
             )
 
         elif typ == "function_call":
-            # Una function call gia' fatta nel turno precedente — la ricostruiamo
-            # come assistant message con tool_calls
+            # A function call from a previous turn — reconstruct as an
+            # assistant message with tool_calls so context is preserved.
             name = item.get("name", "")
             arguments = item.get("arguments", "")
             call_id = item.get("call_id", "")
@@ -186,25 +192,27 @@ def _input_to_messages(input_data: Any) -> list[dict]:
                     ],
                 }
             )
-        # item type sconosciuto → skip
+        # Unknown item types are ignored — forward compatibility.
 
     return messages
 
 
 def _tools_to_chat_tools(tools: list[dict]) -> list[dict]:
     """
-    Responses tools → chat/completions tools[].
-    Codex CLI invia due formati:
-      - flat: {type:"function", name:"x", description:"...", parameters:{...}}
-      - nested: {type:"function", function:{name:"x", ...}}
-    Filtra anche tipi non-function (namespace, web_search, image_generation)
-    che NVIDIA non supporta.
+    Convert Responses tools into chat/completions tools[].
+
+    Codex CLI sends two function shapes:
+      - flat:    {type:"function", name:"x", description:"...", parameters:{...}}
+      - nested:  {type:"function", function:{name:"x", ...}}
+
+    Non-function types (namespace, web_search, image_generation) are filtered
+    out because NVIDIA NIM does not understand them.
     """
     chat_tools = []
     for tool in tools:
         if tool.get("type") != "function":
             continue
-        # Formato flat (Codex) — nome e parametri al top level
+        # Flat shape (Codex): name and parameters at the top level.
         if "name" in tool:
             chat_tools.append(
                 {
@@ -216,7 +224,7 @@ def _tools_to_chat_tools(tools: list[dict]) -> list[dict]:
                     },
                 }
             )
-        # Formato nested (standard OpenAI)
+        # Nested shape (OpenAI standard).
         elif "function" in tool:
             fn = tool["function"]
             chat_tools.append(
@@ -233,18 +241,18 @@ def _tools_to_chat_tools(tools: list[dict]) -> list[dict]:
 
 
 def _build_chat_payload(body: dict, model_override: str | None) -> dict:
-    """Costruisce il payload chat/completions dal body Responses."""
+    """Build the chat/completions payload from a Responses request body."""
     messages = []
 
-    # Instructions (system prompt) → system message
+    # Instructions (system prompt) → leading system message.
     instructions = body.get("instructions")
     if instructions:
         messages.append({"role": "system", "content": instructions})
 
     messages.extend(_input_to_messages(body.get("input", "")))
 
-    # model_override (da state.active_model) ha precedenza; se assente,
-    # usa il default NVIDIA (mai passare "openvidia/openvidia" a NVIDIA)
+    # model_override (from state.active_model) takes precedence; otherwise use
+    # the NVIDIA default — never forward "openvidia/openvidia" to NVIDIA.
     effective_model = model_override or "deepseek-ai/deepseek-v4-pro"
 
     payload: dict[str, Any] = {
@@ -252,12 +260,12 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
         "messages": messages,
     }
 
-    # Tools
+    # Tools translation.
     tools = body.get("tools", [])
     if tools:
         payload["tools"] = _tools_to_chat_tools(tools)
 
-    # Parametri opzionali pass-through (solo quelli compatibili con chat/completions)
+    # Pass-through optional parameters (only those compatible with chat/completions).
     for key in (
         "temperature",
         "top_p",
@@ -277,7 +285,7 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
 
 
 def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
-    """Traduce una chat/completions response (non-streaming) in formato Responses."""
+    """Translate a non-streaming chat/completions response into Responses format."""
     resp_id = f"resp_{uuid.uuid4().hex[:24]}"
     created = chat_data.get("created", int(time.time()))
 
@@ -285,7 +293,7 @@ def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
     choice = (chat_data.get("choices") or [{}])[0]
     msg = choice.get("message", {})
 
-    # Tool calls → function_call items
+    # Tool calls → function_call items.
     tool_calls = msg.get("tool_calls", [])
     if tool_calls:
         for tc in tool_calls:
@@ -300,7 +308,7 @@ def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
                 }
             )
 
-    # Text content → message item con content array (output_text)
+    # Text content → message item with a content array (output_text).
     text = msg.get("content")
     if text:
         output.append(
@@ -313,11 +321,11 @@ def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
             }
         )
 
-    # Status
+    # Status derived from finish_reason.
     finish = choice.get("finish_reason", "stop")
     status = "completed" if finish == "stop" else "incomplete"
 
-    # Usage
+    # Usage mapping (prompt/completion → input/output/total).
     usage = chat_data.get("usage", {})
     resp_usage = {
         "input_tokens": usage.get("prompt_tokens", 0),
@@ -340,6 +348,7 @@ def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
 
 
 def _sse_event(event_type: str, data: dict) -> bytes:
+    """Serialize a single SSE event for the Responses streaming protocol."""
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
 
 
@@ -351,13 +360,14 @@ async def _stream_responses(
     request: Request,
 ) -> AsyncGenerator[bytes, None]:
     """
-    Invia chat/completions con stream:true a NVIDIA, ritraduce i chunk SSE
-    in eventi Responses SSE.
+    Forward chat/completions with stream:true to NVIDIA and re-translate the
+    SSE chat chunks into Responses-protocol SSE events.
     """
     resp_id = f"resp_{uuid.uuid4().hex[:24]}"
     created_ts = int(time.time())
 
-    # Evento iniziale: response.created
+    # Opening events: response.created then response.in_progress (Codex
+    # expects both before any output).
     yield _sse_event(
         "response.created",
         {
@@ -372,7 +382,6 @@ async def _stream_responses(
             },
         },
     )
-    # response.in_progress — Codex lo aspetta
     yield _sse_event(
         "response.in_progress",
         {
@@ -390,12 +399,12 @@ async def _stream_responses(
 
     upstream = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-    # Candidati calcolati qui, dentro il generator, non prima — evita collisioni
-    # fra richieste concorrenti che condividerebbero la stessa lista pre-computata.
+    # Candidate keys resolved inside the generator, not before — avoids
+    # concurrent requests sharing a single precomputed list.
     async with state.lock:
         candidates = state.get_candidate_keys()
 
-    # Prova tutte le chiavi in rotazione (come il catch-all)
+    # Key rotation (same pattern as the catch-all proxy).
     resp = None
     used_key = None
     used_idx = None
@@ -413,12 +422,16 @@ async def _stream_responses(
             )
             resp = await client.send(req, stream=True)
         except httpx.ReadTimeout:
-            state.log_cb(f"  responses shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)")
+            state.log_cb(
+                f"  responses shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)"
+            )
             state.mark_key_failed(k)
             continue
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
-            state.log_cb(f"  responses shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
+            state.log_cb(
+                f"  responses shim: key[{idx}] {err_msg} (rotating, cooldown 30s)"
+            )
             state.mark_key_failed(k)
             continue
 
@@ -427,7 +440,7 @@ async def _stream_responses(
             used_idx = idx
             break
 
-        # Error: rotate to next key
+        # Non-200: rotate to the next key.
         err_status = resp.status_code
         await resp.aread()
         await resp.aclose()
@@ -436,12 +449,14 @@ async def _stream_responses(
         state.mark_key_failed(k, status=err_status)
 
     if resp is None or used_key is None:
-        # Tentativo fallback su modello alternativo nei preset
+        # All keys exhausted on the primary model → try a preset fallback model.
         from .proxy_app import _get_fallback_model
 
         fb_model = _get_fallback_model(state, model)
         if fb_model and fb_model != model:
-            state.log_cb(f"  responses shim: all keys failed for {model}, fallback to {fb_model}")
+            state.log_cb(
+                f"  responses shim: all keys failed for {model}, fallback to {fb_model}"
+            )
             chat_payload["model"] = fb_model
             for idx, k in candidates:
                 if not state.key_can_send_rpm(k):
@@ -452,7 +467,9 @@ async def _stream_responses(
                     "User-Agent": "openvidia/2.0",
                 }
                 try:
-                    req = client.build_request("POST", upstream, json=chat_payload, headers=hdrs)
+                    req = client.build_request(
+                        "POST", upstream, json=chat_payload, headers=hdrs
+                    )
                     resp = await client.send(req, stream=True)
                 except httpx.ReadTimeout:
                     state.mark_key_failed(k)
@@ -473,6 +490,7 @@ async def _stream_responses(
                 state.mark_key_failed(k, status=err_status)
 
     if resp is None or used_key is None:
+        # Definitive failure: emit error + response.failed and terminate.
         yield _sse_event(
             "error",
             {
@@ -504,13 +522,13 @@ async def _stream_responses(
     if used_idx is not None:
         state.log_cb(f"✔ key[{used_idx}] OK")
 
-    # Stati per accumulare tool calls durante lo streaming
-    # Codex (Responses API) usa item type "message" con content array di
-    # content_part type "output_text" — NON item type "text".
+    # Accumulators for the streamed output. Codex (Responses API) uses item
+    # type "message" with a content array of output_text parts — NOT item
+    # type "text".
     text_item_id = f"msg_{uuid.uuid4().hex[:24]}"
     text_started = False
     text_full = ""
-    # output_index: 0 = text (se presente), poi tool_calls
+    # output_index: 0 = text (if any), then tool_calls in arrival order.
     tool_calls_map: dict[int, dict] = {}  # index → tool_call state
     next_output_index = 0
 
@@ -531,7 +549,7 @@ async def _stream_responses(
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta", {})
 
-        # Text delta
+        # Text delta → response.output_text.delta
         text_content = delta.get("content")
         if text_content:
             if not text_started:
@@ -563,7 +581,7 @@ async def _stream_responses(
             )
             text_full += text_content
 
-        # Tool call deltas
+        # Tool call deltas → function_call item add + arguments deltas.
         tc_deltas = delta.get("tool_calls", [])
         for tc in tc_deltas:
             idx = tc.get("index", 0)
@@ -608,7 +626,7 @@ async def _stream_responses(
                     },
                 )
 
-        # Finish
+        # Finish: close all open items, then emit response.completed.
         finish = choice.get("finish_reason")
         if finish:
             if text_started:
@@ -662,7 +680,7 @@ async def _stream_responses(
                 )
             break
 
-    # response.completed finale
+    # Final response.completed event.
     yield _sse_event(
         "response.completed",
         {
@@ -681,7 +699,7 @@ async def _stream_responses(
     await resp.aclose()
 
 
-# ── Handler principale ─────────────────────────────────────────────────
+# ── Entry point ─────────────────────────────────────────────────────────
 
 
 async def handle_responses(
@@ -690,8 +708,10 @@ async def handle_responses(
     client,
 ) -> JSONResponse | StreamingResponse:
     """
-    Punto d'ingresso per POST /v1/responses.
-    Fa l'effettivo forward a NVIDIA chat/completions (interno, NON passa dal catch-all).
+    Handle POST /v1/responses.
+
+    Forwards directly to NVIDIA chat/completions (this path is internal — it
+    does not go through the catch-all proxy_app handler).
     """
     raw = await request.body()
     try:
@@ -699,7 +719,6 @@ async def handle_responses(
     except json.JSONDecodeError:
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
-    # Log per debug
     state.log_cb(
         f"  responses: model={body.get('model', '?')} stream={body.get('stream', False)} tools={len(body.get('tools', []))}"
     )
@@ -707,7 +726,7 @@ async def handle_responses(
     model_override = state.active_model
     chat_payload = _build_chat_payload(body, model_override)
 
-    # Auto-compaction: history troppo lunga -> riassunto (fallback trim).
+    # Auto-compaction: summarize oversized history in place (trim fallback).
     from .compaction import maybe_compact
 
     chat_payload["messages"] = await maybe_compact(
@@ -734,7 +753,7 @@ async def handle_responses(
             },
         )
 
-    # Non-streaming: candidati calcolati qui, subito prima del loop HTTP
+    # Non-streaming: resolve candidates right before the HTTP loop.
     async with state.lock:
         candidates = state.get_candidate_keys()
     if not candidates:
@@ -758,12 +777,16 @@ async def handle_responses(
             )
             resp = await client.send(req)
         except httpx.ReadTimeout:
-            state.log_cb(f"  responses shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)")
+            state.log_cb(
+                f"  responses shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)"
+            )
             state.mark_key_failed(k)
             continue
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
-            state.log_cb(f"  responses shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
+            state.log_cb(
+                f"  responses shim: key[{idx}] {err_msg} (rotating, cooldown 30s)"
+            )
             state.mark_key_failed(k)
             continue
         if resp.status_code == 200:

@@ -19,6 +19,7 @@ Flow:
      f. Save key
      g. Close modal with "Close Modal" button
 """
+
 import asyncio
 import itertools
 import json
@@ -40,7 +41,7 @@ _msgi = itertools.count(1000)
 # ── Low-level CDP helpers ──────────────────────────────────────────
 
 _UUID_RE = re.compile(
-    r'/devtools/browser/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    r"/devtools/browser/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 )
 
 
@@ -67,8 +68,10 @@ def read_ws_url() -> Optional[str]:
             return None
         except (FileNotFoundError, IndexError, OSError):
             continue
-    logger.warning("Cannot read DevToolsActivePort (tried %s)",
-                   ", ".join(str(p) for p in _CDP_PATHS))
+    logger.warning(
+        "Cannot read DevToolsActivePort (tried %s)",
+        ", ".join(str(p) for p in _CDP_PATHS),
+    )
     return None
 
 
@@ -80,17 +83,24 @@ async def _send(ws, msg: dict):
     await ws.send(json.dumps(msg))
 
 
-async def _eval(ws, sid: str, expr: str, msg_id: int = 100,
-                timeout_sec: float = 10) -> Optional[dict]:
+async def _eval(
+    ws, sid: str, expr: str, msg_id: int = 100, timeout_sec: float = 10
+) -> Optional[dict]:
     """Runtime.evaluate. Returns the ``result`` dict or None."""
-    await _send(ws, {
-        "id": msg_id, "sessionId": sid,
-        "method": "Runtime.evaluate",
-        "params": {
-            "expression": expr, "returnByValue": True, "awaitPromise": True,
-            "timeout": int(timeout_sec * 1000),
+    await _send(
+        ws,
+        {
+            "id": msg_id,
+            "sessionId": sid,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": expr,
+                "returnByValue": True,
+                "awaitPromise": True,
+                "timeout": int(timeout_sec * 1000),
+            },
         },
-    })
+    )
     deadline = time.time() + timeout_sec + 2
     while time.time() < deadline:
         try:
@@ -106,15 +116,19 @@ async def _eval(ws, sid: str, expr: str, msg_id: int = 100,
     return None
 
 
-async def _eval_val(ws, sid: str, expr: str, msg_id: int = 100,
-                    timeout_sec: float = 10) -> any:
+async def _eval_val(
+    ws, sid: str, expr: str, msg_id: int = 100, timeout_sec: float = 10
+) -> any:
     r = await _eval(ws, sid, expr, msg_id=msg_id, timeout_sec=timeout_sec)
     return r.get("value") if r else None
 
 
 async def _js_click(ws, sid: str, button_text: str, msg_id: int = 300) -> bool:
     """Click a button by exact text content. Returns True if clicked."""
-    val = await _eval_val(ws, sid, f"""
+    val = await _eval_val(
+        ws,
+        sid,
+        f"""
     (() => {{
         const btn = Array.from(document.querySelectorAll('button')).find(b =>
             b.textContent.trim() === {json.dumps(button_text)}
@@ -123,11 +137,14 @@ async def _js_click(ws, sid: str, button_text: str, msg_id: int = 300) -> bool:
         btn.click();
         return 'CLICKED';
     }})();
-    """, msg_id=msg_id)
+    """,
+        msg_id=msg_id,
+    )
     return val == "CLICKED"
 
 
 # ── Target management ──────────────────────────────────────────────
+
 
 async def list_targets(ws_url: str, retries: int = 3) -> list:
     """Return all page targets via Target.getTargets, with retries."""
@@ -135,15 +152,20 @@ async def list_targets(ws_url: str, retries: int = 3) -> list:
 
     for attempt in range(retries):
         try:
-            async with websockets.connect(ws_url, max_size=2 ** 24,
-                                          open_timeout=10) as ws:
+            async with websockets.connect(
+                ws_url, max_size=2**24, open_timeout=10
+            ) as ws:
                 await _send(ws, {"id": 1, "method": "Target.getTargets"})
                 resp = await _recv(ws)
                 return resp.get("result", {}).get("targetInfos", [])
         except (OSError, asyncio.TimeoutError, websockets.InvalidStatus) as e:
             if attempt < retries - 1:
-                logger.warning("CDP connect attempt %d/%d failed: %s — retrying",
-                               attempt + 1, retries, e)
+                logger.warning(
+                    "CDP connect attempt %d/%d failed: %s — retrying",
+                    attempt + 1,
+                    retries,
+                    e,
+                )
                 await asyncio.sleep(1)
             else:
                 raise
@@ -155,8 +177,14 @@ async def attach_and_get_sid(ws, target_id: str, timeout: float = 8) -> Optional
     Attach to a page target with flatten=True from an already-open connection.
     Returns sessionId.
     """
-    await _send(ws, {"id": 888, "method": "Target.attachToTarget",
-                      "params": {"targetId": target_id, "flatten": True}})
+    await _send(
+        ws,
+        {
+            "id": 888,
+            "method": "Target.attachToTarget",
+            "params": {"targetId": target_id, "flatten": True},
+        },
+    )
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -174,19 +202,28 @@ async def attach_and_get_sid(ws, target_id: str, timeout: float = 8) -> Optional
 
 # ── Auth check ─────────────────────────────────────────────────────
 
+
 async def is_authenticated(ws, sid: str) -> bool:
     """Page shows authenticated API keys content (not the Sign In page)."""
-    val = await _eval_val(ws, sid, """
+    val = await _eval_val(
+        ws,
+        sid,
+        """
         document.body.innerText.includes('Sign In')
         && !document.body.innerText.includes('API Keys')
         ? 'NOT_AUTH' : 'AUTH'
-    """, msg_id=900)
+    """,
+        msg_id=900,
+    )
     return val == "AUTH"
 
 
 # ── Key generation ─────────────────────────────────────────────────
 
-async def generate_one_key(ws, sid: str, ws_url: str, key_name: str = "") -> Optional[str]:
+
+async def generate_one_key(
+    ws, sid: str, ws_url: str, key_name: str = ""
+) -> Optional[str]:
     """
     Generate one API key on an already-attached, authenticated page.
     Uses the same WebSocket connection throughout (sid stays valid).
@@ -204,7 +241,10 @@ async def generate_one_key(ws, sid: str, ws_url: str, key_name: str = "") -> Opt
 
     # ── 2. Fill key name if provided ─────────────────────────────────
     if key_name:
-        await _eval_val(ws, sid, f"""
+        await _eval_val(
+            ws,
+            sid,
+            f"""
         (() => {{
             const input = document.querySelector('.nv-modal-overlay input[type="text"]');
             if (!input) return 'NO_INPUT';
@@ -214,7 +254,9 @@ async def generate_one_key(ws, sid: str, ws_url: str, key_name: str = "") -> Opt
             input.dispatchEvent(new Event('change', {{bubbles: true}}));
             return 'FILLED';
         }})();
-        """, msg_id=next(_msgi))
+        """,
+            msg_id=next(_msgi),
+        )
 
     # ── 3. Extract key (two sub-flows) ──────────────────────────────
     # NVIDIA's current UI auto-generates the key immediately inside a modal
@@ -223,7 +265,10 @@ async def generate_one_key(ws, sid: str, ws_url: str, key_name: str = "") -> Opt
     # the footer button if nothing found.
     deadline = time.time() + 15
     while time.time() < deadline:
-        val = await _eval_val(ws, sid, """
+        val = await _eval_val(
+            ws,
+            sid,
+            """
         (() => {
             const all = document.querySelectorAll('input, textarea');
             for (const el of all) {
@@ -234,7 +279,9 @@ async def generate_one_key(ws, sid: str, ws_url: str, key_name: str = "") -> Opt
             const m = text.match(/nvapi-[A-Za-z0-9_-]{40,}/);
             return m ? m[0] : null;
         })();
-        """, msg_id=next(_msgi))
+        """,
+            msg_id=next(_msgi),
+        )
         if val and str(val).startswith("nvapi-"):
             key = str(val)
             await _js_click(ws, sid, "Close Modal", msg_id=next(_msgi))
@@ -251,7 +298,10 @@ async def generate_one_key(ws, sid: str, ws_url: str, key_name: str = "") -> Opt
     # ── 4. Post-Generate-Key poll (only reached if step 3b fired) ────
     deadline = time.time() + 15
     while time.time() < deadline:
-        val = await _eval_val(ws, sid, """
+        val = await _eval_val(
+            ws,
+            sid,
+            """
         (() => {
             const all = document.querySelectorAll('input, textarea');
             for (const el of all) {
@@ -262,7 +312,9 @@ async def generate_one_key(ws, sid: str, ws_url: str, key_name: str = "") -> Opt
             const m = text.match(/nvapi-[A-Za-z0-9_-]{40,}/);
             return m ? m[0] : null;
         })();
-        """, msg_id=next(_msgi))
+        """,
+            msg_id=next(_msgi),
+        )
         if val and str(val).startswith("nvapi-"):
             key = str(val)
             await _js_click(ws, sid, "Close Modal", msg_id=next(_msgi))
@@ -276,9 +328,13 @@ async def generate_one_key(ws, sid: str, ws_url: str, key_name: str = "") -> Opt
 
 # ── Multi-account ──────────────────────────────────────────────────
 
-async def generate_for_all(ws_url: str, accounts: List[dict],
-                           max_per_account: int = 1,
-                           timeout_per_context: float = 25) -> List[Tuple[str, str, bool]]:
+
+async def generate_for_all(
+    ws_url: str,
+    accounts: List[dict],
+    max_per_account: int = 1,
+    timeout_per_context: float = 25,
+) -> List[Tuple[str, str, bool]]:
     """
     Iterate all authenticated build.nvidia.com tabs across all browser
     contexts and generate keys. Uses a single CDP connection per context.
@@ -287,8 +343,11 @@ async def generate_for_all(ws_url: str, accounts: List[dict],
     """
 
     targets = await list_targets(ws_url)
-    nv_pages = [t for t in targets
-                if t.get("type") == "page" and "build.nvidia.com" in t.get("url", "")]
+    nv_pages = [
+        t
+        for t in targets
+        if t.get("type") == "page" and "build.nvidia.com" in t.get("url", "")
+    ]
 
     if not nv_pages:
         return [(a["name"], "No build.nvidia.com tab open", False) for a in accounts]
@@ -318,14 +377,14 @@ async def generate_for_all(ws_url: str, accounts: List[dict],
     return results
 
 
-async def _process_context(ws_url: str, ctx_id: str, tid: str,
-                           accounts: list, max_per_account: int) -> list:
+async def _process_context(
+    ws_url: str, ctx_id: str, tid: str, accounts: list, max_per_account: int
+) -> list:
     """Process a single browser context: attach, auth check, generate keys."""
     import websockets
 
     results = []
-    async with websockets.connect(ws_url, max_size=2 ** 24,
-                                  open_timeout=10) as ws:
+    async with websockets.connect(ws_url, max_size=2**24, open_timeout=10) as ws:
         sid = await attach_and_get_sid(ws, tid)
         if not sid:
             return [(f"ctx_{ctx_id[:8]}", "Cannot attach", False)]
@@ -333,15 +392,21 @@ async def _process_context(ws_url: str, ctx_id: str, tid: str,
         if not await is_authenticated(ws, sid):
             return [(f"ctx_{ctx_id[:8]}", "Not authenticated", False)]
 
-        page_name = (await _eval_val(ws, sid, r"""
+        page_name = (
+            await _eval_val(
+                ws,
+                sid,
+                r"""
             (() => {
                 const m = document.body.innerText.match(/within ([^\n]+)/);
                 return m ? m[1].trim() : '';
             })();
-        """, msg_id=401)) or ""
+        """,
+                msg_id=401,
+            )
+        ) or ""
 
-        matched = [a for a in accounts
-                   if page_name.lower() in a["name"].lower()]
+        matched = [a for a in accounts if page_name.lower() in a["name"].lower()]
         if not matched:
             matched = accounts
 
@@ -364,6 +429,7 @@ async def _process_context(ws_url: str, ctx_id: str, tid: str,
 
 
 # ── Persistence ────────────────────────────────────────────────────
+
 
 def save_key(key: str, account_name: str, accounts_path: Path, keys_path: Path):
     """Persist key to keys.json and link it in accounts.json."""

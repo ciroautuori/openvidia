@@ -1,18 +1,9 @@
-"""
-The actual reverse proxy: catch-all route, key rotation, streaming passthrough.
+"""Reverse proxy core: catch-all route, key rotation, streaming passthrough."""
 
-Merge il meglio di entrambe le versioni:
-- Dal VECCHIO: connection pooling tuned, key rotation con bucket available+cooldown,
-  reuse cooldown se tutte giù, ripristino validità su successo
-- Dal NUOVO: background health check, RPM rate limiting, Responses shim per Codex,
-  Retry-After parsing, client disconnect detection, HTTP/2, fallback basato sui preset
+from __future__ import annotations
 
-Fallback: niente DEGRADED_MODELS hardcoded. Se il modello attivo fallisce su tutte
-le chiavi, prova il modello successivo nei preset dell'utente.
-"""
 import asyncio
 import json
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -30,21 +21,22 @@ from .anthropic_shim import handle_anthropic_messages
 UPSTREAM_BASE = "https://integrate.api.nvidia.com/v1/"
 MAX_BODY_BYTES = 64 * 1024 * 1024
 
-# 400 (payload malformato) e 404 (modello inesistente) sono deterministici sul
-# contenuto: ruotare non aiuta (stesso errore su ogni chiave) e sprecherebbe
-# chiavi in cooldown. Vengono ritornati direttamente al client.
-# 401/403 (auth) e 429 (rate) sono invece colpa della chiave → rotazione+cooldown.
+# 400/404 are deterministic content errors — rotating keys won't help and
+# just burns cooldown budget. 401/403/429 are key-specific → rotate + cooldown.
 ROTATE_STATUSES = {401, 403, 429}
+
+DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"
+
+STRIPPED_RESPONSE_HEADERS = {
+    "content-encoding",
+    "transfer-encoding",
+    "content-length",
+    "connection",
+}
 
 
 def should_rotate(status: int) -> bool:
     return status in ROTATE_STATUSES or status >= 500
-
-
-STRIPPED_RESPONSE_HEADERS = {"content-encoding", "transfer-encoding", "content-length", "connection"}
-
-# Sinonimi di modello — se l'utente chiede "openvidia" mappa al modello attivo
-DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"
 
 
 async def _check_key_health(client: httpx.AsyncClient, key: str) -> bool:
@@ -59,11 +51,14 @@ async def _check_key_health(client: httpx.AsyncClient, key: str) -> bool:
         return False
 
 
-async def _health_check_all(state: ProxyState, client: httpx.AsyncClient, force: bool = False) -> None:
+async def _health_check_all(
+    state: ProxyState, client: httpx.AsyncClient, force: bool = False
+) -> None:
     revived = 0
     for key in state.keys:
         if not force and not state.is_key_on_cooldown(key):
             continue
+        # Skip keys with most of their cooldown left — probing too early wastes quota.
         if not force and state.cooldown_remaining(key) > 90:
             continue
         healthy = await _check_key_health(client, key)
@@ -83,7 +78,9 @@ async def _health_check_all(state: ProxyState, client: httpx.AsyncClient, force:
     )
 
 
-async def _background_health_check(state: ProxyState, client: httpx.AsyncClient) -> None:
+async def _background_health_check(
+    state: ProxyState, client: httpx.AsyncClient
+) -> None:
     try:
         while True:
             await asyncio.sleep(30)
@@ -105,8 +102,11 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
 
 
 def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
-    # Connection pooling tuned (dal VECCHIO) + HTTP/2 (dal NUOVO)
-    limits = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0)
+    # Tuned for many concurrent streaming completions: generous keepalive pool,
+    # long read timeout for slow LLM generation, HTTP/2 for connection reuse.
+    limits = httpx.Limits(
+        max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0
+    )
     client = httpx.AsyncClient(
         http2=True,
         limits=limits,
@@ -115,17 +115,16 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # startup: pre-warm chiavi + health check in background
         async def _pre_warm():
             state.log_cb("⚕ pre-warm: checking all keys...")
             await _health_check_all(state, client, force=True)
             state.log_cb(
                 f"⚕ pre-warm done ({sum(1 for k in state.keys if state.is_key_healthy(k))}/{len(state.keys)} healthy)"
             )
+
         asyncio.create_task(_pre_warm())
         state.health_task = asyncio.create_task(_background_health_check(state, client))
         yield
-        # shutdown: ferma il task e chiudi il client
         if state.health_task is not None:
             state.health_task.cancel()
         await client.aclose()
@@ -143,9 +142,10 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
     if web_dir and web_dir.exists():
         from .webui import attach_webui
+
         attach_webui(app, state, web_dir)
 
-    # ── Shim Responses API → chat/completions (Codex) ────────────────
+    # ── Responses API shim → chat/completions (Codex) ──────────────────
     @app.post("/v1/responses")
     async def responses_handler(request: Request):
         if not state.running:
@@ -153,20 +153,23 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         state.stats.requests += 1
         return await handle_responses(request, state, client)
 
-    # ── Shim Anthropic Messages API → chat/completions (Claude Code) ──
-    # Endpoint SEPARATO — attivo solo se l'utente punta ANTHROPIC_BASE_URL
-    # a localhost:1919. Zero impatto su Claude Code default (api.anthropic.com).
+    # ── Anthropic Messages API shim (Claude Code) ───────────────────────
+    # Separate endpoint — only active if the user points ANTHROPIC_BASE_URL
+    # at localhost:1919. Zero impact on the default Claude Code flow.
     @app.post("/v1/messages")
     async def anthropic_messages_handler(request: Request):
         if not state.running:
             return JSONResponse(
-                {"type": "error", "error": {"type": "api_error", "message": "proxy stopped"}},
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": "proxy stopped"},
+                },
                 status_code=503,
             )
         state.stats.requests += 1
         return await handle_anthropic_messages(request, state, client)
 
-    # ── /v1/models con formato OpenAI per Codex ───────────────────────
+    # ── /v1/models in OpenAI format (Codex compatibility) ──────────────
     @app.get("/v1/models")
     async def models_handler():
         if not state.running:
@@ -182,7 +185,9 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 continue
             headers = {"Authorization": f"Bearer {key}", "User-Agent": "openvidia/2.0"}
             try:
-                req = client.build_request("GET", UPSTREAM_BASE + "models", headers=headers)
+                req = client.build_request(
+                    "GET", UPSTREAM_BASE + "models", headers=headers
+                )
                 resp = await client.send(req)
                 if resp.is_success:
                     data = resp.json()
@@ -200,7 +205,10 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         return JSONResponse({"error": "all keys failed"}, status_code=503)
 
     # ── Catch-all proxy → NVIDIA NIM ──────────────────────────────────
-    @app.api_route("/v1/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    @app.api_route(
+        "/v1/{full_path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
     async def proxy_handler(full_path: str, request: Request):
         if not state.running:
             return JSONResponse({"error": "proxy stopped"}, status_code=503)
@@ -215,7 +223,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             except json.JSONDecodeError:
                 payload = None
 
-        # Model rewrite: "openvidia" → active_model o default
+        # Model alias: "openvidia" resolves to the user's active model or the default.
         if isinstance(payload, dict):
             m = state.active_model or payload.get("model")
             if isinstance(m, str) and m != "openvidia":
@@ -225,13 +233,15 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 payload["model"] = DEFAULT_MODEL
                 body = json.dumps(payload).encode()
 
-        # ── Auto-compaction: history troppo lunga → riassunto (no block) ──
+        # Auto-compaction: if conversation history exceeds the token budget,
+        # summarize older turns transparently so the request stays under limits.
         if (
             isinstance(payload, dict)
             and isinstance(payload.get("messages"), list)
             and full_path.endswith("chat/completions")
         ):
             from .compaction import maybe_compact
+
             new_messages = await maybe_compact(
                 payload["messages"], state=state, client=client, log=state.log_cb
             )
@@ -239,7 +249,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 payload["messages"] = new_messages
                 body = json.dumps(payload).encode()
 
-        # ── Key rotation con bucket (dal VECCHIO meglio del NUOVO) ─────
+        # ── Key rotation ──────────────────────────────────────────────
         async with state.lock:
             candidates = state.get_candidate_keys()
 
@@ -255,9 +265,10 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         CLIENT_FWD_HEADERS = {"content-type", "accept", "x-request-id", "x-trace-id"}
 
         for orig_idx, key in candidates:
-            # Skip se RPM satura
             if not state.key_can_send_rpm(key):
-                state.log_cb(f"  key[{orig_idx}] RPM saturated ({state.key_rpm(key)}/min), skip")
+                state.log_cb(
+                    f"  key[{orig_idx}] RPM saturated ({state.key_rpm(key)}/min), skip"
+                )
                 continue
 
             headers = {
@@ -267,11 +278,15 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             for k, v in request.headers.items():
                 if k.lower() in CLIENT_FWD_HEADERS:
                     headers[k] = v
-            if isinstance(payload, dict) and "content-type" not in {k.lower() for k in headers}:
+            if isinstance(payload, dict) and "content-type" not in {
+                k.lower() for k in headers
+            }:
                 headers["Content-Type"] = "application/json"
 
             try:
-                req = client.build_request(request.method, url, content=body, headers=headers)
+                req = client.build_request(
+                    request.method, url, content=body, headers=headers
+                )
                 resp = await client.send(req, stream=True)
             except httpx.ReadTimeout:
                 state.log_cb(f"key[{orig_idx}] ReadTimeout (rotating, cooldown 30s)")
@@ -295,15 +310,19 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 state.stats.success += 1
                 state.stats.record_key_usage(key, ok=True)
                 state.record_request(key)
-                state.restore_key(key)  # Dal VECCHIO: ripristina su successo
+                state.restore_key(key)
                 if nv_path != "models":
                     state.log_cb(f"✔ key[{orig_idx}] OK")
 
                 out_headers = {
-                    k: v for k, v in resp.headers.items() if k.lower() not in STRIPPED_RESPONSE_HEADERS
+                    k: v
+                    for k, v in resp.headers.items()
+                    if k.lower() not in STRIPPED_RESPONSE_HEADERS
                 }
                 out_headers["access-control-allow-origin"] = "*"
-                out_headers["access-control-allow-headers"] = "Content-Type, Authorization"
+                out_headers["access-control-allow-headers"] = (
+                    "Content-Type, Authorization"
+                )
                 out_headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
 
                 async def body_iter():
@@ -315,7 +334,9 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                     finally:
                         await resp.aclose()
 
-                return StreamingResponse(body_iter(), status_code=status, headers=out_headers)
+                return StreamingResponse(
+                    body_iter(), status_code=status, headers=out_headers
+                )
 
             state.log_cb(f"key[{orig_idx}] HTTP {status}")
             last_status = status
@@ -337,12 +358,14 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 headers={"access-control-allow-origin": "*"},
             )
 
-        # ── Fallback basato sui preset utente (no DEGRADED_MODELS) ──────
+        # ── Preset-based model fallback ────────────────────────────────
         model_name = payload.get("model", "") if isinstance(payload, dict) else ""
         fallback_model = _get_fallback_model(state, model_name)
 
         if fallback_model:
-            state.log_cb(f"↻ {model_name} failed on all keys — retry with preset fallback: {fallback_model}")
+            state.log_cb(
+                f"↻ {model_name} failed on all keys — retry with preset fallback: {fallback_model}"
+            )
             fb_body = json.dumps({**payload, "model": fallback_model}).encode()
             for fb_key in state.keys:
                 if not state.is_key_healthy(fb_key):
@@ -353,17 +376,24 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                     "User-Agent": "openvidia/2.0",
                 }
                 try:
-                    fb_req = client.build_request("POST", url, content=fb_body, headers=hdrs)
+                    fb_req = client.build_request(
+                        "POST", url, content=fb_body, headers=hdrs
+                    )
                     fb_resp = await client.send(fb_req)
                     if fb_resp.is_success:
                         state.log_cb(f"✔ fallback → {fallback_model}")
                         state.record_request(fb_key)
                         fb_body_raw = await fb_resp.aread()
-                        persist_index(state, (state.keys.index(fb_key) + 1) % len(state.keys))
+                        persist_index(
+                            state, (state.keys.index(fb_key) + 1) % len(state.keys)
+                        )
                         await fb_resp.aclose()
                         fb_data = json.loads(fb_body_raw)
                         fb_data["model"] = fallback_model
-                        return JSONResponse(content=fb_data, headers={"access-control-allow-origin": "*"})
+                        return JSONResponse(
+                            content=fb_data,
+                            headers={"access-control-allow-origin": "*"},
+                        )
                     await fb_resp.aclose()
                     if fb_resp.status_code == 429:
                         continue
@@ -375,7 +405,9 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
         msg = "all keys exhausted"
         if fallback_model:
-            msg += f" — {model_name} failed, preset fallback {fallback_model} also failed"
+            msg += (
+                f" — {model_name} failed, preset fallback {fallback_model} also failed"
+            )
         return JSONResponse(
             {"error": msg, "last_upstream_status": last_status},
             status_code=last_status,
@@ -385,10 +417,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
 
 def _get_fallback_model(state: ProxyState, failed_model: str) -> Optional[str]:
-    """
-    Fallback basato sui preset utente: trova il modello successivo nei preset
-    rispetto al modello attivo. Niente mapping hardcoded.
-    """
+    """Find the next preset model after the one that just failed all keys."""
     from . import config
 
     try:

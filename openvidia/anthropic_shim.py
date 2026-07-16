@@ -1,18 +1,21 @@
 """
-Shim Anthropic Messages API -> chat/completions.
+Anthropic Messages API → chat/completions shim.
 
-Traduce /v1/messages (l'API usata da Claude Code CLI) in /v1/chat/completions
-(che openvidia gia' sa inoltrare a NVIDIA NIM). Bidirezionale:
-  - request:  messages + system -> chat messages (system come primo message)
-  - response: chat completion -> Anthropic content blocks (text, tool_use)
-  - streaming: SSE chat chunks -> SSE Anthropic events
-  - tools:    Anthropic tool schema (input_schema) -> OpenAI function (parameters)
+Translates /v1/messages (the API used by Claude Code CLI) into
+/v1/chat/completions, which the proxy already knows how to forward to NVIDIA
+NIM. The translation is bidirectional:
 
-Endpoint SEPARATO — non interferisce con il funzionamento normale di Claude Code
-che punta ad api.anthropic.com. Attivo solo se l'utente sceglie di puntare
-ANTHROPIC_BASE_URL a localhost:1919.
+  - request:   messages + system  → chat messages (system as leading message)
+  - response:  chat completion     → Anthropic content blocks (text, tool_use)
+  - streaming: SSE chat chunks     → SSE Anthropic events
+  - tools:     Anthropic tool schema (input_schema) → OpenAI function (parameters)
 
-Niente astrazioni — solo traduzione di payload.
+This is a separate endpoint — it does not interfere with Claude Code's normal
+operation pointing at api.anthropic.com. It activates only when the user
+chooses to point ANTHROPIC_BASE_URL at localhost:1919.
+
+No abstractions — just payload translation. All names, signatures and control
+flow are frozen; only prose (docstrings/comments) is reformatted.
 """
 
 from __future__ import annotations
@@ -26,25 +29,27 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 
-from .proxy_state import ProxyState, persist_index
+from .proxy_state import ProxyState
 
 
-# ── Sanitize chat/completions messages (defensive) ────────────────────
+# ── Defensive sanitization of chat/completions messages ────────────────
 def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
     """
-    Ensure every message is a valid OpenAI chat/completions message so
+    Guarantee every message is a valid OpenAI chat/completions message so
     upstream never rejects a request with::
 
         data did not match any variant of untagged enum
         ChatCompletionRequestToolMessageContent
 
-    Rules applied:
-      - content must be a str (or None only when tool_calls are present on an
-        assistant message). Lists are flattened to text where possible.
-      - tool messages must have non-null string content and a tool_call_id.
-      - assistant messages with tool_calls get content coerced to "" (never
-        None) — NVIDIA NIM rejects content:null on non-tool messages.
-      - drop empty/unknown roles.
+    Coercion rules:
+      - content is forced to str. Lists are flattened to text; dicts are
+        JSON-encoded; None becomes "" (or " " for tool/user fallbacks).
+      - tool messages require a non-null string content and a tool_call_id;
+        if the caller forgot the id we synthesize one (NVIDIA enforces the
+        match against a prior assistant tool_calls entry).
+      - assistant messages carrying tool_calls get content coerced to ""
+        (never None) — NVIDIA NIM rejects content:null on non-tool messages.
+      - Unknown roles are dropped silently.
     """
     out: list[dict] = []
     for m in messages:
@@ -122,12 +127,14 @@ def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
 
 UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-# 400/404 sono deterministici sul contenuto (payload malformato / modello
-# inesistente): ruotare non aiuta e sprecherebbe chiavi. Si ritorna al client.
+# 400/404 are deterministic on content (bad payload / nonexistent model):
+# rotating keys cannot fix them and would only waste quota. Surface them
+# directly to the client.
 _CLIENT_ERR = {400, 404}
 
 
 def _extract_err(raw: bytes, status: int) -> str:
+    """Best-effort extraction of a human-readable error message from an upstream error body."""
     try:
         d = json.loads(raw)
         m = d.get("error", {})
@@ -138,25 +145,26 @@ def _extract_err(raw: bytes, status: int) -> str:
         return raw.decode("utf-8", "replace") if raw else f"HTTP {status}"
 
 
-# ── Request: Anthropic Messages -> chat/completions ──────────────────
+# ── Request: Anthropic Messages → chat/completions ──────────────────
 
 
 def _anthropic_to_chat_messages(body: dict) -> list[dict]:
     """
-    Converte i messaggi Anthropic in messaggi chat/completions.
-    Anthropic messaggi hanno content che puo' essere stringa o array di content blocks:
+    Convert Anthropic messages into chat/completions messages.
+
+    Anthropic message content may be a string or an array of content blocks:
       - {type:"text", text:"..."}
-      - {type:"image", source:{...}}   (ignorato, NVIDIA non supporta immagini)
-      - {type:"tool_use", id:"...", name:"...", input:{...}}  -> assistant tool_calls
-      - {type:"tool_result", tool_use_id:"...", content:"..."}  -> role:tool
+      - {type:"image", source:{...}}            (dropped — NVIDIA has no vision)
+      - {type:"tool_use", id, name, input}      → assistant tool_calls
+      - {type:"tool_result", tool_use_id, content} → role:tool
     """
     messages: list[dict] = []
 
-    # system prompt (Anthropic lo mette separatamente, non nei messages)
+    # Anthropic carries the system prompt separately from the messages array.
     system = body.get("system")
     if system:
         if isinstance(system, list):
-            # Anthropic system puo' essere array di {type:"text", text:"..."}
+            # Anthropic system may be an array of {type:"text", text:"..."}.
             system = "\n".join(
                 b.get("text", "") for b in system if b.get("type") == "text"
             )
@@ -167,17 +175,17 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
         role = msg.get("role", "user")
         content = msg.get("content", "")
 
-        # content stringa semplice
+        # Simple string content — pass through.
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
             continue
 
-        # content array di content blocks
+        # Non-list, non-string — stringify defensively.
         if not isinstance(content, list):
             messages.append({"role": role, "content": str(content)})
             continue
 
-        # Parsa i content blocks
+        # Parse content blocks.
         text_parts: list[str] = []
         tool_calls: list[dict] = []
         tool_results: list[dict] = []
@@ -189,7 +197,7 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
                 text_parts.append(block.get("text", ""))
 
             elif btype == "tool_use":
-                # Assistant ha chiamato un tool -> diventa tool_calls nel messaggio assistant
+                # Assistant invoked a tool → assistant tool_calls entry.
                 tool_calls.append(
                     {
                         "id": block.get("id", f"call_{uuid.uuid4().hex[:24]}"),
@@ -202,10 +210,10 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
                 )
 
             elif btype == "tool_result":
-                # Risultato di un tool -> diventa messaggio role:tool
+                # Tool result → role:tool message.
                 tr_content = block.get("content", "")
                 if isinstance(tr_content, list):
-                    # array di content blocks (text)
+                    # Array of content blocks (text-only).
                     tr_content = "\n".join(
                         b.get("text", "") for b in tr_content if b.get("type") == "text"
                     )
@@ -220,11 +228,12 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
                 )
 
             elif btype == "image":
-                # NVIDIA NIM non supporta vision: placeholder testuale cosi' il
-                # modello sa che c'era un'immagine (invece del drop silenzioso).
+                # NVIDIA NIM has no vision support — inject a textual
+                # placeholder so the model knows an image was present,
+                # rather than silently dropping it.
                 text_parts.append("[immagine omessa: il modello non supporta vision]")
 
-        # Costruisci il messaggio finale
+        # Assemble the final message(s).
         if role == "assistant":
             msg_dict: dict[str, Any] = {"role": "assistant"}
             if text_parts:
@@ -235,7 +244,7 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
                     msg_dict["content"] = None
             messages.append(msg_dict)
         elif role == "user":
-            # User con tool_result -> messaggi tool separati
+            # User with tool_results → emit tool messages, then any text.
             if tool_results:
                 messages.extend(tool_results)
             if text_parts:
@@ -249,16 +258,19 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
 
 def _anthropic_tools_to_chat_tools(tools: list[dict]) -> list[dict]:
     """
-    Anthropic tools -> chat/completions tools.
-    Anthropic usa: {name, description, input_schema: {...}}
-    OpenAI usa:    {type:"function", function:{name, description, parameters:{...}}}
+    Convert Anthropic tools into chat/completions tools.
+
+    Anthropic shape:  {name, description, input_schema: {...}}
+    OpenAI shape:     {type:"function", function:{name, description, parameters:{...}}}
+
+    Non-function tools (computer_use, bash, text_editor, typed tools like
+    "computer_20241022") are skipped — NVIDIA only understands function tools.
     """
     chat_tools = []
     for tool in tools:
-        # Salta tools non function (es. computer_use, bash, text_editor)
-        # Anthropic ha type per alcuni, ma molti sono solo name+input_schema
+        # Anthropic tags some tools with a type; "custom" is the generic
+        # function tool. Anything else (computer, bash, etc.) is unsupported.
         if tool.get("type") and tool.get("type") != "custom":
-            # type="computer_20241022" etc -> non supportato, skip
             continue
 
         name = tool.get("name", "")
@@ -281,10 +293,10 @@ def _anthropic_tools_to_chat_tools(tools: list[dict]) -> list[dict]:
 
 
 def _build_chat_payload(body: dict, model_override: str | None) -> dict:
-    """Costruisce il payload chat/completions dal body Anthropic Messages."""
+    """Build the chat/completions payload from an Anthropic Messages request body."""
     messages = _anthropic_to_chat_messages(body)
 
-    # model_override (da state.active_model) ha precedenza
+    # model_override (from state.active_model) takes precedence.
     effective_model = model_override or "deepseek-ai/deepseek-v4-pro"
 
     payload: dict[str, Any] = {
@@ -292,11 +304,11 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
         "messages": messages,
     }
 
-    # Tools
+    # Tools translation + tool_choice mapping.
     tools = body.get("tools", [])
     if tools:
         payload["tools"] = _anthropic_tools_to_chat_tools(tools)
-        # Anthropic tool_choice -> OpenAI tool_choice
+        # Anthropic tool_choice → OpenAI tool_choice
         tc = body.get("tool_choice")
         if tc:
             if isinstance(tc, dict) and tc.get("type") == "auto":
@@ -309,8 +321,8 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
                     "function": {"name": tc.get("name", "")},
                 }
 
-    # Parametri: Anthropic usa max_tokens (obbligatorio), temperature, top_p
-    # OpenAI usa max_tokens o max_completion_tokens
+    # Parameter pass-through. Anthropic uses max_tokens (required), temperature,
+    # top_p; OpenAI uses max_tokens or max_completion_tokens.
     max_tokens = body.get("max_tokens")
     if max_tokens:
         payload["max_tokens"] = max_tokens
@@ -320,7 +332,7 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
         if val is not None:
             payload[key] = val
 
-    # stop_sequences -> stop
+    # stop_sequences → stop
     stop = body.get("stop_sequences")
     if stop:
         payload["stop"] = stop
@@ -329,17 +341,18 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
     return payload
 
 
-# ── Response: chat/completions -> Anthropic Messages ─────────────────
+# ── Response: chat/completions → Anthropic Messages ─────────────────
 
 
 def _chat_to_anthropic_response(chat_data: dict, model: str) -> dict:
-    """Traduce una chat/completions response in formato Anthropic Messages."""
+    """Translate a chat/completions response into Anthropic Messages format."""
     choice = (chat_data.get("choices") or [{}])[0]
     msg = choice.get("message", {})
 
     content_blocks: list[dict] = []
 
-    # Tool calls -> tool_use blocks
+    # Tool calls → tool_use blocks. Arguments are parsed back into objects
+    # to match Anthropic's input field (not a JSON string).
     tool_calls = msg.get("tool_calls", [])
     for tc in tool_calls:
         fn = tc.get("function", {})
@@ -356,12 +369,12 @@ def _chat_to_anthropic_response(chat_data: dict, model: str) -> dict:
             }
         )
 
-    # Text content -> text block
+    # Text content → text block.
     text = msg.get("content")
     if text:
         content_blocks.append({"type": "text", "text": text})
 
-    # Anthropic richiede stop_reason
+    # Anthropic requires a stop_reason — map from OpenAI's finish_reason.
     finish = choice.get("finish_reason", "stop")
     stop_reason_map = {
         "stop": "end_turn",
@@ -371,7 +384,7 @@ def _chat_to_anthropic_response(chat_data: dict, model: str) -> dict:
     }
     stop_reason = stop_reason_map.get(finish, "end_turn")
 
-    # Usage
+    # Usage mapping (prompt/completion → input/output).
     usage = chat_data.get("usage", {})
     anthropic_usage = {
         "input_tokens": usage.get("prompt_tokens", 0),
@@ -390,11 +403,11 @@ def _chat_to_anthropic_response(chat_data: dict, model: str) -> dict:
     }
 
 
-# ── Streaming: SSE chat chunks -> SSE Anthropic events ───────────────
+# ── Streaming: SSE chat chunks → SSE Anthropic events ───────────────
 
 
 def _sse_event(event_type: str, data: dict) -> bytes:
-    """Anthropic SSE: event: type\ndata: json\n\n"""
+    """Serialize a single SSE event for the Anthropic streaming protocol."""
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
 
 
@@ -405,10 +418,10 @@ async def _stream_anthropic(
     client,
     request: Request,
 ) -> AsyncGenerator[bytes, None]:
-    """Invia chat/completions con stream:true, ritraduce in SSE Anthropic."""
+    """Forward chat/completions with stream:true and re-translate SSE chunks into Anthropic events."""
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
-    # message_start
+    # message_start — the opening event of the Anthropic stream.
     yield _sse_event(
         "message_start",
         {
@@ -426,12 +439,12 @@ async def _stream_anthropic(
         },
     )
 
-    # Candidati calcolati qui, dentro il generator, non prima — evita collisioni
-    # fra richieste concorrenti che condividerebbero la stessa lista pre-computata.
+    # Candidate keys resolved inside the generator — avoids concurrent
+    # requests sharing a precomputed list.
     async with state.lock:
         candidates = state.get_candidate_keys()
 
-    # Key rotation (stesso pattern della Responses shim)
+    # Key rotation (same pattern as the Responses shim).
     resp = None
     used_key = None
     used_idx = None
@@ -449,12 +462,16 @@ async def _stream_anthropic(
             )
             resp = await client.send(req, stream=True)
         except httpx.ReadTimeout:
-            state.log_cb(f"  anthropic shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)")
+            state.log_cb(
+                f"  anthropic shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)"
+            )
             state.mark_key_failed(k)
             continue
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
-            state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
+            state.log_cb(
+                f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)"
+            )
             state.mark_key_failed(k)
             continue
 
@@ -469,7 +486,7 @@ async def _stream_anthropic(
         resp = None
         state.log_cb(f"  anthropic shim: key[{idx}] HTTP {err_status}")
         if err_status in _CLIENT_ERR:
-            # deterministico: errore al client, niente rotazione ne' cooldown
+            # Deterministic error: surface to client, do not rotate or cooldown.
             yield _sse_event(
                 "error",
                 {
@@ -484,12 +501,14 @@ async def _stream_anthropic(
         state.mark_key_failed(k, status=err_status)
 
     if resp is None or used_key is None:
-        # Tentativo fallback su modello alternativo nei preset
+        # All keys exhausted on the primary model → try a preset fallback model.
         from .proxy_app import _get_fallback_model
 
         fb_model = _get_fallback_model(state, model)
         if fb_model and fb_model != model:
-            state.log_cb(f"  anthropic shim: all keys failed for {model}, fallback to {fb_model}")
+            state.log_cb(
+                f"  anthropic shim: all keys failed for {model}, fallback to {fb_model}"
+            )
             chat_payload["model"] = fb_model
             for idx, k in candidates:
                 if not state.key_can_send_rpm(k):
@@ -500,7 +519,9 @@ async def _stream_anthropic(
                     "User-Agent": "openvidia/2.0",
                 }
                 try:
-                    req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
+                    req = client.build_request(
+                        "POST", UPSTREAM, json=chat_payload, headers=hdrs
+                    )
                     resp = await client.send(req, stream=True)
                 except httpx.ReadTimeout:
                     state.mark_key_failed(k)
@@ -551,14 +572,14 @@ async def _stream_anthropic(
     if used_idx is not None:
         state.log_cb(f"✔ key[{used_idx}] OK")
 
-    # Stati per accumulare content blocks
+    # Accumulators for streamed content blocks.
     text_block_started = False
     text_block_index = 0
     text_full = ""
 
-    # Tool calls: index -> state
+    # Tool calls: index → state.
     tool_map: dict[int, dict] = {}
-    next_block_index = 1  # 0 = text, poi tool blocks
+    next_block_index = 1  # 0 = text block, then tool blocks
 
     async for line in resp.aiter_lines():
         if await request.is_disconnected():
@@ -577,7 +598,7 @@ async def _stream_anthropic(
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta", {})
 
-        # Text delta -> content_block_delta (text_delta)
+        # Text delta → content_block_delta (text_delta).
         text_content = delta.get("content")
         if text_content:
             if not text_block_started:
@@ -601,7 +622,7 @@ async def _stream_anthropic(
             )
             text_full += text_content
 
-        # Tool call deltas
+        # Tool call deltas → content_block_start (tool_use) + input_json_delta.
         tc_deltas = delta.get("tool_calls", [])
         for tc in tc_deltas:
             idx = tc.get("index", 0)
@@ -646,10 +667,10 @@ async def _stream_anthropic(
                     },
                 )
 
-        # Finish
+        # Finish: close all open blocks, then message_delta + message_stop.
         finish = choice.get("finish_reason")
         if finish:
-            # Chiudi text block
+            # Close the text block.
             if text_block_started:
                 yield _sse_event(
                     "content_block_stop",
@@ -658,7 +679,7 @@ async def _stream_anthropic(
                         "index": text_block_index,
                     },
                 )
-            # Chiudi tool blocks
+            # Close tool blocks.
             for idx, tcm in tool_map.items():
                 yield _sse_event(
                     "content_block_stop",
@@ -668,7 +689,7 @@ async def _stream_anthropic(
                     },
                 )
 
-            # stop_reason mapping
+            # stop_reason mapping.
             stop_map = {
                 "stop": "end_turn",
                 "length": "max_tokens",
@@ -676,7 +697,7 @@ async def _stream_anthropic(
             }
             stop_reason = stop_map.get(finish, "end_turn")
 
-            # message_delta con stop_reason + usage
+            # message_delta carries stop_reason and a rough output token estimate.
             yield _sse_event(
                 "message_delta",
                 {
@@ -685,11 +706,11 @@ async def _stream_anthropic(
                         "stop_reason": stop_reason,
                         "stop_sequence": None,
                     },
-                    "usage": {"output_tokens": len(text_full) // 4},  # stimato
+                    "usage": {"output_tokens": len(text_full) // 4},  # approx
                 },
             )
 
-            # message_stop
+            # message_stop — terminal event.
             yield _sse_event(
                 "message_stop",
                 {
@@ -698,7 +719,7 @@ async def _stream_anthropic(
             )
             break
 
-    # Se non ricevuto finish, chiudi comunque
+    # If upstream closed without a finish_reason, close gracefully anyway.
     if text_block_started:
         yield _sse_event(
             "content_block_stop",
@@ -728,7 +749,7 @@ async def _stream_anthropic(
     await resp.aclose()
 
 
-# ── Handler principale ─────────────────────────────────────────────────
+# ── Entry point ─────────────────────────────────────────────────────────
 
 
 async def handle_anthropic_messages(
@@ -737,9 +758,11 @@ async def handle_anthropic_messages(
     client,
 ) -> JSONResponse | StreamingResponse:
     """
-    Punto d'ingresso per POST /v1/messages.
-    Traduce Anthropic Messages API in chat/completions e inoltra a NVIDIA NIM.
-    Endpoint SEPARATO — non interferisce con Claude Code default.
+    Handle POST /v1/messages.
+
+    Translates the Anthropic Messages API into chat/completions and forwards
+    to NVIDIA NIM. This is a separate endpoint — it does not interfere with
+    Claude Code's default routing to api.anthropic.com.
     """
     raw = await request.body()
     try:
@@ -758,6 +781,7 @@ async def handle_anthropic_messages(
         f"tools={len(body.get('tools', []))}"
     )
 
+    # Count images so the user gets a visible warning instead of silent drops.
     n_img = sum(
         1
         for m in body.get("messages", [])
@@ -773,7 +797,7 @@ async def handle_anthropic_messages(
     model_override = state.active_model
     chat_payload = _build_chat_payload(body, model_override)
 
-    # Auto-compaction: se la history supera il budget, riassumi (fallback trim).
+    # Auto-compaction: summarize oversized history in place (trim fallback).
     from .compaction import maybe_compact
 
     chat_payload["messages"] = await maybe_compact(
@@ -800,7 +824,7 @@ async def handle_anthropic_messages(
             },
         )
 
-    # Non-streaming: candidati calcolati qui, subito prima del loop HTTP
+    # Non-streaming: resolve candidates right before the HTTP loop.
     async with state.lock:
         candidates = state.get_candidate_keys()
     if not candidates:
@@ -812,7 +836,7 @@ async def handle_anthropic_messages(
             status_code=503,
         )
 
-    # Non-streaming: key rotation
+    # Non-streaming: key rotation.
     used_key = None
     used_idx = None
     resp = None
@@ -830,12 +854,16 @@ async def handle_anthropic_messages(
             )
             resp = await client.send(req)
         except httpx.ReadTimeout:
-            state.log_cb(f"  anthropic shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)")
+            state.log_cb(
+                f"  anthropic shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)"
+            )
             state.mark_key_failed(k)
             continue
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
-            state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
+            state.log_cb(
+                f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)"
+            )
             state.mark_key_failed(k)
             continue
         if resp.status_code == 200:
@@ -847,7 +875,7 @@ async def handle_anthropic_messages(
         await resp.aclose()
         resp = None
         if err_status in _CLIENT_ERR:
-            # deterministico: errore al client, niente rotazione ne' cooldown
+            # Deterministic error: surface to client, do not rotate or cooldown.
             return JSONResponse(
                 {
                     "type": "error",
