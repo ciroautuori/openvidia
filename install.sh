@@ -5,27 +5,27 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
 echo "╔════════════════════════════════════════════╗"
-echo "║   OpenVidia — Installazione automatica     ║"
+echo "║   OpenVidia — Automatic Installer          ║"
 echo "╚════════════════════════════════════════════╝"
 echo ""
 
-# ── 1. Dipendenze Python ──────────────────────────
-echo "▶ Installa dipendenze Python..."
+# ── 1. Python dependencies ──────────────────────
+echo "▶ Installing Python dependencies..."
 if command -v uv >/dev/null 2>&1; then
     uv sync --quiet
-    echo "  ✓ Dipendenze installate (uv)"
+    echo "  ✓ Dependencies installed (uv)"
 elif command -v pip >/dev/null 2>&1; then
     pip install -e . --quiet
-    echo "  ✓ Dipendenze installate (pip)"
+    echo "  ✓ Dependencies installed (pip)"
 else
-    echo "  ✗ Devi installare uv (consigliato) o pip prima di continuare"
+    echo "  ✗ You need to install uv (recommended) or pip before continuing"
     echo "    curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
 echo ""
 
-# ── 2. Auto-configura tutte le CLI trovate ────────
-echo "▶ Auto-configura CLI (opencode, Codex, Grok)..."
+# ── 2. Auto-configure detected CLIs ─────────────
+echo "▶ Auto-configuring CLIs (opencode, Codex, Grok)..."
 if command -v uv >/dev/null 2>&1; then
     uv run openvidia setup 2>/dev/null || true
 elif command -v openvidia >/dev/null 2>&1; then
@@ -35,24 +35,37 @@ else
 fi
 echo ""
 
-# ── 3. Avvia e verifica ──────────────────────────
-echo "▶ Avvia proxy + desktop app..."
+# ── 3. Desktop integration (Linux only) ────────
+if [[ "$(uname -s)" == "Linux" ]]; then
+    echo "▶ Installing desktop entry..."
+    DESKTOP_DIR="$HOME/.local/share/applications"
+    ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
+    mkdir -p "$DESKTOP_DIR" "$ICON_DIR"
+    cp openvidia.desktop "$DESKTOP_DIR/" 2>/dev/null || true
+    cp web/assets/logo.png "$ICON_DIR/openvidia.png" 2>/dev/null || true
+    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+    echo "  ✓ Desktop entry installed"
+    echo ""
+fi
+
+# ── 4. Start and verify ─────────────────────────
+echo "▶ Starting proxy + desktop app..."
 pkill -f "python.*-m openvidia" 2>/dev/null || true
 nohup python3 -m openvidia > /dev/null 2>&1 &
 sleep 3
 if curl -s http://localhost:1919/health >/dev/null 2>&1; then
     KEYS=$(curl -s http://localhost:1919/health | python3 -c "import sys,json; print(json.load(sys.stdin).get('keys','?'))" 2>/dev/null || echo "?")
-    echo "  ✓ Proxy attivo — $KEYS keys su http://localhost:1919"
-    echo "  ✓ Desktop app aperta"
+    echo "  ✓ Proxy active — $KEYS keys on http://localhost:1919"
+    echo "  ✓ Desktop app opened"
 else
-    echo "  ⚠ Proxy non ancora attivo — controlla: python3 -m openvidia foreground"
+    echo "  ⚠ Proxy not yet active — check: python3 -m openvidia foreground"
 fi
 echo ""
 
 echo "╔════════════════════════════════════════════╗"
-echo "║   Installazione completata!                ║"
+echo "║   Installation complete!                   ║"
 echo "╠════════════════════════════════════════════╣"
-echo "║   Comando:    openvidia                    ║"
+echo "║   Command:    openvidia                    ║"
 echo "║   Proxy:      http://localhost:1919/v1     ║"
 echo "║   Dashboard:  http://localhost:1919        ║"
 echo "╠════════════════════════════════════════════╣"
