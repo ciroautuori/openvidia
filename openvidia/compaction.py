@@ -73,17 +73,47 @@ def _render(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_CONV_KEY_PREFIX_MSGS = 4  # quanti messaggi iniziali di `rest` entrano nell'identita'
+
+
 def _conv_key(system_block: list[dict], rest: list[dict]) -> str:
-    """Identita' stabile della conversazione: system + primo messaggio utente."""
+    """
+    Identita' 'stabile' della conversazione: system + primi N messaggi.
+
+    Usare solo rest[:1] (un unico messaggio) collide facilmente quando piu'
+    conversazioni condividono lo stesso system prompt fisso e lo stesso
+    primo messaggio (tipico con tool automatizzati come Codex/opencode che
+    mandano sempre lo stesso prompt iniziale) → riassunti incrociati fra
+    conversazioni scorrelate. Usare piu' messaggi iniziali riduce
+    drasticamente le collisioni senza cambiare la logica di roll-forward
+    (il roll-forward si basa comunque su `covered_count`, non sulla key).
+    """
     h = hashlib.sha256()
-    for m in system_block + rest[:1]:
+    for m in system_block + rest[:_CONV_KEY_PREFIX_MSGS]:
         h.update(_render([m]).encode("utf-8", "replace"))
+    # Include anche il conteggio dei messaggi nel prefisso: due conversazioni
+    # la cui "rest" e' piu' corta del prefisso (es. rest ha 1 solo messaggio)
+    # non collidono con una che ne ha di piu' ma stesso contenuto iniziale.
+    h.update(str(min(len(rest), _CONV_KEY_PREFIX_MSGS)).encode())
     return h.hexdigest()
 
 
-# conv_key -> (covered_count, summary_text)
+def _fingerprint(msgs: list[dict]) -> str:
+    """Fingerprint corto di una sequenza di messaggi, per verificare che una
+    entry di cache corrisponda davvero alla stessa continuazione prima di
+    riusarla (difesa aggiuntiva in caso di collisione residua su _conv_key)."""
+    h = hashlib.sha256()
+    for m in msgs:
+        h.update(_render([m]).encode("utf-8", "replace"))
+    return h.hexdigest()[:16]
+
+
+# conv_key -> (covered_count, summary_text, fingerprint_dei_msg_coperti)
 #   covered_count = quanti messaggi di `rest` sono gia' inclusi nel riassunto
-_rolling: dict[str, tuple[int, str]] = {}
+#   fingerprint   = hash dei primi messaggi coperti, per rilevare collisioni
+#                   residue su _conv_key (due conversazioni diverse che
+#                   finiscono comunque con la stessa chiave)
+_rolling: dict[str, tuple[int, str, str]] = {}
 _ROLLING_CAP = 256
 
 
@@ -113,7 +143,7 @@ async def _summarize(client, key: str, model: str, prev_summary: Optional[str],
             {"role": "system", "content": sys},
             {"role": "user", "content": user},
         ],
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_tokens,
         "temperature": 0.2,
         "stream": False,
     }
@@ -131,7 +161,7 @@ async def _summarize(client, key: str, model: str, prev_summary: Optional[str],
     finally:
         await resp.aclose()
 
-    txt = (data.get("choices", [{}])[0].get("message", {}) or {}).get("content") or ""
+    txt = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content") or ""
     if not txt.strip():
         raise RuntimeError("summarize empty")
     return txt.strip()
@@ -176,14 +206,18 @@ async def maybe_compact(messages: list[dict], *, state, client,
     # roll-forward: riassumi solo i messaggi nuovi oltre a quelli gia' coperti
     ck = _conv_key(system_block, rest)
     prev = _rolling.get(ck)
-    if prev and prev[0] <= len(old):
-        covered, prev_summary = prev
+    fp_check_len = min(len(old), _CONV_KEY_PREFIX_MSGS)
+    current_fp = _fingerprint(old[:fp_check_len])
+    if prev and prev[0] <= len(old) and prev[2] == current_fp:
+        covered, prev_summary, _fp = prev
         new_msgs = old[covered:]
         base = prev_summary
         if not new_msgs:
             block = {"role": "system", "content": "Riassunto conversazione precedente:\n" + prev_summary}
             return system_block + [block] + tail
     else:
+        if prev and prev[2] != current_fp:
+            log("⧉ compaction: collisione cache rilevata (fingerprint mismatch) → riassunto da zero")
         new_msgs = old
         base = None
 
@@ -194,7 +228,7 @@ async def maybe_compact(messages: list[dict], *, state, client,
             summary = await _summarize(client, key, model, base, new_msgs, cfg["summary_max_tokens"])
             if len(_rolling) >= _ROLLING_CAP:
                 _rolling.clear()
-            _rolling[ck] = (len(old), summary)
+            _rolling[ck] = (len(old), summary, current_fp)
             log(f"⧉ compaction: riassunti {len(old)} msg → {len(summary)} char (tenuti {len(tail)} recenti)")
             block = {"role": "system", "content": "Riassunto conversazione precedente:\n" + summary}
             return system_block + [block] + tail

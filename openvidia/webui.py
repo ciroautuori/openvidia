@@ -122,7 +122,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         if not key:
             return {"ok": False, "error": "key required"}
         async with state.lock:
-            state.keys.append(key)
+            state.keys = list(state.keys) + [key]
             keys = list(state.keys)
         config.save_keys_file(keys)
         return {"ok": True, "keys": keys}
@@ -134,7 +134,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         key = body.get("key", "")
         async with state.lock:
             if idx is not None and 0 <= idx < len(state.keys):
-                state.keys.pop(idx)
+                state.keys = [k for i, k in enumerate(state.keys) if i != idx]
             elif key:
                 state.keys = [k for k in state.keys if k != key]
             keys = list(state.keys)
@@ -201,13 +201,18 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         import os as _os
         import signal as _signal
         import subprocess as _sp
-        # Spawn the new process first, then kill the old one
+        # Spawn the new process first, then kill the old one.
+        # SIGKILL non esiste su Windows (solo POSIX): li' os.kill con
+        # SIGTERM termina il processo (Windows non ha una vera distinzione
+        # SIGTERM/SIGKILL — os.kill lo mappa a TerminateProcess).
+        _kill_sig = _signal.SIGKILL if sys.platform != "win32" else _signal.SIGTERM
+
         def _do_restart():
             import time as _time
             _time.sleep(0.3)
             _sp.Popen([sys.executable, "-m", "openvidia"] + sys.argv[1:])
             _time.sleep(0.5)
-            _os.kill(_os.getpid(), _signal.SIGKILL)
+            _os.kill(_os.getpid(), _kill_sig)
         threading.Thread(target=_do_restart, daemon=True).start()
         return {"ok": True, "restarting": True}
 
@@ -223,7 +228,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         if not keys:
             return {"ok": False, "error": "no keys"}
 
-        payload = {"model": model_id, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 5}
+        payload = {"model": model_id, "messages": [{"role": "user", "content": "ok"}], "max_completion_tokens": 5}
         async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as client:
             for key in keys:
                 try:

@@ -240,31 +240,10 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 body = json.dumps(payload).encode()
 
         # ── Key rotation con bucket (dal VECCHIO meglio del NUOVO) ─────
-        now = time.time()
         async with state.lock:
-            available_keys_info: list[tuple[int, str]] = []   # (index, key)
-            cooldown_keys_info: list[tuple[int, str, float]] = []  # (index, key, cooldown_until)
+            candidates = state.get_candidate_keys()
 
-            for idx, key in enumerate(state.keys):
-                ks = state.key_states.get(key)
-                if not ks:
-                    from .proxy_state import KeyState
-                    ks = KeyState(key)
-                    state.key_states[key] = ks
-                if not ks.is_valid:
-                    continue
-                if state.is_key_on_cooldown(key):
-                    cd_rem = state.cooldown_remaining(key)
-                    cooldown_keys_info.append((idx, key, cd_rem))
-                else:
-                    available_keys_info.append((idx, key))
-
-            if not available_keys_info and cooldown_keys_info:
-                cooldown_keys_info.sort(key=lambda x: x[2])
-                available_keys_info = [(idx, key) for idx, key, _ in cooldown_keys_info]
-                state.log_cb("⚠ No active keys outside cooldown, reusing cooldown keys")
-
-        if not available_keys_info:
+        if not candidates:
             state.log_cb("✗ No valid keys available")
             return JSONResponse({"error": "no valid keys available"}, status_code=503)
 
@@ -272,21 +251,10 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         url = UPSTREAM_BASE + nv_path
 
         total_keys = len(state.keys)
-        start_idx_global = state.stats.current_index % total_keys if total_keys else 0
-
-        start_offset = 0
-        for offset, (orig_idx, _) in enumerate(available_keys_info):
-            if orig_idx >= start_idx_global:
-                start_offset = offset
-                break
-
         last_status = 503
         CLIENT_FWD_HEADERS = {"content-type", "accept", "x-request-id", "x-trace-id"}
 
-        for offset in range(len(available_keys_info)):
-            cand_idx = (start_offset + offset) % len(available_keys_info)
-            orig_idx, key = available_keys_info[cand_idx]
-
+        for orig_idx, key in candidates:
             # Skip se RPM satura
             if not state.key_can_send_rpm(key):
                 state.log_cb(f"  key[{orig_idx}] RPM saturated ({state.key_rpm(key)}/min), skip")
@@ -306,8 +274,9 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 req = client.build_request(request.method, url, content=body, headers=headers)
                 resp = await client.send(req, stream=True)
             except httpx.ReadTimeout:
-                state.log_cb(f"key[{orig_idx}] ReadTimeout (rotating, no cooldown)")
+                state.log_cb(f"key[{orig_idx}] ReadTimeout (rotating, cooldown 30s)")
                 state.stats.record_key_usage(key, ok=False, error="ReadTimeout")
+                state.mark_key_failed(key)
                 state.stats.rotations += 1
                 persist_index(state, (orig_idx + 1) % total_keys)
                 continue
@@ -327,7 +296,6 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 state.stats.record_key_usage(key, ok=True)
                 state.record_request(key)
                 state.restore_key(key)  # Dal VECCHIO: ripristina su successo
-                persist_index(state, orig_idx)
                 if nv_path != "models":
                     state.log_cb(f"✔ key[{orig_idx}] OK")
 

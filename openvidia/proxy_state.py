@@ -10,6 +10,7 @@ Merges il meglio di entrambe le versioni:
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -145,6 +146,14 @@ class ProxyState:
     ):
         self._keys: List[str] = list(keys)
         self._key_states: Dict[str, KeyState] = {k: KeyState(k) for k in keys}
+        # Protegge la coppia (_keys, _key_states) da scritture concorrenti
+        # provenienti da thread OS reali (es. account_manager.py, che
+        # rigenera le chiavi da threading.Thread) E dall'event loop asyncio.
+        # asyncio.Lock da solo NON basta: non serializza rispetto a thread
+        # esterni all'event loop. threading.Lock è invece cross-thread e,
+        # per operazioni brevi come questa, sicuro da usare anche dentro
+        # codice sync chiamato dall'event loop (nessun await al suo interno).
+        self._keys_write_lock = threading.Lock()
         self.stats = stats
         self.index_path = index_path
         self.port = port
@@ -176,18 +185,23 @@ class ProxyState:
 
     @keys.setter
     def keys(self, new_keys: List[str]) -> None:
-        self._keys = list(new_keys)
-        updated_states = {}
-        for k in new_keys:
-            if k in self._key_states:
-                updated_states[k] = self._key_states[k]
-            else:
-                updated_states[k] = KeyState(k)
-        self._key_states = updated_states
+        with self._keys_write_lock:
+            updated_states = {}
+            for k in new_keys:
+                if k in self._key_states:
+                    updated_states[k] = self._key_states[k]
+                else:
+                    updated_states[k] = KeyState(k)
+            # Riassegna insieme, sotto lock: chi legge keys/key_states da
+            # un altro thread mentre questo blocco gira aspetta il lock
+            # invece di vedere uno stato a metà aggiornamento.
+            self._keys = list(new_keys)
+            self._key_states = updated_states
 
     @property
     def key_states(self) -> Dict[str, KeyState]:
-        return self._key_states
+        with self._keys_write_lock:
+            return dict(self._key_states)
 
     # ── Logging (dal VECCHIO — push ai listener SSE) ───────────────────
 
@@ -294,6 +308,48 @@ class ProxyState:
         if ks and not ks.is_valid:
             return False
         return not self.is_key_on_cooldown(key)
+
+    def get_candidate_keys(self) -> List[tuple[int, str]]:
+        """
+        Ritorna la lista di tuple (original_index, key) nell'ordine in cui
+        devono essere provate per la richiesta corrente, ruotata rispetto a current_index.
+
+        Pre-claim: avanza current_index subito, così richieste concorrenti partono
+        da indici diversi e non collidono tutte sulla stessa chiave.
+        """
+        available: List[tuple[int, str]] = []
+        cooldown: List[tuple[int, str, float]] = []
+
+        for idx, key in enumerate(self._keys):
+            ks = self._key_states.get(key)
+            if not ks or not ks.is_valid:
+                continue
+            if self.is_key_on_cooldown(key):
+                cooldown.append((idx, key, self.cooldown_remaining(key)))
+            else:
+                available.append((idx, key))
+
+        if not available and cooldown:
+            cooldown.sort(key=lambda x: x[2])
+            available = [(idx, key) for idx, key, _ in cooldown]
+            self.log_cb("⚠ No active keys outside cooldown, reusing cooldown keys")
+
+        if not available:
+            return []
+
+        curr_idx = self.stats.current_index % len(self._keys) if self._keys else 0
+        after = [x for x in available if x[0] >= curr_idx]
+        before = [x for x in available if x[0] < curr_idx]
+        ordered = after + before
+
+        # Pre-claim: avanza subito l'indice al prossimo candidato,
+        # così la prossima chiamata concorrente non parte dallo stesso indice.
+        if ordered:
+            next_candidate_idx = ordered[0][0]
+            self.stats.current_index = (next_candidate_idx + 1) % len(self._keys)
+            self.stats.active_key_index = next_candidate_idx
+
+        return ordered
 
     def clear_cooldown_and_restore(self, key: str) -> None:
         """Usato dal health check per rivitalizzare una chiave."""

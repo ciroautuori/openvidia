@@ -23,7 +23,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 
-from .proxy_state import ProxyState
+from .proxy_state import ProxyState, persist_index
 
 
 # ── Sanitize chat/completions messages (defensive) ────────────────────
@@ -282,7 +282,7 @@ def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
     created = chat_data.get("created", int(time.time()))
 
     output: list[dict] = []
-    choice = chat_data.get("choices", [{}])[0]
+    choice = (chat_data.get("choices") or [{}])[0]
     msg = choice.get("message", {})
 
     # Tool calls → function_call items
@@ -348,7 +348,6 @@ async def _stream_responses(
     chat_payload: dict,
     model: str,
     client,
-    keys: list[str],
     request: Request,
 ) -> AsyncGenerator[bytes, None]:
     """
@@ -391,11 +390,17 @@ async def _stream_responses(
 
     upstream = "https://integrate.api.nvidia.com/v1/chat/completions"
 
+    # Candidati calcolati qui, dentro il generator, non prima — evita collisioni
+    # fra richieste concorrenti che condividerebbero la stessa lista pre-computata.
+    async with state.lock:
+        candidates = state.get_candidate_keys()
+
     # Prova tutte le chiavi in rotazione (come il catch-all)
     resp = None
     used_key = None
-    for k in keys:
-        if not state.is_key_healthy(k) or not state.key_can_send_rpm(k):
+    used_idx = None
+    for idx, k in candidates:
+        if not state.key_can_send_rpm(k):
             continue
         hdrs = {
             "Authorization": f"Bearer {k}",
@@ -407,11 +412,19 @@ async def _stream_responses(
                 "POST", upstream, json=chat_payload, headers=hdrs
             )
             resp = await client.send(req, stream=True)
-        except httpx.HTTPError:
+        except httpx.ReadTimeout:
+            state.log_cb(f"  responses shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)")
+            state.mark_key_failed(k)
+            continue
+        except httpx.HTTPError as e:
+            err_msg = str(e) or type(e).__name__
+            state.log_cb(f"  responses shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
+            state.mark_key_failed(k)
             continue
 
         if resp.status_code == 200:
             used_key = k
+            used_idx = idx
             break
 
         # Error: rotate to next key
@@ -419,11 +432,56 @@ async def _stream_responses(
         await resp.aread()
         await resp.aclose()
         resp = None
-        state.log_cb(f"  responses shim: key HTTP {err_status}")
+        state.log_cb(f"  responses shim: key[{idx}] HTTP {err_status}")
         state.mark_key_failed(k, status=err_status)
 
     if resp is None or used_key is None:
-        yield _sse_event("error", {"type": "error", "message": "all keys failed"})
+        # Tentativo fallback su modello alternativo nei preset
+        from .proxy_app import _get_fallback_model
+
+        fb_model = _get_fallback_model(state, model)
+        if fb_model and fb_model != model:
+            state.log_cb(f"  responses shim: all keys failed for {model}, fallback to {fb_model}")
+            chat_payload["model"] = fb_model
+            for idx, k in candidates:
+                if not state.key_can_send_rpm(k):
+                    continue
+                hdrs = {
+                    "Authorization": f"Bearer {k}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "openvidia/2.0",
+                }
+                try:
+                    req = client.build_request("POST", upstream, json=chat_payload, headers=hdrs)
+                    resp = await client.send(req, stream=True)
+                except httpx.ReadTimeout:
+                    state.mark_key_failed(k)
+                    continue
+                except httpx.HTTPError:
+                    state.mark_key_failed(k)
+                    continue
+                if resp.status_code == 200:
+                    used_key = k
+                    used_idx = idx
+                    model = fb_model
+                    break
+                err_status = resp.status_code
+                await resp.aread()
+                await resp.aclose()
+                resp = None
+                state.log_cb(f"  responses shim fallback: key[{idx}] HTTP {err_status}")
+                state.mark_key_failed(k, status=err_status)
+
+    if resp is None or used_key is None:
+        yield _sse_event(
+            "error",
+            {
+                "type": "error",
+                "code": "server_error",
+                "message": "all keys failed",
+                "param": None,
+            },
+        )
         yield _sse_event(
             "response.failed",
             {
@@ -443,6 +501,8 @@ async def _stream_responses(
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)
     state.record_request(used_key)
+    if used_idx is not None:
+        state.log_cb(f"✔ key[{used_idx}] OK")
 
     # Stati per accumulare tool calls durante lo streaming
     # Codex (Responses API) usa item type "message" con content array di
@@ -468,7 +528,7 @@ async def _stream_responses(
         except json.JSONDecodeError:
             continue
 
-        choice = chunk.get("choices", [{}])[0]
+        choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta", {})
 
         # Text delta
@@ -656,12 +716,6 @@ async def handle_responses(
 
     want_stream = body.get("stream", False)
 
-    # Keysnapshot
-    async with state.lock:
-        keys = list(state.keys)
-    if not keys:
-        return JSONResponse({"error": "no keys available"}, status_code=503)
-
     if want_stream:
         chat_payload["stream"] = True
         return StreamingResponse(
@@ -670,7 +724,6 @@ async def handle_responses(
                 chat_payload,
                 model_override or chat_payload["model"],
                 client,
-                keys,
                 request,
             ),
             media_type="text/event-stream",
@@ -681,12 +734,18 @@ async def handle_responses(
             },
         )
 
-    # Non-streaming: prova tutte le chiavi in rotazione
+    # Non-streaming: candidati calcolati qui, subito prima del loop HTTP
+    async with state.lock:
+        candidates = state.get_candidate_keys()
+    if not candidates:
+        return JSONResponse({"error": "no keys available"}, status_code=503)
+
     upstream = "https://integrate.api.nvidia.com/v1/chat/completions"
     used_key = None
+    used_idx = None
     resp = None
-    for k in keys:
-        if not state.is_key_healthy(k) or not state.key_can_send_rpm(k):
+    for idx, k in candidates:
+        if not state.key_can_send_rpm(k):
             continue
         hdrs = {
             "Authorization": f"Bearer {k}",
@@ -698,14 +757,23 @@ async def handle_responses(
                 "POST", upstream, json=chat_payload, headers=hdrs
             )
             resp = await client.send(req)
-        except httpx.HTTPError:
+        except httpx.ReadTimeout:
+            state.log_cb(f"  responses shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)")
+            state.mark_key_failed(k)
+            continue
+        except httpx.HTTPError as e:
+            err_msg = str(e) or type(e).__name__
+            state.log_cb(f"  responses shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
+            state.mark_key_failed(k)
             continue
         if resp.status_code == 200:
             used_key = k
+            used_idx = idx
             break
         err_status = resp.status_code
         await resp.aclose()
         resp = None
+        state.log_cb(f"  responses shim: key[{idx}] HTTP {err_status}")
         state.mark_key_failed(k, status=err_status)
         continue
 
@@ -715,6 +783,8 @@ async def handle_responses(
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)
     state.record_request(used_key)
+    if used_idx is not None:
+        state.log_cb(f"✔ key[{used_idx}] OK")
 
     chat_data = resp.json()
     await resp.aclose()
