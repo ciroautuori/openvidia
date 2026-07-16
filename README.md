@@ -1,5 +1,12 @@
 # OpenVidia
 
+![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue?logo=python&logoColor=white)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow)
+![Ruff](https://img.shields.io/badge/Ruff-passed-261230?logo=ruff&logoColor=white)
+![Stars](https://img.shields.io/github/stars/ciroautuori/openvidia?style=social)
+![Last Commit](https://img.shields.io/github/last-commit/ciroautuori/openvidia)
+![Version](https://img.shields.io/badge/version-2.0.0-green)
+
 **Multi-key proxy for NVIDIA NIM with a native desktop dashboard.**
 
 <p align="center">
@@ -13,6 +20,14 @@ Built for [opencode](https://opencode.ai), [Codex CLI](https://github.com/openai
 ---
 
 ## Quick Start
+
+### Arch Linux (AUR)
+
+```bash
+yay -S openvidia-git
+openvidia setup
+openvidia
+```
 
 ### Linux (Ubuntu / Arch / Fedora)
 

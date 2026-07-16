@@ -1,0 +1,67 @@
+# Maintainer: Ciro Autuori <https://github.com/ciroautuori>
+# This PKGBUILD tracks the main branch (latest commit). For stable releases
+# use the openvidia package (tagged versions) when available.
+
+pkgname=openvidia-git
+pkgver=2.0.0
+pkgrel=1
+pkgdesc="Multi-key proxy for NVIDIA NIM with a native desktop dashboard — auto-rotation, cooldown, RPM limiting, Claude Code + Codex CLI + opencode support"
+arch=('any')
+url="https://github.com/ciroautuori/openvidia"
+license=('MIT')
+depends=(
+    'python>=3.12'
+    'python-fastapi'
+    'python-uvicorn'
+    'python-httpx'
+    'python-psutil'
+    'python-pywebview'
+    'webkit2gtk'
+    'gobject-introspection'
+)
+optdepends=(
+    'python-playwright: auto key regeneration'
+    'python-websockets: CDP-based key regeneration'
+    'uv: faster dependency resolution'
+)
+makedepends=('python-setuptools' 'git')
+provides=('openvidia')
+conflicts=('openvidia')
+source=("$pkgname::git+https://github.com/ciroautuori/openvidia.git")
+md5sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/$pkgname"
+    # Extract version from pyproject.toml — falls back to git describe
+    local ver
+    ver=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+    if [[ -n "$ver" ]]; then
+        printf "%s" "$ver"
+    else
+        git describe --tags --long 2>/dev/null | sed 's/^v//;s/-/.r/;s/-/./' || echo "0.0.0"
+    fi
+}
+
+build() {
+    cd "$srcdir/$pkgname"
+    python -m build --no-isolation 2>/dev/null || python setup.py build
+}
+
+package() {
+    cd "$srcdir/$pkgname"
+
+    # Install the Python package
+    python -m installer --destdir="$pkgdir" dist/*.whl 2>/dev/null || \
+        pip install --root="$pkgdir" --prefix=/usr --optimize=1 .
+
+    # Install LICENSE
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
+
+    # Desktop entry + icon (if present in repo)
+    if [[ -f openvidia.desktop ]]; then
+        install -Dm644 openvidia.desktop "$pkgdir/usr/share/applications/openvidia.desktop"
+    fi
+    if [[ -f web/assets/logo.png ]]; then
+        install -Dm644 web/assets/logo.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/openvidia.png"
+    fi
+}
