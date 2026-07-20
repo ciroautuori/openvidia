@@ -14,15 +14,46 @@ import hashlib
 import json
 from typing import Callable, Optional
 
+import httpx
+
 from . import config
 
 UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 _DEFAULTS = {
     "enabled": True,
-    "budget_tokens": 100_000,  # activation threshold (~4 chars/token)
+    "budget_tokens": 100_000,  # default activation threshold (~4 chars/token)
     "keep_recent": 8,  # final messages kept verbatim
     "summary_max_tokens": 1024,  # cap on summarized output
+    "reserved_tokens": 8000,  # generation headroom reserved from budget
+    # Summarization NEVER uses the hot streamed model the client is hammering
+    # (Codex/whatever); it uses a server-local "quiet" model so a compaction
+    # request competes for keys on a DIFFERENT traffic stream, never the same.
+    # Set to "" to fall back to state.active_model (legacy, NOT recommended).
+    "summary_model": "deepseek-ai/deepseek-v4-pro",
+    # Hard cap on summarize attempts: if the pool is saturated we must NOT
+    # serially try all 25 keys with a 30s timeout on each (= 12 min block).
+    # After this many rotate-attempts we bail to deterministic trim.
+    "max_summarize_attempts": 3,
+    # Per-attempt connect/read total cap (was unbounded read=30s on a hung
+    # upstream, amplifying the block). 8s is enough for a short summary.
+    "summarize_timeout": 8.0,
+    # When the pool health is below this fraction of live keys, skip the
+    # summarize attempt entirely and go straight to deterministic trim —
+    # there is no point burning 8s×3 on a pool that is mostly rate-limited.
+    "min_healthy_fraction": 0.25,
+}
+
+# Per-model context budget override (tokens). NVIDIA NIM context windows vary:
+# most NIM chat models expose 128k, but some (e.g. small/legacy) are 32k.
+# Override here only when you know the real limit; otherwise the
+# ``budget_tokens`` default applies.
+_MODEL_BUDGETS = {
+    "deepseek-ai/deepseek-v4-pro": 120_000,
+    "meta-llama/llama-3.3-70b-instruct": 120_000,
+    "nvidia/llama-3.1-nemotron-70b-instruct": 120_000,
+    "qwen/qwen2.5-7b-instruct": 30_000,
+    "mistralai/mixtral-8x7b-instruct-v0.1": 30_000,
 }
 
 
@@ -74,47 +105,61 @@ _CONV_KEY_PREFIX_MSGS = (
 
 def _conv_key(system_block: list[dict], rest: list[dict]) -> str:
     """
-    Stable identity for a conversation: system prompt + first N messages.
+    Stable identity for a conversation.
 
-    Using only rest[:1] (one message) collides across conversations sharing
-    the same system prompt and first message — typical for automated tools.
-    Using the first 4 instead keeps collisions vanishingly rare without
-    changing the roll-forward logic (which keys on `covered_count`, not here).
+    Identity = full hash of system_block + first N rest messages + total rest
+    length. Two conversations that share the same system prompt but diverge
+    at message 2 (common with agentic CLIs: same system, different user
+    turns) MUST hash differently, otherwise the rolling cache would swap
+    summaries across sessions and contaminate context. We hash the prefix
+    (cheap) plus the total length (forces a brand-new cache entry when the
+    conversation grows past the previous cached covered_count, instead of
+    silently reusing a stale summary).
     """
     h = hashlib.sha256()
     for m in system_block + rest[:_CONV_KEY_PREFIX_MSGS]:
         h.update(_render([m]).encode("utf-8", "replace"))
-    h.update(str(min(len(rest), _CONV_KEY_PREFIX_MSGS)).encode())
+    h.update(str(len(rest)).encode())
     return h.hexdigest()
 
 
 def _fingerprint(msgs: list[dict]) -> str:
-    """Short fingerprint of a message sequence to guard against cache collisions."""
+    """Full SHA-256 of a message sequence to guard against cache collisions.
+
+    A 16-char truncation (~64-bit) collides too often when many concurrent
+    openvidia sessions share the same system prompt: rolling cache would reuse
+    the wrong summary and contaminate the context. Use the full digest.
+    """
     h = hashlib.sha256()
     for m in msgs:
         h.update(_render([m]).encode("utf-8", "replace"))
-    return h.hexdigest()[:16]
+    return h.hexdigest()
 
 
 _rolling: dict[str, tuple[int, str, str]] = {}
 _ROLLING_CAP = 256
 
 
-def _pick_key(state) -> Optional[str]:
-    for k in state.keys:
-        if state.is_key_healthy(k) and state.key_can_send_rpm(k):
-            return k
-    return None
-
-
 async def _summarize(
     client,
-    key: str,
+    keys: list[str],
     model: str,
     prev_summary: Optional[str],
     new_msgs: list[dict],
     max_tokens: int,
+    log: Optional[Callable[[str], None]] = None,
+    *,
+    max_attempts: int = 3,
+    attempt_timeout: float = 8.0,
 ) -> str:
+    """Summarize with rotation across the given keys + bounded attempts.
+
+    A missing/empty summary must NEVER block the request. We rotate across
+    at most ``max_attempts`` keys (NOT the whole pool — with 25 keys that
+    previously meant 25×30s = 12 min of hard block while Codex waited). Each
+    attempt is capped at ``attempt_timeout`` seconds total connect+read so a
+    hung or rate-limited upstream falls back to deterministic trim quickly.
+    """
     sys = (
         "You are a conversation history compressor. Produce a concise but dense "
         "summary that preserves decisions, facts, file modifications and their "
@@ -136,26 +181,65 @@ async def _summarize(
         "temperature": 0.2,
         "stream": False,
     }
-    hdrs = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "User-Agent": "openvidia/2.0",
-    }
-    req = client.build_request("POST", UPSTREAM, json=payload, headers=hdrs)
-    resp = await client.send(req)
-    try:
-        if resp.status_code != 200:
-            raise RuntimeError(f"summarize HTTP {resp.status_code}")
-        data = resp.json()
-    finally:
-        await resp.aclose()
+    last_err = ""
+    # Pre-import the key-failure marker so we can record summarize-induced
+    # 429s back into ProxyState (live state, not just local string) — this
+    # stops the main proxy loop from re-selecting a key we just learned is
+    # saturated via the compaction path.
+    attempts = 0
+    seen_429 = False
+    for key in keys:
+        if attempts >= max_attempts:
+            break
+        attempts += 1
+        hdrs = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": "openvidia/2.0",
+        }
+        try:
+            req = client.build_request(
+                "POST",
+                UPSTREAM,
+                json=payload,
+                headers=hdrs,
+                extensions={
+                    "timeout": {
+                        "connect": 3.0,
+                        "read": attempt_timeout,
+                        "write": 3.0,
+                        "pool": attempt_timeout,
+                    }
+                },
+            )
+            resp = await client.send(req)
+        except httpx.HTTPError as e:
+            last_err = str(e) or type(e).__name__
+            continue
+        try:
+            if resp.status_code != 200:
+                last_err = f"summarize HTTP {resp.status_code}"
+                if resp.status_code == 429:
+                    seen_429 = True
+                    # Hint the caller (maybe_compact) that the pool is
+                    # saturated so it skips further summarize attempts on
+                    # the NEXT compaction cycle until keys recover.
+                    last_err = "summarize HTTP 429 (pool saturated)"
+                continue
+            data = resp.json()
+        finally:
+            await resp.aclose()
 
-    txt = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get(
-        "content"
-    ) or ""
-    if not txt.strip():
-        raise RuntimeError("summarize empty")
-    return txt.strip()
+        txt = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get(
+            "content"
+        ) or ""
+        if not txt.strip():
+            last_err = "summarize empty"
+            continue
+        return txt.strip()
+
+    suffix = " (pool rate-limited)" if seen_429 else ""
+    raise RuntimeError(last_err or "summarize: all keys failed" + suffix)
 
 
 def _trim(
@@ -185,7 +269,12 @@ async def maybe_compact(
     cfg = _settings()
     if not cfg["enabled"] or not isinstance(messages, list) or len(messages) < 4:
         return messages
-    budget = cfg["budget_tokens"]
+    # Per-model context budget − reserved generation headroom.
+    reserved = cfg.get("reserved_tokens", _DEFAULTS["reserved_tokens"])
+    model_budget = _MODEL_BUDGETS.get(
+        state.active_model or "", cfg["budget_tokens"]
+    )
+    budget = max(model_budget - reserved, reserved)
     if estimate_tokens(messages) <= budget:
         return messages
 
@@ -199,8 +288,11 @@ async def maybe_compact(
 
     ck = _conv_key(system_block, rest)
     prev = _rolling.get(ck)
-    fp_check_len = min(len(old), _CONV_KEY_PREFIX_MSGS)
-    current_fp = _fingerprint(old[:fp_check_len])
+    # Fingerprint on the whole covered prefix (everything we'd summarise),
+    # not just the first _CONV_KEY_PREFIX_MSGS messages. This catches the case
+    # where two conversations share the same prefix but diverge later —
+    # important when many concurrent sessions reuse the same system prompt.
+    current_fp = _fingerprint(old)
     if prev and prev[0] <= len(old) and prev[2] == current_fp:
         covered, prev_summary, _fp = prev
         new_msgs = old[covered:]
@@ -219,18 +311,47 @@ async def maybe_compact(
         new_msgs = old
         base = None
 
-    model = state.active_model or "deepseek-ai/deepseek-v4-pro"
-    key = _pick_key(state)
-    if key is not None:
+    # Summarize ALWAYS runs on the server-local "quiet" model, NOT the hot
+    # streamed model the client is saturating (e.g. z-ai/glm-5.2 being
+    # hammered by Codex). Using the same model would compete with the very
+    # requests that triggered compaction and burn the only available RPM.
+    summary_model = cfg.get("summary_model") or "deepseek-ai/deepseek-v4-pro"
+    # Gather all healthy+rate-feasible keys so _summarize can rotate on 429.
+    # Least-RPM-first lets summarization land on the least busy key, not key[0].
+    candidate_keys = [
+        k
+        for k in state.keys
+        if state.is_key_healthy(k) and state.key_can_send_rpm(k)
+    ]
+    n_keys = len(state.keys) or 1
+    min_healthy = max(1, int(n_keys * cfg.get("min_healthy_fraction", 0.25)))
+    if len(candidate_keys) < min_healthy:
+        # Pool is mostly saturated: a summarize attempt would serially 429
+        # (the very bug that blocked Codex) — go directly to deterministic
+        # trim so the real request goes through immediately.
+        log(
+            f"⧉ compaction: pool saturated ({len(candidate_keys)}/{n_keys} healthy) → trim fallback (no summarize)"
+        )
+    elif candidate_keys:
+        max_attempts = cfg.get("max_summarize_attempts", 3)
+        attempt_timeout = cfg.get("summarize_timeout", 8.0)
         try:
             summary = await _summarize(
-                client, key, model, base, new_msgs, cfg["summary_max_tokens"]
+                client,
+                candidate_keys,
+                summary_model,
+                base,
+                new_msgs,
+                cfg["summary_max_tokens"],
+                log=log,
+                max_attempts=max_attempts,
+                attempt_timeout=attempt_timeout,
             )
             if len(_rolling) >= _ROLLING_CAP:
                 _rolling.clear()
             _rolling[ck] = (len(old), summary, current_fp)
             log(
-                f"⧉ compaction: summarized {len(old)} msg → {len(summary)} char (kept {len(tail)} recent)"
+                f"⧉ compaction: summarized {len(old)} msg → {len(summary)} char (kept {len(tail)} recent, model={summary_model})"
             )
             block = {
                 "role": "system",

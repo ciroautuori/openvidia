@@ -21,15 +21,7 @@ Built for [opencode](https://opencode.ai), [Codex CLI](https://github.com/openai
 
 ## Quick Start
 
-### Arch Linux (AUR)
-
-```bash
-yay -S openvidia-git
-openvidia setup
-openvidia
-```
-
-### Linux (Ubuntu / Arch / Fedora)
+### Linux (Arch / Ubuntu / Fedora)
 
 ```bash
 git clone https://github.com/ciroautuori/openvidia.git
@@ -234,7 +226,7 @@ Streaming (SSE) is fully supported — tokens flow through unbuffered.
 
 | HTTP Status | Cooldown | Reason |
 |-------------|----------|--------|
-| **429** | `Retry-After` header (or 60s) | Rate limited — respect NVIDIA's backoff |
+| **429** | `Retry-After` header (or 180s) | Rate limited — respect NVIDIA's backoff |
 | **401 / 403** | 3600s | Dead key — don't waste requests |
 | **400 / 404** | — (no cooldown) | Deterministic request error (bad payload / unknown model) — returned to the client immediately, **key untouched**. Rotating wouldn't help: every key gets the same error. |
 | **5xx** | 30s | Server error — retry soon |
@@ -401,12 +393,12 @@ MAX_RPM = 28              # Safe margin below NVIDIA's 40 RPM limit
 RPM_WINDOW = 60.0         # Sliding window in seconds
 
 COOLDOWN_DURATIONS = {
-    400: 120.0,           # Bad request — model access
     401: 3600.0,          # Unauthorized — dead key
     403: 3600.0,          # Forbidden — dead key
-    404: 120.0,           # Not found — model not on this key
-    429: 60.0,            # Rate limited (Retry-After overrides)
+    429: 180.0,           # Rate limited (Retry-After overrides)
 }
+# 400/404 are deterministic content errors: the key is left untouched,
+# so rotating on them would only burn cooldown budget.
 DEFAULT_COOLDOWN = 30.0   # Network errors, unknown 5xx
 ```
 
@@ -449,7 +441,7 @@ DEFAULT_COOLDOWN = 30.0   # Network errors, unknown 5xx
 
 ## Tech Stack
 
-- **[FastAPI](https://fastapi.tiangola.com/)** — async web framework
+- **[FastAPI](https://fastapi.tiangolo.com/)** — async web framework
 - **[httpx](https://www.python-httpx.org/)** — HTTP/2 client for upstream
 - **[uvicorn](https://www.uvicorn.org/)** — ASGI server
 - **[pywebview](https://pywebview.flowrl.com/)** — native desktop window (Qt/GTK/WebKit/EdgeChromium)

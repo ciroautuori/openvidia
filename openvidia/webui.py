@@ -108,6 +108,15 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         async with state.lock:
             on_cooldown = sum(1 for k in state.keys if state.is_key_on_cooldown(k))
             total_rpm = sum(state.key_rpm(k) for k in state.keys)
+            n_healthy = sum(1 for k in state.keys if state.is_key_healthy(k))
+            in_flight = sum(
+                (state._key_states.get(k).in_flight if state._key_states.get(k) else 0)
+                for k in state.keys
+            )
+            agg_ceiling = sum(
+                (state.rpm.get(k).max_rpm if state.rpm.get(k) and state.rpm.get(k).max_rpm else 28)
+                for k in state.keys
+            )
         return {
             "requests": state.stats.requests,
             "rotations": state.stats.rotations,
@@ -115,6 +124,9 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
             "active_index": state.stats.active_key_index,
             "cooldowns": on_cooldown,
             "total_rpm": total_rpm,
+            "healthy": n_healthy,
+            "in_flight": in_flight,
+            "aggregate_rpm_ceiling": agg_ceiling,
         }
 
     # ----------------------------------------------------------------------- #
@@ -217,15 +229,23 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
                             else "unused",
                         }
                     )
-                # Cooldown remaining, current RPM, last probe validity.
+                # Cooldown remaining, current RPM, last probe validity,
+                # adaptive RPM ceiling, in-flight count and consecutive failures
+                # (used by the dashboard to show adaptive backoff state).
                 cd_rem = state.cooldown_remaining(k)
                 entry["cooldown"] = round(cd_rem, 1) if cd_rem > 0 else 0
                 entry["cooldown_reason"] = (
                     state.cooldown_reason(k) if cd_rem > 0 else ""
                 )
                 entry["rpm"] = state.key_rpm(k)
+                tracker = state.rpm.get(k)
+                entry["rpm_ceiling"] = (
+                    tracker.max_rpm if tracker and tracker.max_rpm else 28
+                )
                 ks = state.key_states.get(k)
                 entry["is_valid"] = ks.is_valid if ks else True
+                entry["in_flight"] = ks.in_flight if ks else 0
+                entry["consecutive_failures"] = ks.consecutive_failures if ks else 0
                 stats[str(i)] = entry
             return {
                 "active_index": state.stats.active_key_index,
