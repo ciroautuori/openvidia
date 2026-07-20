@@ -29,6 +29,72 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .proxy_state import ProxyState
 
 
+# ── Bounded rotation + saturation fast-fail ─────────────────────────────
+# Codex CLI blocks historically when /v1/responses rotated serially across
+# ALL 25 candidate keys with no per-attempt timeout (client default read=
+# 120s): 25 × 120s = up to 50 minutes before returning 503. We now cap the
+# number of keys we actually send to per rotation phase (the weighted
+# least-loaded ordering already puts the best keys first), give each send a
+# bounded connect+read+write+pool timeout, and fast-fail the whole loop as
+# soon as the live (RPM-eligible) pool is too small to bother.
+_MAX_ROTATE_ATTEMPTS = 5          # hard cap on sends per model phase
+_ROTATE_SEND_TIMEOUT = httpx.Timeout(connect=4.0, read=30.0, write=10.0, pool=30.0)
+_MIN_LIVE_FRACTION = 0.2          # <20% of valid keys live → 503 fast
+
+
+async def _rotation_phase(client, upstream, payload, headers_factory,
+                          state, candidates, *, max_attempts, timeout,
+                          stream, log_tag, seen_429_box):
+    """Single bounded rotation phase. Returns (resp_or_None, used_key, used_idx)."""
+    attempts = 0
+    for idx, k in candidates:
+        if not state.key_can_send_rpm(k):
+            continue
+        if attempts >= max_attempts:
+            break
+        attempts += 1
+        hdrs = headers_factory(k, idx)
+        try:
+            req = client.build_request("POST", upstream, json=payload, headers=hdrs, timeout=timeout)
+            resp = await client.send(req, stream=stream)
+        except httpx.ReadTimeout:
+            state.log_cb(f"  {log_tag}: key[{idx}] ReadTimeout (rotating)")
+            state.mark_key_failed(k)
+            continue
+        except httpx.HTTPError as e:
+            err_msg = str(e) or type(e).__name__
+            state.log_cb(f"  {log_tag}: key[{idx}] {err_msg} (rotating)")
+            state.mark_key_failed(k)
+            continue
+        if resp.status_code == 200:
+            return resp, k, idx
+        err_status = resp.status_code
+        await resp.aclose()
+        state.log_cb(f"  {log_tag}: key[{idx}] HTTP {err_status}")
+        if err_status == 429:
+            seen_429_box[0] = True
+        state.mark_key_failed(k, status=err_status)
+    return None, None, None
+
+
+def _live_pool_snapshot(state, candidates):
+    """Return ``(live, total_pool)`` for saturation gating.
+
+    ``live`` = candidates that are cooldown-free AND RPM-eligible right now
+    (the set a rotation loop could actually succeed on). ``total_pool`` is
+    the FULL pool size (including cooldown keys) — weighing by the full pool
+    rather than just `len(candidates)` is what makes the saturation gate
+    fire correctly: when most of the 25 keys are on cooldown, the live
+    fraction genuinely drops below threshold, which is exactly when we want
+    to skip rotation and go to model-fallback / 503 instead of serially
+    hammering the few surviving keys.
+    """
+    live = sum(1 for _, k in candidates if state.key_can_send_rpm(k) and not state.is_key_on_cooldown(k))
+    total_pool = len(state.keys)
+    return live, total_pool
+
+
+
 # ── Defensive sanitization of chat/completions messages ────────────────
 def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
     """
@@ -265,6 +331,43 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
     if tools:
         payload["tools"] = _tools_to_chat_tools(tools)
 
+    # tool_choice translation (Responses → chat/completions).
+    # Responses uses: "auto" | "none" | "required" | {type:"function", name}
+    tc = body.get("tool_choice")
+    if tc is not None:
+        if isinstance(tc, str):
+            payload["tool_choice"] = tc
+        elif isinstance(tc, dict):
+            if tc.get("type") == "auto":
+                payload["tool_choice"] = "auto"
+            elif tc.get("type") == "none":
+                payload["tool_choice"] = "none"
+            elif tc.get("type") == "required":
+                payload["tool_choice"] = "required"
+            elif tc.get("type") == "function":
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tc.get("name", "")},
+                }
+
+    # parallel_tool_calls passthrough (Codex sends it).
+    if "parallel_tool_calls" in body:
+        payload["parallel_tool_calls"] = body["parallel_tool_calls"]
+
+    # metadata passthrough (Codex may attach; NVIDIA ignores unknown fields).
+    if body.get("metadata"):
+        payload["metadata"] = body["metadata"]
+
+    # stop sequences passthrough.
+    if body.get("stop"):
+        payload["stop"] = body["stop"]
+
+    # stream_options: Codex sends {"include_usage": true} on streaming
+    # requests so the final SSE chunk carries token usage. NVIDIA NIM
+    # accepts stream_options.include_usage.
+    if body.get("stream_options"):
+        payload["stream_options"] = body["stream_options"]
+
     # Pass-through optional parameters (only those compatible with chat/completions).
     for key in (
         "temperature",
@@ -272,10 +375,20 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
         "max_tokens",
         "max_completion_tokens",
         "stream",
+        "seed",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "user",
     ):
         val = body.get(key)
         if val is not None:
             payload[key] = val
+
+    # request-level response format: Codex may ask for {"type":"text"} or
+    # {"type":"json_object"}; forward to NVIDIA if present.
+    if body.get("response_format"):
+        payload["response_format"] = body["response_format"]
 
     payload["messages"] = _sanitize_chat_messages(payload["messages"])
     return payload
@@ -325,13 +438,20 @@ def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
     finish = choice.get("finish_reason", "stop")
     status = "completed" if finish == "stop" else "incomplete"
 
-    # Usage mapping (prompt/completion → input/output/total).
+    # Usage mapping (prompt/completion → input/output/total). NVIDIA may
+    # return completion_tokens_details to pass through if present.
     usage = chat_data.get("usage", {})
     resp_usage = {
         "input_tokens": usage.get("prompt_tokens", 0),
         "output_tokens": usage.get("completion_tokens", 0),
         "total_tokens": usage.get("total_tokens", 0),
     }
+    ctd = usage.get("completion_tokens_details")
+    if isinstance(ctd, dict) and ctd:
+        resp_usage["output_tokens_details"] = ctd
+    ptd = usage.get("prompt_tokens_details")
+    if isinstance(ptd, dict) and ptd:
+        resp_usage["input_tokens_details"] = ptd
 
     return {
         "id": resp_id,
@@ -404,49 +524,30 @@ async def _stream_responses(
     async with state.lock:
         candidates = state.get_candidate_keys()
 
-    # Key rotation (same pattern as the catch-all proxy).
+    # Key rotation: bounded attempts + saturation fast-fail (was serial
+    # across ALL candidates with the client default 120s read → Codex block).
     resp = None
     used_key = None
     used_idx = None
-    for idx, k in candidates:
-        if not state.key_can_send_rpm(k):
-            continue
-        hdrs = {
-            "Authorization": f"Bearer {k}",
-            "Content-Type": "application/json",
-            "User-Agent": "openvidia/2.0",
-        }
-        try:
-            req = client.build_request(
-                "POST", upstream, json=chat_payload, headers=hdrs
-            )
-            resp = await client.send(req, stream=True)
-        except httpx.ReadTimeout:
-            state.log_cb(
-                f"  responses shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)"
-            )
-            state.mark_key_failed(k)
-            continue
-        except httpx.HTTPError as e:
-            err_msg = str(e) or type(e).__name__
-            state.log_cb(
-                f"  responses shim: key[{idx}] {err_msg} (rotating, cooldown 30s)"
-            )
-            state.mark_key_failed(k)
-            continue
 
-        if resp.status_code == 200:
-            used_key = k
-            used_idx = idx
-            break
+    _live, _valid = _live_pool_snapshot(state, candidates)
+    if _valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION)):
+        state.log_cb(
+            f"  responses shim: pool saturated ({_live}/{_valid} live) → skip primary "
+            f"(fallback/503)"
+        )
+    else:
 
-        # Non-200: rotate to the next key.
-        err_status = resp.status_code
-        await resp.aread()
-        await resp.aclose()
-        resp = None
-        state.log_cb(f"  responses shim: key[{idx}] HTTP {err_status}")
-        state.mark_key_failed(k, status=err_status)
+        def _hdr(k, idx):
+            return {"Authorization": f"Bearer {k}", "Content-Type": "application/json", "User-Agent": "openvidia/2.0"}
+
+        resp, used_key, used_idx = await _rotation_phase(
+            client, upstream, chat_payload, _hdr, state, candidates,
+            max_attempts=_MAX_ROTATE_ATTEMPTS,
+            timeout=_ROTATE_SEND_TIMEOUT,
+            stream=True, log_tag="responses shim",
+            seen_429_box=[False],
+        )
 
     if resp is None or used_key is None:
         # All keys exhausted on the primary model → try a preset fallback model.
@@ -458,36 +559,32 @@ async def _stream_responses(
                 f"  responses shim: all keys failed for {model}, fallback to {fb_model}"
             )
             chat_payload["model"] = fb_model
-            for idx, k in candidates:
-                if not state.key_can_send_rpm(k):
-                    continue
-                hdrs = {
-                    "Authorization": f"Bearer {k}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "openvidia/2.0",
-                }
-                try:
-                    req = client.build_request(
-                        "POST", upstream, json=chat_payload, headers=hdrs
-                    )
-                    resp = await client.send(req, stream=True)
-                except httpx.ReadTimeout:
-                    state.mark_key_failed(k)
-                    continue
-                except httpx.HTTPError:
-                    state.mark_key_failed(k)
-                    continue
-                if resp.status_code == 200:
-                    used_key = k
-                    used_idx = idx
+
+            # Same saturation gate on the fallback model: if the pool is still
+            # saturated when we reach the fallback, do NOT serially hammer it.
+            async with state.lock:
+                fb_candidates = state.get_candidate_keys()
+            _fb_live, _fb_total = _live_pool_snapshot(state, fb_candidates)
+            if _fb_total and _fb_live < max(1, int(_fb_total * _MIN_LIVE_FRACTION)):
+                state.log_cb(
+                    f"  responses shim: pool still saturated ({_fb_live}/{_fb_total} live) → "
+                    f"skip fallback {fb_model}"
+                )
+            else:
+
+                def _fb_hdr(k, idx):
+                    return {"Authorization": f"Bearer {k}", "Content-Type": "application/json", "User-Agent": "openvidia/2.0"}
+
+                fb_seen_429 = [False]
+                resp, used_key, used_idx = await _rotation_phase(
+                    client, upstream, chat_payload, _fb_hdr, state, fb_candidates,
+                    max_attempts=_MAX_ROTATE_ATTEMPTS,
+                    timeout=_ROTATE_SEND_TIMEOUT,
+                    stream=True, log_tag="responses shim fallback",
+                    seen_429_box=fb_seen_429,
+                )
+                if used_key is not None:
                     model = fb_model
-                    break
-                err_status = resp.status_code
-                await resp.aread()
-                await resp.aclose()
-                resp = None
-                state.log_cb(f"  responses shim fallback: key[{idx}] HTTP {err_status}")
-                state.mark_key_failed(k, status=err_status)
 
     if resp is None or used_key is None:
         # Definitive failure: emit error + response.failed and terminate.
@@ -680,7 +777,48 @@ async def _stream_responses(
                 )
             break
 
-    # Final response.completed event.
+    # Capture usage from the terminal chunk (NVIDIA streams usage only when
+    # stream_options.include_usage=true). If absent we report zeros — Codex
+    # tolerates it but misses token accounting; we forward it when upstream
+    # sends it.
+    final_usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    if isinstance(chunk, dict):
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            final_usage = {
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+
+    # Final response.completed event. A non-empty output array lets Codex
+    # reconstruct the assistant message instead of relying on delta replay.
+    final_output: list[dict] = []
+    if text_started:
+        final_output.append(
+            {
+                "type": "message",
+                "id": text_item_id,
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text_full}],
+            }
+        )
+    for tcm in tool_calls_map.values():
+        final_output.append(
+            {
+                "type": "function_call",
+                "id": tcm["fc_id"],
+                "call_id": tcm["call_id"],
+                "name": tcm["name"],
+                "arguments": tcm["arguments"],
+                "status": "completed",
+            }
+        )
     yield _sse_event(
         "response.completed",
         {
@@ -690,8 +828,9 @@ async def _stream_responses(
                 "object": "response",
                 "created_at": created_ts,
                 "model": model,
-                "output": [],
+                "output": final_output,
                 "status": "completed",
+                "usage": final_usage,
             },
         },
     )
@@ -763,45 +902,31 @@ async def handle_responses(
     used_key = None
     used_idx = None
     resp = None
-    for idx, k in candidates:
-        if not state.key_can_send_rpm(k):
-            continue
-        hdrs = {
-            "Authorization": f"Bearer {k}",
-            "Content-Type": "application/json",
-            "User-Agent": "openvidia/2.0",
-        }
-        try:
-            req = client.build_request(
-                "POST", upstream, json=chat_payload, headers=hdrs
-            )
-            resp = await client.send(req)
-        except httpx.ReadTimeout:
-            state.log_cb(
-                f"  responses shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)"
-            )
-            state.mark_key_failed(k)
-            continue
-        except httpx.HTTPError as e:
-            err_msg = str(e) or type(e).__name__
-            state.log_cb(
-                f"  responses shim: key[{idx}] {err_msg} (rotating, cooldown 30s)"
-            )
-            state.mark_key_failed(k)
-            continue
-        if resp.status_code == 200:
-            used_key = k
-            used_idx = idx
-            break
-        err_status = resp.status_code
-        await resp.aclose()
-        resp = None
-        state.log_cb(f"  responses shim: key[{idx}] HTTP {err_status}")
-        state.mark_key_failed(k, status=err_status)
-        continue
+
+    # Bounded attempts + saturation fast-fail (was serial across all
+    # candidates with the 120s client default → Codex block).
+    _live, _valid = _live_pool_snapshot(state, candidates)
+    if _valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION)):
+        state.log_cb(
+            f"  responses shim: pool saturated ({_live}/{_valid} live) → 503 fast"
+        )
+    else:
+
+        def _hdr(k, idx):
+            return {"Authorization": f"Bearer {k}", "Content-Type": "application/json", "User-Agent": "openvidia/2.0"}
+
+        resp, used_key, used_idx = await _rotation_phase(
+            client, upstream, chat_payload, _hdr, state, candidates,
+            max_attempts=_MAX_ROTATE_ATTEMPTS,
+            timeout=_ROTATE_SEND_TIMEOUT,
+            stream=False, log_tag="responses shim",
+            seen_429_box=[False],
+        )
+        if used_idx is not None and isinstance(resp, httpx.Response):
+            await resp.aread()
 
     if resp is None or used_key is None:
-        return JSONResponse({"error": "all keys failed"}, status_code=503)
+        return JSONResponse({"error": "all keys failed (pool saturated)" if _live else "all keys failed"}, status_code=503)
 
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)

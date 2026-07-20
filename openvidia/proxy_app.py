@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,14 @@ MAX_BODY_BYTES = 64 * 1024 * 1024
 ROTATE_STATUSES = {401, 403, 429}
 
 DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"
+
+# Bounded rotation: cap the number of upstream sends per rotation phase and
+# give each send a bounded connect+read+write+pool timeout. The catch-all
+# historically iterated ALL candidates with the client default read=120s, so
+# 25 saturated keys could block a Codex request for up to 25×120s = 50min.
+_MAX_ROTATE_ATTEMPTS = 5
+_ROTATE_SEND_TIMEOUT = httpx.Timeout(connect=4.0, read=30.0, write=10.0, pool=30.0)
+_MIN_LIVE_FRACTION = 0.2  # <20% live keys → skip rotation, go to fallback/503
 
 STRIPPED_RESPONSE_HEADERS = {
     "content-encoding",
@@ -54,20 +63,37 @@ async def _check_key_health(client: httpx.AsyncClient, key: str) -> bool:
 async def _health_check_all(
     state: ProxyState, client: httpx.AsyncClient, force: bool = False
 ) -> None:
-    revived = 0
+    """Probe cooldown-expired keys in parallel (pre-warm touches all keys).
+
+    Serial probing was fine for <5 keys but stalls pre-warm beyond ~2s when
+    many keys are dead and each probe takes the full ReadTimeout. We batch
+    them with asyncio.gather so the whole pass completes in ~one round-trip.
+    """
+    targets: list[str] = []
     for key in state.keys:
         if not force and not state.is_key_on_cooldown(key):
             continue
         # Skip keys with most of their cooldown left — probing too early wastes quota.
         if not force and state.cooldown_remaining(key) > 90:
             continue
-        healthy = await _check_key_health(client, key)
+        targets.append(key)
+
+    if not targets:
+        return
+
+    results = await asyncio.gather(
+        *(_check_key_health(client, k) for k in targets),
+        return_exceptions=True,
+    )
+
+    revived = 0
+    for key, healthy in zip(targets, results):
+        if isinstance(healthy, Exception):
+            healthy = False
         if healthy:
             state.clear_cooldown_and_restore(key)
             revived += 1
-        elif not force:
-            pass
-        else:
+        elif force:
             state.mark_key_failed(key)
     n_unhealthy = sum(1 for k in state.keys if state.is_key_on_cooldown(k))
     all_ok = len(state.keys) - n_unhealthy
@@ -85,6 +111,30 @@ async def _background_health_check(
         while True:
             await asyncio.sleep(30)
             await _health_check_all(state, client)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _warm_keepalive_task(
+    state: ProxyState, client: httpx.AsyncClient
+) -> None:
+    """Decay-only passive helper.
+
+    We DO NOT actively ping all healthy keys on a timer — that would burn
+    ~25 GET /v1/models every 45s across the pool, silently inflating the RPM
+    sliding window of every key and risking accidental self-induced 429 when
+    real user traffic arrives on top. Instead this task just ages out stale
+    consecutive-failure counters once per minute so a key that had a couple
+    of transient errors three minutes ago stops being deprioritized forever.
+    """
+    try:
+        while True:
+            await asyncio.sleep(60)
+            now = time.time()
+            for key in state.keys:
+                ks = state._key_states.get(key)
+                if ks and ks.consecutive_failures and now - ks.last_failure_at > 180:
+                    ks.consecutive_failures = max(0, ks.consecutive_failures - 1)
     except asyncio.CancelledError:
         pass
 
@@ -124,7 +174,10 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
         asyncio.create_task(_pre_warm())
         state.health_task = asyncio.create_task(_background_health_check(state, client))
+        state.warm_task = asyncio.create_task(_warm_keepalive_task(state, client))
         yield
+        if state.warm_task is not None:
+            state.warm_task.cancel()
         if state.health_task is not None:
             state.health_task.cancel()
         await client.aclose()
@@ -204,6 +257,49 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 continue
         return JSONResponse({"error": "all keys failed"}, status_code=503)
 
+    # ── Internal ops endpoint: not proxied, dashboard-facing ──────────
+    # Exposes live per-key health/RPM/in-flight/consecutive-failures so the
+    # dashboard can render the whole pool, not just an aggregate count.
+    @app.get("/ops/keys")
+    async def _ops_keys_inner() -> JSONResponse:
+        if not state.running:
+            return JSONResponse({"error": "proxy stopped"}, status_code=503)
+        async with state.lock:
+            out: list[dict] = []
+            for idx, key in enumerate(state.keys):
+                ks = state._key_states.get(key)
+                redacted = key[:5] + "…" + key[-4:] if len(key) > 12 else "***"
+                tracker = state.rpm.get(key)
+                ku = state.stats.key_usage.get(key)
+                out.append(
+                    {
+                        "index": idx,
+                        "key": redacted,
+                        "valid": bool(ks and ks.is_valid),
+                        "healthy": state.is_key_healthy(key),
+                        "cooldown_remaining": round(state.cooldown_remaining(key), 1),
+                        "cooldown_reason": state.cooldown_reason(key),
+                        "rpm": state.key_rpm(key),
+                        "rpm_ceiling": tracker.max_rpm if tracker and tracker.max_rpm else None,
+                        "in_flight": ks.in_flight if ks else 0,
+                        "consecutive_failures": ks.consecutive_failures if ks else 0,
+                        "requests": ku.requests if ku else 0,
+                        "success": ku.success if ku else 0,
+                        "failed": ku.failed if ku else 0,
+                    }
+                )
+        return JSONResponse(
+            {
+                "keys": out,
+                "n_keys": len(state.keys),
+                "n_healthy": sum(1 for k in state.keys if state.is_key_healthy(k)),
+                "n_on_cooldown": sum(1 for k in state.keys if state.is_key_on_cooldown(k)),
+                "aggregate_rpm": sum(state.key_rpm(k) for k in state.keys),
+                "aggregate_rpm_ceiling": len(state.keys) * 28,
+                "active_index": state.stats.active_key_index,
+            }
+        )
+
     # ── Catch-all proxy → NVIDIA NIM ──────────────────────────────────
     @app.api_route(
         "/v1/{full_path:path}",
@@ -264,7 +360,36 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         last_status = 503
         CLIENT_FWD_HEADERS = {"content-type", "accept", "x-request-id", "x-trace-id"}
 
+        # Saturation gate: weigh live (cooldown-free, RPM-eligible) candidates
+        # against the FULL pool size, not just len(candidates). The proxy's
+        # get_candidate_keys() drops invalid keys and sorts cooldown ones to the
+        # tail, so len(candidates) can be small even when the pool is healthy.
+        # Using the full pool as the denominator makes the gate fire correctly
+        # when most of the 25 keys are on cooldown (the historical Codex block).
+        _live_candidates = sum(
+            1 for _, k in candidates
+            if state.key_can_send_rpm(k) and not state.is_key_on_cooldown(k)
+        )
+        _total_pool = len(state.keys)
+        _pool_saturated = (
+            _total_pool > 0
+            and _live_candidates < max(1, int(_total_pool * _MIN_LIVE_FRACTION))
+        )
+        if _pool_saturated:
+            state.log_cb(
+                f"⚠ pool saturated ({_live_candidates}/{_total_pool} live) → "
+                f"skip rotation, try model fallback"
+            )
+            last_status = 429
+
+        _rotate_attempts = 0
         for orig_idx, key in candidates:
+            if _rotate_attempts >= _MAX_ROTATE_ATTEMPTS:
+                state.log_cb(
+                    f"  rotation cap reached ({_MAX_ROTATE_ATTEMPTS} attempts) → stop "
+                    f"(fallback/503)"
+                )
+                break
             if not state.key_can_send_rpm(key):
                 state.log_cb(
                     f"  key[{orig_idx}] RPM saturated ({state.key_rpm(key)}/min), skip"
@@ -283,12 +408,16 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             }:
                 headers["Content-Type"] = "application/json"
 
+            state.begin_in_flight(key)
+            _rotate_attempts += 1
             try:
                 req = client.build_request(
-                    request.method, url, content=body, headers=headers
+                    request.method, url, content=body, headers=headers,
+                    timeout=_ROTATE_SEND_TIMEOUT,
                 )
                 resp = await client.send(req, stream=True)
             except httpx.ReadTimeout:
+                state.end_in_flight(key)
                 state.log_cb(f"key[{orig_idx}] ReadTimeout (rotating, cooldown 30s)")
                 state.stats.record_key_usage(key, ok=False, error="ReadTimeout")
                 state.mark_key_failed(key)
@@ -296,6 +425,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 persist_index(state, (orig_idx + 1) % total_keys)
                 continue
             except httpx.HTTPError as e:
+                state.end_in_flight(key)
                 err_msg = str(e) or type(e).__name__
                 state.log_cb(f"key[{orig_idx}] {err_msg}")
                 state.stats.record_key_usage(key, ok=False, error=err_msg)
@@ -332,12 +462,14 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                                 break
                             yield chunk
                     finally:
+                        state.end_in_flight(key)
                         await resp.aclose()
 
                 return StreamingResponse(
                     body_iter(), status_code=status, headers=out_headers
                 )
 
+            state.end_in_flight(key)
             state.log_cb(f"key[{orig_idx}] HTTP {status}")
             last_status = status
 
@@ -367,8 +499,8 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 f"↻ {model_name} failed on all keys — retry with preset fallback: {fallback_model}"
             )
             fb_body = json.dumps({**payload, "model": fallback_model}).encode()
-            for fb_key in state.keys:
-                if not state.is_key_healthy(fb_key):
+            for fb_idx, fb_key in enumerate(state.keys):
+                if not state.is_key_healthy(fb_key) or not state.key_can_send_rpm(fb_key):
                     continue
                 hdrs = {
                     "Authorization": f"Bearer {fb_key}",
@@ -381,12 +513,11 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                     )
                     fb_resp = await client.send(fb_req)
                     if fb_resp.is_success:
-                        state.log_cb(f"✔ fallback → {fallback_model}")
+                        state.log_cb(f"✔ fallback key[{fb_idx}] → {fallback_model}")
                         state.record_request(fb_key)
+                        state.stats.record_key_usage(fb_key, ok=True)
                         fb_body_raw = await fb_resp.aread()
-                        persist_index(
-                            state, (state.keys.index(fb_key) + 1) % len(state.keys)
-                        )
+                        persist_index(state, (fb_idx + 1) % len(state.keys))
                         await fb_resp.aclose()
                         fb_data = json.loads(fb_body_raw)
                         fb_data["model"] = fallback_model
@@ -394,13 +525,18 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                             content=fb_data,
                             headers={"access-control-allow-origin": "*"},
                         )
+                    fb_status = fb_resp.status_code
                     await fb_resp.aclose()
-                    if fb_resp.status_code == 429:
+                    state.stats.record_key_usage(fb_key, ok=False, error=f"HTTP {fb_status}")
+                    if should_rotate(fb_status):
+                        state.mark_key_failed(fb_key, status=fb_status)
                         continue
-                    state.log_cb(f"✗ fallback HTTP {fb_resp.status_code}")
+                    state.log_cb(f"✗ fallback HTTP {fb_status}")
                     break
-                except Exception as e:
-                    state.log_cb(f"  ⏳ fallback key error: {e}, trying next...")
+                except httpx.HTTPError as e:
+                    err_msg = str(e) or type(e).__name__
+                    state.log_cb(f"  ⏳ fallback key error: {err_msg}")
+                    state.mark_key_failed(fb_key)
                     continue
 
         msg = "all keys exhausted"
