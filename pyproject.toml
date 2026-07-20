@@ -1,7 +1,8 @@
 [project]
 name = "openvidia"
-version = "2.0.0"
+version = "1.0.0"
 description = "NVIDIA NIM multi-key proxy with smart rate limiting, cooldown management, and desktop dashboard"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
@@ -20,7 +21,7 @@ license = "MIT"
 authors = [{ name = "Ciro Autuori" }]
 keywords = ["nvidia", "nim", "proxy", "rate-limiting", "api-gateway", "opencode", "desktop"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries",
 ]
