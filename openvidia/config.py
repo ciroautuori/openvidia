@@ -53,8 +53,26 @@ def atomic_write(path: Path, content: str) -> None:
     tmp.rename(path)
 
 
-def save_keys_file(keys: List[str]) -> None:
-    atomic_write(config_path(), json.dumps(keys, indent=2))
+def save_keys_file(keys: List[str], create_backup: bool = True) -> None:
+    """Save keys with optional automatic backup.
+    
+    Args:
+        keys: List of API keys to save
+        create_backup: Whether to create a backup before writing
+    """
+    
+    content = json.dumps(keys, indent=2)
+    cfg_path = config_path()
+    
+    if create_backup and cfg_path.exists():
+        # Create backup before writing
+        try:
+            from .safe_file import create_backup as make_backup
+            make_backup(cfg_path)
+        except Exception:
+            pass  # Backup is optional, continue with write
+    
+    atomic_write(cfg_path, content)
 
 
 def load_saved_index() -> int:

@@ -1,3 +1,32 @@
+Metadata-Version: 2.4
+Name: openvidia
+Version: 1.0.0
+Summary: NVIDIA NIM multi-key proxy with smart rate limiting, cooldown management, and desktop dashboard
+Author: Ciro Autuori
+License-Expression: MIT
+Keywords: nvidia,nim,proxy,rate-limiting,api-gateway,opencode,desktop
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: Developers
+Classifier: Topic :: Software Development :: Libraries
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: httpx[http2]>=0.27
+Requires-Dist: psutil>=6.0
+Requires-Dist: pywebview>=5.0
+Requires-Dist: PyGObject>=3.42; platform_system == "Linux"
+Requires-Dist: pycairo>=1.20; platform_system == "Linux"
+Requires-Dist: PyQt6>=6.5; platform_system == "Linux"
+Requires-Dist: PyQt6-WebEngine>=6.5; platform_system == "Linux"
+Requires-Dist: qtpy>=2.4; platform_system == "Linux"
+Requires-Dist: pyqt6-webengine>=6.11.0
+Provides-Extra: auto-regen
+Requires-Dist: playwright>=1.40; extra == "auto-regen"
+Requires-Dist: websockets>=12.0; extra == "auto-regen"
+Dynamic: license-file
+
 # OpenVidia
 
 ![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue?logo=python&logoColor=white)
