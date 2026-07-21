@@ -34,6 +34,15 @@
           <div class="status-info">
             <span class="status-label" id="statusText">Running</span>
             <span class="status-meta">Port <strong id="portDisplay">1919</strong> · <strong id="activeModelDisplay">none</strong></span>
+            <!-- Reasoning toggle: a hybrid model emits nothing until it stops
+                 thinking, which is the difference between a 2s and a 160s
+                 first token. Applies to the active model. -->
+            <span class="status-meta think-row">
+              Thinking
+              <button class="btn btn-xs think-btn" data-think="auto" title="Leave it to the model">auto</button>
+              <button class="btn btn-xs think-btn" data-think="on" title="Force reasoning on">on</button>
+              <button class="btn btn-xs think-btn" data-think="off" title="Force reasoning off — much faster first token">off</button>
+            </span>
           </div>
           <div class="status-acts">
             <button class="btn btn-sm" id="stopBtn" title="Stop">⏹</button>

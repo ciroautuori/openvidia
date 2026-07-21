@@ -351,6 +351,13 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 payload["model"] = resolved
                 body = json.dumps(payload).encode()
 
+        # Thinking toggle (dashboard setting; never overrides the client).
+        if isinstance(payload, dict) and payload.get("model"):
+            before = json.dumps(payload, sort_keys=True)
+            config.apply_model_options(payload)
+            if json.dumps(payload, sort_keys=True) != before:
+                body = json.dumps(payload).encode()
+
         # Auto-compaction: if conversation history exceeds the token budget,
         # summarize older turns transparently so the request stays under limits.
         if (

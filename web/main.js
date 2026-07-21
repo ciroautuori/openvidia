@@ -133,6 +133,44 @@ async function setModel(id) {
 
 async function loadModel() {
   try { const r = await api('GET', '/api/model'); activeModel = r.model || ''; $('activeModelDisplay').textContent = activeModel || 'none' } catch (_) {}
+  loadThinking()
+}
+
+document.querySelectorAll('.think-btn').forEach(b => {
+  b.addEventListener('click', () => setThinking(b.dataset.think))
+})
+
+/* ── Reasoning toggle ─────────────────────────
+   A hybrid reasoning model withholds every byte until it finishes thinking.
+   The switch is per active model and stored server-side, so all four CLIs
+   pick it up without touching their own configs. */
+let thinkingMode = 'auto'
+
+function renderThinking() {
+  document.querySelectorAll('.think-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.think === thinkingMode)
+  })
+}
+
+async function loadThinking() {
+  try {
+    const r = await api('GET', '/api/thinking')
+    thinkingMode = r.mode || 'auto'
+    renderThinking()
+  } catch (_) {}
+}
+
+async function setThinking(mode) {
+  try {
+    await fetch('/api/thinking', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode })
+    })
+    thinkingMode = mode
+    renderThinking()
+    toast(`Thinking: ${mode}${activeModel ? ' — ' + activeModel : ''}`, 'ok')
+  } catch (_) {}
 }
 
 /* ── Models browser ──────────────────────────── */

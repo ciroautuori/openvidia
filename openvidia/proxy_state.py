@@ -158,6 +158,60 @@ class KeyUsage:
         self.last_error = ""
 
 
+class ModelHealth:
+    """Per-model health, measured from real traffic.
+
+    Provider capacity for one model collapses without warning while the rest
+    stay fast, and the proxy is the only component that sees it happen. Every
+    request already carries the evidence — how long the first byte took, and
+    what status came back — so nothing needs to be probed: we just keep score
+    and say so out loud when a model stops being usable.
+    """
+
+    __slots__ = ("requests", "success", "gateway_timeouts", "rate_limited",
+                 "too_slow", "ttfts", "warned_at")
+
+    def __init__(self):
+        self.requests = 0
+        self.success = 0
+        self.gateway_timeouts = 0   # 502/503/504: provider gave up on the model
+        self.rate_limited = 0       # 429
+        self.too_slow = 0           # no first byte before our own read timeout
+        self.ttfts: deque[float] = deque(maxlen=20)
+        self.warned_at = 0.0
+
+    @property
+    def median_ttft(self) -> float:
+        if not self.ttfts:
+            return 0.0
+        s = sorted(self.ttfts)
+        return s[len(s) // 2]
+
+    @property
+    def failure_rate(self) -> float:
+        if not self.requests:
+            return 0.0
+        return 1.0 - (self.success / self.requests)
+
+    def as_dict(self) -> dict:
+        return {
+            "requests": self.requests,
+            "success": self.success,
+            "gateway_timeouts": self.gateway_timeouts,
+            "rate_limited": self.rate_limited,
+            "too_slow": self.too_slow,
+            "median_ttft": round(self.median_ttft, 1),
+            "failure_rate": round(self.failure_rate, 2),
+        }
+
+
+# A model is called out once its recent record is this bad. Small samples lie,
+# so require a handful of attempts before saying anything.
+_MODEL_WARN_MIN_REQUESTS = 4
+_MODEL_WARN_FAILURE_RATE = 0.5
+_MODEL_WARN_INTERVAL = 120.0  # seconds between repeats, per model
+
+
 class ProxyStats:
     def __init__(self, current_index: int = 0):
         self.requests = 0
@@ -211,6 +265,8 @@ class ProxyState:
 
         self.cooldowns: Dict[str, KeyCooldown] = {}
         self.rpm: Dict[str, RpmTracker] = {}
+        # Per-model health, learned from real traffic (see ModelHealth).
+        self.model_health: Dict[str, ModelHealth] = {}
 
         try:
             self.loop = asyncio.get_running_loop()
@@ -419,6 +475,56 @@ class ProxyState:
                 tracker.max_rpm = 0  # fully rehabbed → inherit global ceiling
 
     # ── RPM API ─────────────────────────────────────────────────────
+
+    def record_model_result(
+        self,
+        model: str,
+        *,
+        ok: bool = False,
+        status: int = 0,
+        ttft: Optional[float] = None,
+        too_slow: bool = False,
+    ) -> None:
+        """Score one attempt against a model and warn when it stops working."""
+        if not model:
+            return
+        h = self.model_health.get(model)
+        if h is None:
+            h = ModelHealth()
+            self.model_health[model] = h
+        h.requests += 1
+        if ok:
+            h.success += 1
+            if ttft is not None:
+                h.ttfts.append(ttft)
+            return
+        if too_slow:
+            h.too_slow += 1
+        elif status in (502, 503, 504):
+            h.gateway_timeouts += 1
+        elif status == 429:
+            h.rate_limited += 1
+
+        if (
+            h.requests >= _MODEL_WARN_MIN_REQUESTS
+            and h.failure_rate >= _MODEL_WARN_FAILURE_RATE
+            and time.time() - h.warned_at > _MODEL_WARN_INTERVAL
+        ):
+            h.warned_at = time.time()
+            detail = []
+            if h.gateway_timeouts:
+                detail.append(f"{h.gateway_timeouts}× 504 provider gave up")
+            if h.too_slow:
+                detail.append(f"{h.too_slow}× no answer in time")
+            if h.rate_limited:
+                detail.append(f"{h.rate_limited}× 429")
+            if h.median_ttft:
+                detail.append(f"first token ~{h.median_ttft:.0f}s")
+            self.log_cb(
+                f"⚠ {model}: {h.success}/{h.requests} requests succeeded"
+                + (f" ({', '.join(detail)})" if detail else "")
+                + " — the provider is struggling with this model, not your keys"
+            )
 
     def record_request(self, key: str) -> None:
         t = self.rpm.get(key)

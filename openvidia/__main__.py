@@ -708,7 +708,14 @@ def open_desk(port: int) -> None:
         return False
 
     window.events.closing += on_closing
-    window.events.closed += lambda: _kill_proxy_by_port(port)
+    # NOTE: no killer on `closed` here. With a tray icon the window is a view
+    # onto a background service — closing it hides the view, and the proxy
+    # must keep serving the CLIs. Only the tray's Quit stops it. (This line
+    # used to kill the proxy and appeared harmless purely because the kill was
+    # SIGTERM-only and uvicorn ignored it while streams were open; once the
+    # kill was made to actually work, closing the window took the proxy down
+    # with it.) The no-tray fallback below registers its own handler, because
+    # without a tray there is nothing left to stop it from.
 
     if signaller is not None:
         webview.start(

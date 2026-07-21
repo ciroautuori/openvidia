@@ -835,3 +835,54 @@ class TestKeySpreadUnderConcurrency:
         assert state.get_candidate_keys()[0][1] != first
         state.end_in_flight(first)
         assert state.get_candidate_keys()[0][1] == first
+
+
+class TestThinkingToggle:
+    """The reasoning switch must be config-driven and never override a client."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch):
+        from openvidia import config as cfg
+        monkeypatch.setattr(cfg, "config_dir", lambda: tmp_path)
+        yield
+
+    def test_auto_sends_nothing(self):
+        from openvidia import config as cfg
+        payload = {"model": "vendor/m", "messages": []}
+        assert cfg.apply_model_options(dict(payload)) == payload
+
+    def test_off_injects_the_configured_payload(self):
+        from openvidia import config as cfg
+        cfg.save_model_options({**cfg._MODEL_OPTIONS_DEFAULTS, "thinking": "off"})
+        out = cfg.apply_model_options({"model": "vendor/m", "messages": []})
+        assert out["chat_template_kwargs"] == {"thinking": False}
+
+    def test_per_model_beats_the_global_setting(self):
+        from openvidia import config as cfg
+        cfg.save_model_options({
+            **cfg._MODEL_OPTIONS_DEFAULTS,
+            "thinking": "off",
+            "per_model": {"vendor/keeps-thinking": {"thinking": "on"}},
+        })
+        out = cfg.apply_model_options({"model": "vendor/keeps-thinking"})
+        assert out["chat_template_kwargs"] == {"thinking": True}
+
+    def test_client_choice_is_not_overridden(self):
+        from openvidia import config as cfg
+        cfg.save_model_options({**cfg._MODEL_OPTIONS_DEFAULTS, "thinking": "off"})
+        out = cfg.apply_model_options({
+            "model": "vendor/m",
+            "chat_template_kwargs": {"thinking": True},
+        })
+        assert out["chat_template_kwargs"]["thinking"] is True
+
+    def test_the_flag_name_is_configuration_not_code(self):
+        """A future model using a different flag needs no release."""
+        from openvidia import config as cfg
+        cfg.save_model_options({
+            **cfg._MODEL_OPTIONS_DEFAULTS,
+            "thinking": "off",
+            "thinking_off_payload": {"reasoning_effort": "none"},
+        })
+        out = cfg.apply_model_options({"model": "vendor/future"})
+        assert out["reasoning_effort"] == "none"

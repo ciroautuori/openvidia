@@ -268,6 +268,56 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         config.save_active_model(m or "")
         return {"ok": True, "model": m or ""}
 
+    @app.get("/api/thinking")
+    async def api_get_thinking() -> dict:
+        opts = config.model_options()
+        model = state.active_model or ""
+        per = (opts.get("per_model") or {}).get(model, {})
+        return {
+            "model": model,
+            "mode": per.get("thinking") or opts.get("thinking", "auto"),
+            "inherited": "thinking" not in per,
+        }
+
+    @app.post("/api/thinking")
+    async def api_set_thinking(request: Request) -> dict:
+        """Set the reasoning mode for the active model (or globally).
+
+        A hybrid reasoning model emits nothing until it stops thinking, which
+        is the difference between a 2s and a 160s first token — worth a switch
+        rather than a config file edit.
+        """
+        body = await request.json()
+        mode = body.get("mode", "auto")
+        if mode not in ("auto", "on", "off"):
+            return {"ok": False, "error": "mode must be auto, on or off"}
+        opts = config.model_options()
+        model = body.get("model", state.active_model or "")
+        if model:
+            per = dict(opts.get("per_model") or {})
+            entry = dict(per.get(model) or {})
+            if mode == "auto":
+                entry.pop("thinking", None)
+            else:
+                entry["thinking"] = mode
+            if entry:
+                per[model] = entry
+            else:
+                per.pop(model, None)
+            opts["per_model"] = per
+        else:
+            opts["thinking"] = mode
+        config.save_model_options(opts)
+        state.log_cb(f"◆ thinking={mode} for {model or 'all models'}")
+        return {"ok": True, "model": model, "mode": mode}
+
+    @app.get("/api/model-health")
+    async def api_model_health() -> dict:
+        """What the proxy has learned about each model from real traffic."""
+        return {
+            m: h.as_dict() for m, h in sorted(state.model_health.items())
+        }
+
     # ----------------------------------------------------------------------- #
     # Lifecycle: stop / start / restart
     # ----------------------------------------------------------------------- #

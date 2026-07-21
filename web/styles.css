@@ -388,3 +388,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:2px
   .cli-step-code{padding:8px 10px}
   .cli-step-code code{font-size:.66rem}
 }
+
+/* Reasoning toggle: a hybrid model emits nothing while it thinks, so this is
+   the difference between a 2s and a 160s first token. */
+.btn-xs{padding:2px 7px;font-size:.6rem;border-radius:5px}
+.think-row{display:inline-flex;align-items:center;gap:4px;margin-top:3px}
+.think-btn.active{background:var(--accent);color:#0a0b0a;border-color:var(--accent);font-weight:700}

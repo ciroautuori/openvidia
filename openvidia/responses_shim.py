@@ -98,6 +98,8 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
         state.begin_in_flight(k)
         released = False
         resp = None
+        _model = payload.get("model", "")
+        _t0 = time.monotonic()
         try:
             req = client.build_request("POST", upstream, json=payload, headers=hdrs, timeout=timeout)
             resp = await client.send(req, stream=stream)
@@ -114,6 +116,7 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
                 f"  {log_tag}: key[{idx}] no first byte in {timeout.read:.0f}s "
                 f"— model too slow, not a key fault"
             )
+            state.record_model_result(_model, too_slow=True)
             state.end_in_flight(k)
             released = True
             break
@@ -130,6 +133,7 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
             if not released and (resp is None or resp.status_code != 200):
                 state.end_in_flight(k)
         if resp.status_code == 200:
+            state.record_model_result(_model, ok=True, ttft=time.monotonic() - _t0)
             return resp, k, idx
         err_status = resp.status_code
         # Read error body for detailed logging before closing
@@ -141,6 +145,7 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
             pass
         await resp.aclose()
         state.log_cb(f"  {log_tag}: key[{idx}] HTTP {err_status}")
+        state.record_model_result(_model, status=err_status)
         if err_status == 429:
             seen_429_box[0] = True
         # A gateway timeout is the MODEL being slow, not the key being bad:
@@ -473,6 +478,8 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
         payload["response_format"] = body["response_format"]
 
     payload["messages"] = _sanitize_chat_messages(payload["messages"])
+    # Dashboard thinking toggle — never overrides what the client asked for.
+    config.apply_model_options(payload)
     return payload
 
 

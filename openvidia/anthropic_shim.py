@@ -343,6 +343,9 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
         payload["stop"] = stop
 
     payload["messages"] = _sanitize_chat_messages(payload["messages"])
+    # Dashboard thinking toggle — never overrides what the client asked for.
+    from . import config as _cfg
+    _cfg.apply_model_options(payload)
     return payload
 
 

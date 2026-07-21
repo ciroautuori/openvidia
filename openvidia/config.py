@@ -64,6 +64,79 @@ def httpx_timeout_kwargs() -> dict:
 
 
 
+# ── Thinking / reasoning toggle ────────────────────────────────────────
+# Hybrid reasoning models emit nothing until they finish thinking, which is
+# the difference between a 2s and a 160s first token. Providers expose the
+# switch under different names and it changes with every model generation, so
+# the PAYLOAD is configuration, not code: when the next model uses a
+# different flag, edit model_options.json instead of shipping a release.
+_MODEL_OPTIONS_DEFAULTS = {
+    "thinking": "auto",  # "auto" (send nothing) | "on" | "off"
+    "thinking_off_payload": {"chat_template_kwargs": {"thinking": False}},
+    "thinking_on_payload": {"chat_template_kwargs": {"thinking": True}},
+    # Per-model overrides, e.g. {"vendor/model": {"thinking": "off"}}
+    "per_model": {},
+}
+
+
+def model_options_path() -> Path:
+    return config_dir() / "model_options.json"
+
+
+def model_options() -> dict:
+    try:
+        p = model_options_path()
+        if p.exists():
+            return {**_MODEL_OPTIONS_DEFAULTS, **json.loads(p.read_text())}
+    except (json.JSONDecodeError, OSError):
+        pass
+    return dict(_MODEL_OPTIONS_DEFAULTS)
+
+
+def save_model_options(opts: dict) -> None:
+    atomic_write(model_options_path(), json.dumps(opts, indent=2))
+
+
+def _fill_missing(dst: dict, src: dict) -> dict:
+    """Recursively add keys from ``src`` that ``dst`` does not already have.
+
+    Fill, never overwrite: the dashboard sets a default, but a CLI that spells
+    the parameter out in its own request has made an explicit choice and must
+    win at every level of nesting.
+    """
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _fill_missing(dst[k], v)
+        elif k not in dst:
+            dst[k] = v
+    return dst
+
+
+def apply_model_options(payload: dict) -> dict:
+    """Merge the configured thinking payload into an outgoing chat request.
+
+    Never overwrites something the client already set: an explicit request
+    from the CLI wins over a dashboard default.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    opts = model_options()
+    model = payload.get("model") or ""
+    mode = (opts.get("per_model") or {}).get(model, {}).get(
+        "thinking"
+    ) or opts.get("thinking", "auto")
+    if mode == "off":
+        extra = opts.get("thinking_off_payload") or {}
+    elif mode == "on":
+        extra = opts.get("thinking_on_payload") or {}
+    else:
+        return payload
+    if not isinstance(extra, dict):
+        return payload
+    _fill_missing(payload, extra)
+    return payload
+
+
 def config_path() -> Path:
     return config_dir() / "keys.json"
 
