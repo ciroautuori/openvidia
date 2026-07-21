@@ -6,28 +6,27 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from openvidia.proxy_state import (
-    ProxyState,
-    ProxyStats,
-    KeyState,
-    RpmTracker,
-    KeyCooldown,
-    MAX_RPM,
-    COOLDOWN_DURATIONS,
-    ADAPTIVE_COOLDOWN_MAX,
-)
+from openvidia.compaction import _DEFAULTS as _DEFAULTS_KEYS
 from openvidia.compaction import (
-    estimate_tokens,
-    _split,
-    _render,
     _conv_key,
     _fingerprint,
-    _trim,
+    _model_budgets,
+    _render,
     _settings,
+    _split,
+    _trim,
+    estimate_tokens,
 )
-from openvidia.compaction import _model_budgets
-from openvidia.compaction import _DEFAULTS as _DEFAULTS_KEYS
-
+from openvidia.proxy_state import (
+    ADAPTIVE_COOLDOWN_MAX,
+    COOLDOWN_DURATIONS,
+    MAX_RPM,
+    KeyCooldown,
+    KeyState,
+    ProxyState,
+    ProxyStats,
+    RpmTracker,
+)
 
 # ─────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -69,7 +68,7 @@ class TestKeyState:
         """Test KeyState initialization."""
         key = "test-key"
         ks = KeyState(key)
-        
+
         assert ks.key == key
         assert ks.is_valid is True
         assert ks.cooldown_until == 0.0
@@ -102,12 +101,12 @@ class TestRpmTracker:
     def test_rpm_tracker_record_and_count(self):
         """Test recording requests and counting."""
         tracker = RpmTracker(window=60.0)
-        
+
         assert tracker.count() == 0
-        
+
         tracker.record()
         assert tracker.count() == 1
-        
+
         tracker.record()
         tracker.record()
         assert tracker.count() == 3
@@ -115,11 +114,11 @@ class TestRpmTracker:
     def test_rpm_tracker_prune_old(self):
         """Test that old timestamps are pruned."""
         tracker = RpmTracker(window=1.0)  # 1 second window
-        
+
         tracker.record()
         tracker.record()
         assert tracker.count() == 2
-        
+
         time.sleep(1.1)  # Wait for window to expire
         tracker.record()  # This will prune old entries
         assert tracker.count() == 1
@@ -127,14 +126,14 @@ class TestRpmTracker:
     def test_rpm_tracker_can_send(self):
         """Test can_send respects max_rpm."""
         tracker = RpmTracker(max_rpm=5)
-        
+
         for _ in range(4):
             tracker.record()
         assert tracker.can_send(max_rpm=10) is True
-        
+
         tracker.record()
         assert tracker.can_send(max_rpm=10) is False
-        
+
         # With per-key max_rpm lower than global
         tracker.max_rpm = 3
         assert tracker.can_send(max_rpm=10) is False
@@ -142,10 +141,10 @@ class TestRpmTracker:
     def test_rpm_tracker_adaptive_ceiling(self):
         """Test adaptive RPM ceiling."""
         tracker = RpmTracker(max_rpm=MAX_RPM)
-        
+
         # Initially should use MAX_RPM
         assert tracker.can_send(MAX_RPM) is True
-        
+
         # Simulate 429 - lower the ceiling
         tracker.max_rpm = int(MAX_RPM * 0.5)
         assert tracker.max_rpm < MAX_RPM
@@ -167,7 +166,7 @@ class TestKeyCooldown:
     def test_cooldown_active_when_set(self):
         """Test KeyCooldown becomes active when set."""
         cd = KeyCooldown(until=time.time() + 10.0, reason="rate-limited")
-        
+
         assert cd.active is True
         assert cd.remaining > 0.0
         assert cd.remaining <= 10.0
@@ -176,11 +175,11 @@ class TestKeyCooldown:
     def test_cooldown_remaining_property(self):
         """Test remaining time decreases."""
         cd = KeyCooldown(until=time.time() + 2.0)
-        
+
         initial = cd.remaining
         time.sleep(0.5)
         later = cd.remaining
-        
+
         assert later < initial
         assert later > 0.0
 
@@ -199,9 +198,9 @@ class TestProxyStateCooldown:
     def test_mark_key_failed_sets_cooldown(self, proxy_state):
         """Test marking a key failed sets cooldown."""
         key = proxy_state.keys[0]
-        
+
         proxy_state.mark_key_failed(key, status=429)
-        
+
         assert proxy_state.is_key_on_cooldown(key) is True
         assert "429" in proxy_state.cooldown_reason(key)
 
@@ -246,10 +245,10 @@ class TestProxyStateCooldown:
     def test_clear_cooldown(self, proxy_state):
         """Test clearing a cooldown."""
         key = proxy_state.keys[0]
-        
+
         proxy_state.mark_key_failed(key, status=429)
         assert proxy_state.is_key_on_cooldown(key) is True
-        
+
         proxy_state.clear_cooldown(key)
         assert proxy_state.is_key_on_cooldown(key) is False
         assert proxy_state.cooldown_remaining(key) == 0.0
@@ -257,13 +256,13 @@ class TestProxyStateCooldown:
     def test_restore_key(self, proxy_state):
         """Test restoring a key clears cooldown and resets state."""
         key = proxy_state.keys[0]
-        
+
         proxy_state.mark_key_failed(key, status=429)
         ks = proxy_state._key_states[key]
         ks.consecutive_failures = 5
-        
+
         proxy_state.restore_key(key)
-        
+
         assert proxy_state.is_key_on_cooldown(key) is False
         assert ks.consecutive_failures == 0
         assert ks.is_valid is True
@@ -283,10 +282,10 @@ class TestProxyStateRpm:
     def test_record_request_increments_rpm(self, proxy_state):
         """Test recording requests increments RPM counter."""
         key = proxy_state.keys[0]
-        
+
         proxy_state.record_request(key)
         assert proxy_state.key_rpm(key) == 1
-        
+
         proxy_state.record_request(key)
         proxy_state.record_request(key)
         assert proxy_state.key_rpm(key) == 3
@@ -294,31 +293,31 @@ class TestProxyStateRpm:
     def test_key_can_send_rpm(self, proxy_state):
         """Test key_can_send_rpm respects limits."""
         key = proxy_state.keys[0]
-        
+
         # Initially can send
         assert proxy_state.key_can_send_rpm(key) is True
-        
+
         # Fill up to MAX_RPM
         for _ in range(MAX_RPM):
             proxy_state.record_request(key)
-        
+
         assert proxy_state.key_can_send_rpm(key) is False
 
     def test_in_flight_tracking(self, proxy_state):
         """Test in-flight request tracking."""
         key = proxy_state.keys[0]
-        
+
         assert proxy_state._key_states[key].in_flight == 0
-        
+
         proxy_state.begin_in_flight(key)
         assert proxy_state._key_states[key].in_flight == 1
-        
+
         proxy_state.begin_in_flight(key)
         assert proxy_state._key_states[key].in_flight == 2
-        
+
         proxy_state.end_in_flight(key)
         assert proxy_state._key_states[key].in_flight == 1
-        
+
         proxy_state.end_in_flight(key)
         assert proxy_state._key_states[key].in_flight == 0
 
@@ -332,18 +331,18 @@ class TestProxyStateKeySelection:
     def test_get_candidate_keys_returns_all_healthy(self, proxy_state):
         """Test getting candidate keys returns all healthy keys."""
         candidates = proxy_state.get_candidate_keys()
-        
+
         assert len(candidates) == len(proxy_state.keys)
-        for idx, key in candidates:
+        for _idx, key in candidates:
             assert key in proxy_state.keys
 
     def test_get_candidate_keys_excludes_invalid(self, proxy_state):
         """Test candidate keys excludes invalid keys."""
         key = proxy_state.keys[0]
         proxy_state._key_states[key].is_valid = False
-        
+
         candidates = proxy_state.get_candidate_keys()
-        
+
         assert len(candidates) == len(proxy_state.keys) - 1
         assert key not in [k for _, k in candidates]
 
@@ -351,9 +350,9 @@ class TestProxyStateKeySelection:
         """Test candidate keys handles keys on cooldown as degraded fallback."""
         key = proxy_state.keys[0]
         proxy_state.mark_key_failed(key, status=429)
-        
+
         candidates = proxy_state.get_candidate_keys()
-        
+
         # get_candidate_keys excludes cooldown keys from main list
         # (they're only used as last-resort fallback in the proxy loop)
         assert len(candidates) == len(proxy_state.keys) - 1
@@ -368,11 +367,11 @@ class TestProxyStateKeySelection:
         proxy_state.begin_in_flight(key0)
         proxy_state.begin_in_flight(key0)
         proxy_state.begin_in_flight(key0)
-        
+
         # Second key is free
-        
+
         best_idx = proxy_state.best_key_index()
-        
+
         # Should prefer key1 (less loaded)
         assert best_idx != 0
 
@@ -386,14 +385,14 @@ class TestProxyStateHealth:
     def test_is_key_healthy(self, proxy_state):
         """Test key health status."""
         key = proxy_state.keys[0]
-        
+
         # Initially healthy
         assert proxy_state.is_key_healthy(key) is True
-        
+
         # Mark invalid
         proxy_state._key_states[key].is_valid = False
         assert proxy_state.is_key_healthy(key) is False
-        
+
         # Restore validity but add cooldown
         proxy_state._key_states[key].is_valid = True
         proxy_state.mark_key_failed(key, status=429)
@@ -402,15 +401,15 @@ class TestProxyStateHealth:
     def test_consecutive_failures_tracking(self, proxy_state):
         """Test consecutive failures increment."""
         key = proxy_state.keys[0]
-        
+
         assert proxy_state._key_states[key].consecutive_failures == 0
-        
+
         proxy_state.mark_key_failed(key, status=500)
         assert proxy_state._key_states[key].consecutive_failures == 1
-        
+
         proxy_state.mark_key_failed(key, status=500)
         assert proxy_state._key_states[key].consecutive_failures == 2
-        
+
         # Restore resets counter
         proxy_state.restore_key(key)
         assert proxy_state._key_states[key].consecutive_failures == 0
@@ -428,7 +427,7 @@ class TestCompactionTokenEstimation:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there!"},
         ]
-        
+
         tokens = estimate_tokens(messages)
         assert tokens > 0
         assert isinstance(tokens, int)
@@ -441,7 +440,7 @@ class TestCompactionTokenEstimation:
         """Test token estimation scales with message size."""
         small = [{"role": "user", "content": "Hi"}]
         large = [{"role": "user", "content": "A" * 1000}]
-        
+
         assert estimate_tokens(large) > estimate_tokens(small)
 
 
@@ -459,9 +458,9 @@ class TestCompactionSplit:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi"},
         ]
-        
+
         system_block, rest = _split(messages)
-        
+
         assert len(system_block) == 2
         assert len(rest) == 2
         assert all(m["role"] == "system" for m in system_block)
@@ -473,9 +472,9 @@ class TestCompactionSplit:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi"},
         ]
-        
+
         system_block, rest = _split(messages)
-        
+
         assert len(system_block) == 0
         assert len(rest) == 2
 
@@ -492,9 +491,9 @@ class TestCompactionRender:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there"},
         ]
-        
+
         rendered = _render(messages)
-        
+
         assert "user: Hello" in rendered
         assert "assistant: Hi there" in rendered
 
@@ -504,14 +503,12 @@ class TestCompactionRender:
             {
                 "role": "assistant",
                 "content": "Let me check",
-                "tool_calls": [
-                    {"function": {"name": "get_weather"}}
-                ],
+                "tool_calls": [{"function": {"name": "get_weather"}}],
             },
         ]
-        
+
         rendered = _render(messages)
-        
+
         assert "tool_calls: get_weather" in rendered
 
     def test_render_non_string_content(self):
@@ -519,9 +516,9 @@ class TestCompactionRender:
         messages = [
             {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
         ]
-        
+
         rendered = _render(messages)
-        
+
         assert "user:" in rendered
 
 
@@ -538,10 +535,10 @@ class TestCompactionConvKey:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi"},
         ]
-        
+
         key1 = _conv_key(system, rest)
         key2 = _conv_key(system, rest)
-        
+
         assert key1 == key2
         assert len(key1) == 64  # SHA-256 hex digest
 
@@ -550,10 +547,10 @@ class TestCompactionConvKey:
         system = [{"role": "system", "content": "You are helpful"}]
         rest1 = [{"role": "user", "content": "Hello"}]
         rest2 = [{"role": "user", "content": "Hi there"}]
-        
+
         key1 = _conv_key(system, rest1)
         key2 = _conv_key(system, rest2)
-        
+
         assert key1 != key2
 
 
@@ -567,20 +564,20 @@ class TestCompactionFingerprint:
         """Test fingerprints are unique for different messages."""
         msgs1 = [{"role": "user", "content": "Hello"}]
         msgs2 = [{"role": "user", "content": "Goodbye"}]
-        
+
         fp1 = _fingerprint(msgs1)
         fp2 = _fingerprint(msgs2)
-        
+
         assert fp1 != fp2
         assert len(fp1) == 64  # Full SHA-256
 
     def test_fingerprint_stable_for_same_messages(self):
         """Test fingerprint is stable for same messages."""
         msgs = [{"role": "user", "content": "Test"}]
-        
+
         fp1 = _fingerprint(msgs)
         fp2 = _fingerprint(msgs)
-        
+
         assert fp1 == fp2
 
 
@@ -593,16 +590,13 @@ class TestCompactionTrim:
     def test_trim_keeps_system_and_recent(self):
         """Test trimming keeps system messages and recent conversation."""
         system = [{"role": "system", "content": "You are helpful"}]
-        rest = [
-            {"role": "user", "content": f"Message {i}"}
-            for i in range(20)
-        ]
-        
+        rest = [{"role": "user", "content": f"Message {i}"} for i in range(20)]
+
         budget = 500  # Tight budget
         keep_recent = 5
-        
+
         trimmed = _trim(system, rest, budget, keep_recent)
-        
+
         # Should have system + some messages
         assert len(trimmed) > 0
         assert trimmed[0]["role"] == "system"
@@ -610,16 +604,13 @@ class TestCompactionTrim:
     def test_trim_fits_within_budget(self):
         """Test trimming respects token budget."""
         system = [{"role": "system", "content": "System prompt"}]
-        rest = [
-            {"role": "user", "content": "A" * 500}
-            for _ in range(10)
-        ]
-        
+        rest = [{"role": "user", "content": "A" * 500} for _ in range(10)]
+
         budget = 2000  # More realistic budget
         keep_recent = 2
-        
+
         trimmed = _trim(system, rest, budget, keep_recent)
-        
+
         tokens = estimate_tokens(trimmed)
         # MUST respect the budget strictly — the upstream depends on this
         # guarantee to avoid 400 context overflow.
@@ -646,9 +637,7 @@ class TestCompactionTrim:
 
     def test_no_hardcoded_model_budget(self):
         """Per-model budgets come from compaction.json, never hardcoded."""
-        assert _model_budgets(_settings()) == {} or isinstance(
-            _model_budgets(_settings()), dict
-        )
+        assert _model_budgets(_settings()) == {} or isinstance(_model_budgets(_settings()), dict)
         cfg = {**_settings(), "model_budgets": {"z-ai/glm-5.2": 120_000}}
         assert _model_budgets(cfg).get("z-ai/glm-5.2") == 120_000
 
@@ -692,10 +681,10 @@ class TestProxyStateStats:
     def test_key_usage_tracking(self, proxy_state):
         """Test key usage statistics are tracked."""
         key = proxy_state.keys[0]
-        
+
         proxy_state.stats.record_key_usage(key, ok=True)
         usage = proxy_state.stats.key_usage[key]
-        
+
         assert usage.requests == 1
         assert usage.success == 1
         assert usage.failed == 0
@@ -703,10 +692,10 @@ class TestProxyStateStats:
     def test_key_usage_failure_tracking(self, proxy_state):
         """Test failure tracking in key usage."""
         key = proxy_state.keys[0]
-        
+
         proxy_state.stats.record_key_usage(key, ok=False, error="429")
         usage = proxy_state.stats.key_usage[key]
-        
+
         assert usage.requests == 1
         assert usage.success == 0
         assert usage.failed == 1
@@ -724,14 +713,14 @@ class TestEdgeCases:
         stats = ProxyStats()
         log_cb = MagicMock()
         index_path = Path("/tmp/test.json")
-        
+
         state = ProxyState(
             keys=[],
             stats=stats,
             index_path=index_path,
             log_cb=log_cb,
         )
-        
+
         candidates = state.get_candidate_keys()
         assert len(candidates) == 0
 
@@ -740,27 +729,27 @@ class TestEdgeCases:
         stats = ProxyStats()
         log_cb = MagicMock()
         index_path = Path("/tmp/test.json")
-        
+
         state = ProxyState(
             keys=["single-key"],
             stats=stats,
             index_path=index_path,
             log_cb=log_cb,
         )
-        
+
         candidates = state.get_candidate_keys()
         assert len(candidates) == 1
 
     def test_rpm_tracker_window_edge(self):
         """Test RPM tracker at window boundary."""
         tracker = RpmTracker(window=0.1)  # Very short window
-        
+
         tracker.record()
         assert tracker.count() == 1
-        
+
         time.sleep(0.15)
         tracker.record()  # Should prune old entry
-        
+
         assert tracker.count() == 1
 
 
@@ -843,46 +832,58 @@ class TestThinkingToggle:
     @pytest.fixture(autouse=True)
     def _isolate(self, tmp_path, monkeypatch):
         from openvidia import config as cfg
+
         monkeypatch.setattr(cfg, "config_dir", lambda: tmp_path)
         yield
 
     def test_auto_sends_nothing(self):
         from openvidia import config as cfg
+
         payload = {"model": "vendor/m", "messages": []}
         assert cfg.apply_model_options(dict(payload)) == payload
 
     def test_off_injects_the_configured_payload(self):
         from openvidia import config as cfg
+
         cfg.save_model_options({**cfg._MODEL_OPTIONS_DEFAULTS, "thinking": "off"})
         out = cfg.apply_model_options({"model": "vendor/m", "messages": []})
         assert out["chat_template_kwargs"] == {"thinking": False}
 
     def test_per_model_beats_the_global_setting(self):
         from openvidia import config as cfg
-        cfg.save_model_options({
-            **cfg._MODEL_OPTIONS_DEFAULTS,
-            "thinking": "off",
-            "per_model": {"vendor/keeps-thinking": {"thinking": "on"}},
-        })
+
+        cfg.save_model_options(
+            {
+                **cfg._MODEL_OPTIONS_DEFAULTS,
+                "thinking": "off",
+                "per_model": {"vendor/keeps-thinking": {"thinking": "on"}},
+            }
+        )
         out = cfg.apply_model_options({"model": "vendor/keeps-thinking"})
         assert out["chat_template_kwargs"] == {"thinking": True}
 
     def test_client_choice_is_not_overridden(self):
         from openvidia import config as cfg
+
         cfg.save_model_options({**cfg._MODEL_OPTIONS_DEFAULTS, "thinking": "off"})
-        out = cfg.apply_model_options({
-            "model": "vendor/m",
-            "chat_template_kwargs": {"thinking": True},
-        })
+        out = cfg.apply_model_options(
+            {
+                "model": "vendor/m",
+                "chat_template_kwargs": {"thinking": True},
+            }
+        )
         assert out["chat_template_kwargs"]["thinking"] is True
 
     def test_the_flag_name_is_configuration_not_code(self):
         """A future model using a different flag needs no release."""
         from openvidia import config as cfg
-        cfg.save_model_options({
-            **cfg._MODEL_OPTIONS_DEFAULTS,
-            "thinking": "off",
-            "thinking_off_payload": {"reasoning_effort": "none"},
-        })
+
+        cfg.save_model_options(
+            {
+                **cfg._MODEL_OPTIONS_DEFAULTS,
+                "thinking": "off",
+                "thinking_off_payload": {"reasoning_effort": "none"},
+            }
+        )
         out = cfg.apply_model_options({"model": "vendor/future"})
         assert out["reasoning_effort"] == "none"

@@ -16,8 +16,8 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
 
 from . import config
 from .proxy_state import ProxyState
@@ -34,13 +34,13 @@ class Account:
         email: str = "",
         password: str = "",
         cookie_json: str = "",
-        keys: Optional[List[str]] = None,
+        keys: list[str] | None = None,
     ):
         self.name = name
         self.email = email
         self.password = password
         self.cookie_json = cookie_json
-        self.keys: List[str] = list(keys) if keys else []
+        self.keys: list[str] = list(keys) if keys else []
         self._gen_lock = threading.Lock()
 
     @property
@@ -82,11 +82,11 @@ class AccountManager:
     def __init__(self, state: ProxyState, accounts_path: Path):
         self.state = state
         self.accounts_path = accounts_path
-        self.accounts: List[Account] = []
+        self.accounts: list[Account] = []
         # key_value -> account index
-        self._key_owner: Dict[str, int] = {}
+        self._key_owner: dict[str, int] = {}
         # Set of keys currently being replenished (prevent double-spawn)
-        self._replenishing: Set[str] = set()
+        self._replenishing: set[str] = set()
         self._replenish_lock = threading.Lock()
         # Cross-thread lock for state.keys mutations (asyncio.Lock in proxy is
         # single-thread only — replenish runs from thread pool workers)
@@ -125,7 +125,7 @@ class AccountManager:
     def _sync_keys_to_state(self):
         """Ensure the proxy's key list matches all account keys."""
         all_keys = []
-        seen: Set[str] = set()
+        seen: set[str] = set()
         for acct in self.accounts:
             for k in acct.keys:
                 if k not in seen:
@@ -146,9 +146,7 @@ class AccountManager:
     ) -> Account:
         if any(a.name == name for a in self.accounts):
             raise ValueError(f"Account {name!r} already exists")
-        acct = Account(
-            name=name, email=email, password=password, cookie_json=cookie_json
-        )
+        acct = Account(name=name, email=email, password=password, cookie_json=cookie_json)
         self.accounts.append(acct)
         self.save()
         auth = "🔑" if acct.has_credentials else "🍪"
@@ -167,9 +165,7 @@ class AccountManager:
         self.save()
         self._log_cb(f"➖ Account {name!r} removed ({len(acct.keys)} keys)")
 
-    def update_account(
-        self, name: str, email: str = "", password: str = "", cookie_json: str = ""
-    ):
+    def update_account(self, name: str, email: str = "", password: str = "", cookie_json: str = ""):
         acct = self._find(name)
         if acct is None:
             raise ValueError(f"Account {name!r} not found")
@@ -182,7 +178,7 @@ class AccountManager:
         self.save()
         self._log_cb(f"✏️ Account {name!r} updated")
 
-    def get_accounts_info(self) -> List[dict]:
+    def get_accounts_info(self) -> list[dict]:
         return [
             {
                 "name": a.name,
@@ -219,17 +215,13 @@ class AccountManager:
                 self._replenishing.discard(key)
             return
 
-        self._log_cb(
-            f"🔄 Replenish key {key[:12]}… (account {self.accounts[idx].name})"
-        )
+        self._log_cb(f"🔄 Replenish key {key[:12]}… (account {self.accounts[idx].name})")
 
         try:
             asyncio.create_task(self._do_replenish(key, idx))
         except RuntimeError:
             # No running loop — fallback to thread
-            threading.Thread(
-                target=self._do_replenish_sync, args=(key, idx), daemon=True
-            ).start()
+            threading.Thread(target=self._do_replenish_sync, args=(key, idx), daemon=True).start()
 
     async def _do_replenish(self, old_key: str, acct_idx: int):
         try:
@@ -239,14 +231,10 @@ class AccountManager:
             # Fallback: Playwright with email+password
             if not new_key and acct.has_credentials:
                 self._log_cb(f"  CDP failed — trying Playwright for {acct.name}")
-                new_key = await asyncio.to_thread(
-                    self._generate_and_swap_pw, old_key, acct_idx
-                )
+                new_key = await asyncio.to_thread(self._generate_and_swap_pw, old_key, acct_idx)
             elif not new_key and acct.cookie_json:
                 self._log_cb(f"  CDP failed — trying cookie auth for {acct.name}")
-                new_key = await asyncio.to_thread(
-                    self._generate_and_swap_pw, old_key, acct_idx
-                )
+                new_key = await asyncio.to_thread(self._generate_and_swap_pw, old_key, acct_idx)
 
             if new_key:
                 self._log_cb(f"✅ Replenished: {old_key[:12]}… → {new_key[:12]}…")
@@ -276,10 +264,11 @@ class AccountManager:
 
     async def _generate_and_swap_cdp(
         self, acct_name: str, old_key: str, acct_idx: int
-    ) -> Optional[str]:
+    ) -> str | None:
         """Generate key via CDP for *acct_name* and swap it in."""
-        from .cdp_keygen import read_ws_url
         import websockets
+
+        from .cdp_keygen import read_ws_url
 
         ws_url = read_ws_url()
         if not ws_url:
@@ -287,9 +276,7 @@ class AccountManager:
             return None
 
         try:
-            async with websockets.connect(
-                ws_url, max_size=2**24, open_timeout=10
-            ) as ws:
+            async with websockets.connect(ws_url, max_size=2**24, open_timeout=10) as ws:
                 # ── Find the right target ──────────────────────────────
                 await ws.send(json.dumps({"id": 1, "method": "Target.getTargets"}))
                 resp = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -299,8 +286,7 @@ class AccountManager:
                 api_pages = [
                     t
                     for t in targets
-                    if t.get("type") == "page"
-                    and "settings/api-keys" in t.get("url", "")
+                    if t.get("type") == "page" and "settings/api-keys" in t.get("url", "")
                 ]
 
             # ── Scan each context for the matching account ─────────────
@@ -336,7 +322,7 @@ class AccountManager:
         acct_name: str,
         old_key: str,
         acct_idx: int,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Attach to a single CDP target, verify account match, generate key."""
         import websockets
 
@@ -348,7 +334,7 @@ class AccountManager:
                 return None
 
             # Check auth and account name
-            from .cdp_keygen import is_authenticated, _eval_val
+            from .cdp_keygen import _eval_val, is_authenticated
 
             if not await is_authenticated(ws, sid):
                 return None
@@ -381,7 +367,7 @@ class AccountManager:
 
     # ── Playwright replenish (fallback) ─────────────────────────────
 
-    def _generate_and_swap_pw(self, old_key: str, acct_idx: int) -> Optional[str]:
+    def _generate_and_swap_pw(self, old_key: str, acct_idx: int) -> str | None:
         """Generate via Playwright — tries Chrome channel first, then fallbacks."""
         acct = self.accounts[acct_idx]
 
@@ -389,9 +375,7 @@ class AccountManager:
         try:
             from .key_factory import chrome_channel_generate_key
 
-            profile_dir = str(
-                Path.home() / ".config" / "openvidia" / "profiles" / acct.name
-            )
+            profile_dir = str(Path.home() / ".config" / "openvidia" / "profiles" / acct.name)
             self._log_cb(f"  Opening Chrome profile for {acct.name}…")
             new_key = chrome_channel_generate_key(
                 old_key=old_key,
@@ -459,7 +443,7 @@ class AccountManager:
             for key in dead:
                 self.on_key_failed(key)
 
-    def _probe_keys(self) -> List[str]:
+    def _probe_keys(self) -> list[str]:
         """Quick HTTP probe of all keys. Returns list of dead keys."""
         import httpx
 
@@ -481,7 +465,7 @@ class AccountManager:
 
     # ── helpers ───────────────────────────────────────────────────────
 
-    def _find(self, name: str) -> Optional[Account]:
+    def _find(self, name: str) -> Account | None:
         for a in self.accounts:
             if a.name == name:
                 return a

@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Actions pinned to a stale major are the most common way a CI pipeline
+  # rots without anyone noticing.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps"
+    groups:
+      # One PR for routine bumps; security updates still arrive on their own.
+      minor-and-patch:
+        update-types: [minor, patch]

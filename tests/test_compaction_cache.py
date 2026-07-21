@@ -14,8 +14,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from openvidia import compaction
-from openvidia import proxy_app  # noqa: F401 — warm the lazy import maybe_compact does
+from openvidia import (
+    compaction,
+    proxy_app,  # noqa: F401 — warm the lazy import maybe_compact does
+)
 from openvidia.compaction import (
     _assemble,
     _cache_get,
@@ -27,7 +29,6 @@ from openvidia.compaction import (
     maybe_compact,
 )
 from openvidia.proxy_state import ProxyState, ProxyStats
-
 
 SYS = [{"role": "system", "content": "You are helpful"}]
 
@@ -190,10 +191,7 @@ class TestInlineDeadline:
         big = SYS + [{"role": "user", "content": "q " + "x" * 4_000} for _ in range(120)]
 
         outs = await asyncio.gather(
-            *[
-                maybe_compact(big, state=state, client=None, log=lambda m: None)
-                for _ in range(4)
-            ]
+            *[maybe_compact(big, state=state, client=None, log=lambda m: None) for _ in range(4)]
         )
         assert len(calls) == 1, "duplicate summarize for the same conversation"
         for o in outs:
@@ -222,9 +220,7 @@ class TestBoundaryAdvance:
 
     @staticmethod
     def _big(n):
-        return SYS + [
-            {"role": "user", "content": f"t{i} " + "x" * 4_000} for i in range(n)
-        ]
+        return SYS + [{"role": "user", "content": f"t{i} " + "x" * 4_000} for i in range(n)]
 
     @pytest.mark.asyncio
     async def test_steady_state_costs_no_upstream_call(self, state, monkeypatch):
@@ -266,9 +262,7 @@ class TestBoundaryAdvance:
             return "S"
 
         monkeypatch.setattr(compaction, "_summarize", ok)
-        out = await maybe_compact(
-            self._big(200), state=state, client=None, log=lambda m: None
-        )
+        out = await maybe_compact(self._big(200), state=state, client=None, log=lambda m: None)
         verbatim = len(out) - len(SYS) - 1
         assert verbatim > compaction._DEFAULTS["keep_recent"] * 2, (
             f"only {verbatim} verbatim messages kept out of a 43k-token target"

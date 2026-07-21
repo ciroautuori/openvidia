@@ -36,6 +36,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
+    "pre-commit>=3.7",
 ]
 
 [project.scripts]
@@ -43,6 +44,24 @@ openvidia = "openvidia.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["openvidia*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Beyond the defaults (E,F): import order, modern syntax, likely bugs, and
+# needless complexity. Enforced in CI and by the pre-commit hook, so style
+# stops being something a reviewer has to notice by hand.
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]
+ignore = [
+    "E501",    # line length is the formatter's job, not a review comment
+    "SIM105",  # contextlib.suppress reads worse than try/except pass here
+    "B008",    # FastAPI's Depends() in defaults is the documented idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # assert False is fine in tests
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

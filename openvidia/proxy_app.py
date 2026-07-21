@@ -7,7 +7,6 @@ import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -16,9 +15,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
 from . import config
+from .anthropic_shim import handle_anthropic_messages
 from .proxy_state import ProxyState, persist_index
 from .responses_shim import handle_responses
-from .anthropic_shim import handle_anthropic_messages
 
 UPSTREAM_BASE = "https://integrate.api.nvidia.com/v1/"
 MAX_BODY_BYTES = 64 * 1024 * 1024
@@ -27,7 +26,8 @@ MAX_BODY_BYTES = 64 * 1024 * 1024
 # just burns cooldown budget. 401/403/429 are key-specific → rotate + cooldown.
 ROTATE_STATUSES = {401, 403, 429}
 
-def default_model(state: Optional[ProxyState] = None) -> str:
+
+def default_model(state: ProxyState | None = None) -> str:
     """The model a request runs on when the client sends the ``openvidia`` alias.
 
     Resolved live, never hardcoded: a pinned model name is a liability the day
@@ -43,6 +43,7 @@ def default_model(state: Optional[ProxyState] = None) -> str:
     except Exception:  # noqa: BLE001 — model choice must never break a request
         presets = []
     return presets[0] if presets else ""
+
 
 # Bounded rotation: cap the number of upstream sends per rotation phase and
 # give each send a bounded connect+read+write+pool timeout. The catch-all
@@ -103,7 +104,7 @@ async def _health_check_all(
     )
 
     revived = 0
-    for key, healthy in zip(targets, results):
+    for key, healthy in zip(targets, results, strict=True):
         if isinstance(healthy, Exception):
             healthy = False
         if healthy:
@@ -120,9 +121,7 @@ async def _health_check_all(
     )
 
 
-async def _background_health_check(
-    state: ProxyState, client: httpx.AsyncClient
-) -> None:
+async def _background_health_check(state: ProxyState, client: httpx.AsyncClient) -> None:
     try:
         while True:
             await asyncio.sleep(30)
@@ -131,9 +130,7 @@ async def _background_health_check(
         pass
 
 
-async def _warm_keepalive_task(
-    state: ProxyState, client: httpx.AsyncClient
-) -> None:
+async def _warm_keepalive_task(state: ProxyState, client: httpx.AsyncClient) -> None:
     """Decay-only passive helper.
 
     We DO NOT actively ping all healthy keys on a timer — that would burn
@@ -167,12 +164,10 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
+def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
     # Tuned for many concurrent streaming completions: generous keepalive pool,
     # long read timeout for slow LLM generation, HTTP/2 for connection reuse.
-    limits = httpx.Limits(
-        max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0
-    )
+    limits = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0)
     client = httpx.AsyncClient(
         http2=True,
         limits=limits,
@@ -254,9 +249,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 continue
             headers = {"Authorization": f"Bearer {key}", "User-Agent": "openvidia/2.0"}
             try:
-                req = client.build_request(
-                    "GET", UPSTREAM_BASE + "models", headers=headers
-                )
+                req = client.build_request("GET", UPSTREAM_BASE + "models", headers=headers)
                 resp = await client.send(req)
                 if resp.is_success:
                     data = resp.json()
@@ -396,13 +389,13 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         # Using the full pool as the denominator makes the gate fire correctly
         # when most of the 25 keys are on cooldown (the historical Codex block).
         _live_candidates = sum(
-            1 for _, k in candidates
+            1
+            for _, k in candidates
             if state.key_can_send_rpm(k) and not state.is_key_on_cooldown(k)
         )
         _total_pool = len(state.keys)
-        _pool_saturated = (
-            _total_pool > 0
-            and _live_candidates < max(1, int(_total_pool * _MIN_LIVE_FRACTION))
+        _pool_saturated = _total_pool > 0 and _live_candidates < max(
+            1, int(_total_pool * _MIN_LIVE_FRACTION)
         )
         if _pool_saturated:
             state.log_cb(
@@ -420,9 +413,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 )
                 break
             if not state.key_can_send_rpm(key):
-                state.log_cb(
-                    f"  key[{orig_idx}] RPM saturated ({state.key_rpm(key)}/min), skip"
-                )
+                state.log_cb(f"  key[{orig_idx}] RPM saturated ({state.key_rpm(key)}/min), skip")
                 continue
 
             headers = {
@@ -432,16 +423,17 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             for k, v in request.headers.items():
                 if k.lower() in CLIENT_FWD_HEADERS:
                     headers[k] = v
-            if isinstance(payload, dict) and "content-type" not in {
-                k.lower() for k in headers
-            }:
+            if isinstance(payload, dict) and "content-type" not in {k.lower() for k in headers}:
                 headers["Content-Type"] = "application/json"
 
             state.begin_in_flight(key)
             _rotate_attempts += 1
             try:
                 req = client.build_request(
-                    request.method, url, content=body, headers=headers,
+                    request.method,
+                    url,
+                    content=body,
+                    headers=headers,
                     timeout=_ROTATE_SEND_TIMEOUT,
                 )
                 resp = await client.send(req, stream=True)
@@ -482,12 +474,13 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                     if k.lower() not in STRIPPED_RESPONSE_HEADERS
                 }
                 out_headers["access-control-allow-origin"] = "*"
-                out_headers["access-control-allow-headers"] = (
-                    "Content-Type, Authorization"
-                )
+                out_headers["access-control-allow-headers"] = "Content-Type, Authorization"
                 out_headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
 
-                async def body_iter():
+                # Bind the loop variables explicitly. The return below leaves
+                # the loop immediately, so late binding could not bite here —
+                # but a reader (and the linter) should not have to prove that.
+                async def body_iter(resp=resp, key=key):
                     try:
                         async for chunk in resp.aiter_raw():
                             if await request.is_disconnected():
@@ -497,9 +490,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                         state.end_in_flight(key)
                         await resp.aclose()
 
-                return StreamingResponse(
-                    body_iter(), status_code=status, headers=out_headers
-                )
+                return StreamingResponse(body_iter(), status_code=status, headers=out_headers)
 
             state.end_in_flight(key)
             state.log_cb(f"key[{orig_idx}] HTTP {status}")
@@ -536,5 +527,3 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
         )
 
     return app
-
-

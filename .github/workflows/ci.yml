@@ -55,3 +55,7 @@ jobs:
     
     - name: Run ruff
       run: ruff check openvidia/ tests/
+
+    # A formatter is only useful if CI refuses code that ignores it.
+    - name: Check formatting
+      run: ruff format --check openvidia/ tests/

@@ -43,9 +43,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
     async def index() -> HTMLResponse:
         p = web_dir / "index.html"
         if not p.exists():
-            return HTMLResponse(
-                "<h1>OpenVidia</h1><p>UI not found</p>", status_code=404
-            )
+            return HTMLResponse("<h1>OpenVidia</h1><p>UI not found</p>", status_code=404)
         return HTMLResponse(p.read_text())
 
     @app.get("/styles.css")
@@ -234,14 +232,10 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
                 # (used by the dashboard to show adaptive backoff state).
                 cd_rem = state.cooldown_remaining(k)
                 entry["cooldown"] = round(cd_rem, 1) if cd_rem > 0 else 0
-                entry["cooldown_reason"] = (
-                    state.cooldown_reason(k) if cd_rem > 0 else ""
-                )
+                entry["cooldown_reason"] = state.cooldown_reason(k) if cd_rem > 0 else ""
                 entry["rpm"] = state.key_rpm(k)
                 tracker = state.rpm.get(k)
-                entry["rpm_ceiling"] = (
-                    tracker.max_rpm if tracker and tracker.max_rpm else 28
-                )
+                entry["rpm_ceiling"] = tracker.max_rpm if tracker and tracker.max_rpm else 28
                 ks = state.key_states.get(k)
                 entry["is_valid"] = ks.is_valid if ks else True
                 entry["in_flight"] = ks.in_flight if ks else 0
@@ -314,9 +308,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
     @app.get("/api/model-health")
     async def api_model_health() -> dict:
         """What the proxy has learned about each model from real traffic."""
-        return {
-            m: h.as_dict() for m, h in sorted(state.model_health.items())
-        }
+        return {m: h.as_dict() for m, h in sorted(state.model_health.items())}
 
     # ----------------------------------------------------------------------- #
     # Lifecycle: stop / start / restart
@@ -390,11 +382,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
                     )
                     if r.is_success:
                         d = r.json()
-                        txt = (
-                            d.get("choices", [{}])[0]
-                            .get("message", {})
-                            .get("content", "")
-                        )
+                        txt = d.get("choices", [{}])[0].get("message", {}).get("content", "")
                         return {"ok": True, "model": model_id, "response": txt[:100]}
                     # 400/429 are key/model-level rejections worth surfacing;
                     # everything else is treated as transient and skipped.
@@ -452,7 +440,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
                     try:
                         msg = await asyncio.wait_for(q.get(), timeout=2.0)
                         yield f"data: {json.dumps({'msg': msg})}\n\n"
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         yield ": heartbeat\n\n"
             finally:
                 state.listeners.discard(q)

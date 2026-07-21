@@ -15,12 +15,11 @@ import asyncio
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
 
 from .config import atomic_write
-
 
 # ── Cooldown / RPM constants ──────────────────────────────────────────
 
@@ -32,25 +31,25 @@ RPM_WINDOW = 60.0  # sliding window in seconds
 # 401/403 mean the key is dead — long cooldown, permanent invalidation.
 # 429 respects Retry-After when provided.
 # Adaptive: cooldowns scale with consecutive failures for repeated offenders.
-COOLDOWN_DURATIONS: Dict[int, float] = {
-    400: 60.0,   # Reduced from 120s - faster recovery for transient client errors
+COOLDOWN_DURATIONS: dict[int, float] = {
+    400: 60.0,  # Reduced from 120s - faster recovery for transient client errors
     401: 3600.0,
     403: 3600.0,
-    404: 60.0,   # Reduced from 120s - endpoint issues may resolve quickly
+    404: 60.0,  # Reduced from 120s - endpoint issues may resolve quickly
     429: 120.0,  # Reduced from 180s - adaptive backoff handles repeat offenders
 }
 DEFAULT_COOLDOWN = 30.0
 
 # Adaptive cooldown multiplier: increases cooldown for repeated failures
 ADAPTIVE_COOLDOWN_MULTIPLIER = 1.5  # Each consecutive failure multiplies cooldown by this
-ADAPTIVE_COOLDOWN_MAX = 5.0         # Cap multiplier at this value (max 5x base cooldown)
+ADAPTIVE_COOLDOWN_MAX = 5.0  # Cap multiplier at this value (max 5x base cooldown)
 
 # Adaptive RPM: per-key ceiling is halved on a 429 (jittered backoff) and
 # restored to MAX_RPM on the next success. This prevents the post-cooldown
 # spike that re-triggers 429 the instant a key is revived.
 ADAPTIVE_429_FACTOR = 0.5  # multiply per-key ceiling by this on each 429
-ADAPTIVE_FLOOR_RPM = 8     # never go below this per-key (keeps SOME flow)
-ADAPTIVE_REHAB_STEP = 4    # per-key ceiling growth on each success (until MAX_RPM)
+ADAPTIVE_FLOOR_RPM = 8  # never go below this per-key (keeps SOME flow)
+ADAPTIVE_REHAB_STEP = 4  # per-key ceiling growth on each success (until MAX_RPM)
 
 
 # ── Per-key state ──────────────────────────────────────────────────────
@@ -136,7 +135,7 @@ class RpmTracker:
         ceiling = self.max_rpm if self.max_rpm and self.max_rpm < max_rpm else max_rpm
         return self.count() < ceiling
 
-    def _prune(self, now: Optional[float] = None) -> None:
+    def _prune(self, now: float | None = None) -> None:
         if now is None:
             now = time.time()
         cutoff = now - self.window
@@ -168,15 +167,22 @@ class ModelHealth:
     and say so out loud when a model stops being usable.
     """
 
-    __slots__ = ("requests", "success", "gateway_timeouts", "rate_limited",
-                 "too_slow", "ttfts", "warned_at")
+    __slots__ = (
+        "requests",
+        "success",
+        "gateway_timeouts",
+        "rate_limited",
+        "too_slow",
+        "ttfts",
+        "warned_at",
+    )
 
     def __init__(self):
         self.requests = 0
         self.success = 0
-        self.gateway_timeouts = 0   # 502/503/504: provider gave up on the model
-        self.rate_limited = 0       # 429
-        self.too_slow = 0           # no first byte before our own read timeout
+        self.gateway_timeouts = 0  # 502/503/504: provider gave up on the model
+        self.rate_limited = 0  # 429
+        self.too_slow = 0  # no first byte before our own read timeout
         self.ttfts: deque[float] = deque(maxlen=20)
         self.warned_at = 0.0
 
@@ -219,7 +225,7 @@ class ProxyStats:
         self.success = 0
         self.current_index = current_index
         self.active_key_index: int = current_index
-        self.key_usage: Dict[str, KeyUsage] = {}
+        self.key_usage: dict[str, KeyUsage] = {}
 
     def record_key_usage(self, key: str, ok: bool = True, error: str = "") -> None:
         u = self.key_usage.get(key)
@@ -241,14 +247,14 @@ class ProxyStats:
 class ProxyState:
     def __init__(
         self,
-        keys: List[str],
+        keys: list[str],
         stats: ProxyStats,
         index_path: Path,
         log_cb: Callable[[str], None],
         port: int = 3940,
     ):
-        self._keys: List[str] = list(keys)
-        self._key_states: Dict[str, KeyState] = {k: KeyState(k) for k in keys}
+        self._keys: list[str] = list(keys)
+        self._key_states: dict[str, KeyState] = {k: KeyState(k) for k in keys}
         self._keys_write_lock = threading.Lock()
         self.stats = stats
         self.index_path = index_path
@@ -257,16 +263,16 @@ class ProxyState:
         self.save_lock = asyncio.Lock()
         self.log_buffer: deque = deque(maxlen=500)
         self._log_cb = log_cb
-        self.on_key_failed: Optional[Callable[[str], None]] = None
-        self.active_model: Optional[str] = None
+        self.on_key_failed: Callable[[str], None] | None = None
+        self.active_model: str | None = None
         self.running: bool = True
-        self.health_task: Optional[asyncio.Task] = None
-        self.warm_task: Optional[asyncio.Task] = None
+        self.health_task: asyncio.Task | None = None
+        self.warm_task: asyncio.Task | None = None
 
-        self.cooldowns: Dict[str, KeyCooldown] = {}
-        self.rpm: Dict[str, RpmTracker] = {}
+        self.cooldowns: dict[str, KeyCooldown] = {}
+        self.rpm: dict[str, RpmTracker] = {}
         # Per-model health, learned from real traffic (see ModelHealth).
-        self.model_health: Dict[str, ModelHealth] = {}
+        self.model_health: dict[str, ModelHealth] = {}
 
         try:
             self.loop = asyncio.get_running_loop()
@@ -277,14 +283,14 @@ class ProxyState:
             # (tests, ad-hoc scripts). In a FastAPI worker the running
             # loop branch above already handles the normal path.
             self.loop = asyncio.new_event_loop()
-        self.listeners: Set[asyncio.Queue] = set()
+        self.listeners: set[asyncio.Queue] = set()
 
     @property
-    def keys(self) -> List[str]:
+    def keys(self) -> list[str]:
         return self._keys
 
     @keys.setter
-    def keys(self, new_keys: List[str]) -> None:
+    def keys(self, new_keys: list[str]) -> None:
         with self._keys_write_lock:
             updated_states = {}
             for k in new_keys:
@@ -296,7 +302,7 @@ class ProxyState:
             self._key_states = updated_states
 
     @property
-    def key_states(self) -> Dict[str, KeyState]:
+    def key_states(self) -> dict[str, KeyState]:
         with self._keys_write_lock:
             return dict(self._key_states)
 
@@ -323,17 +329,18 @@ class ProxyState:
         cd = self.cooldowns.get(key)
         return cd.reason if cd is not None else ""
 
-    def set_cooldown(
-        self, key: str, reason: str = "", duration: float = DEFAULT_COOLDOWN
-    ) -> None:
+    def set_cooldown(self, key: str, reason: str = "", duration: float = DEFAULT_COOLDOWN) -> None:
         self.cooldowns[key] = KeyCooldown(until=time.time() + duration, reason=reason)
 
     def clear_cooldown(self, key: str) -> None:
         self.cooldowns.pop(key, None)
 
     def mark_key_failed(
-        self, key: str, status: int = 0, retry_after: Optional[str] = None, 
-                        error_body: Optional[str] = None
+        self,
+        key: str,
+        status: int = 0,
+        retry_after: str | None = None,
+        error_body: str | None = None,
     ) -> None:
         """Record a failed attempt, set cooldown, and (on 429) tighten RPM.
 
@@ -343,11 +350,11 @@ class ProxyState:
         ceiling down and slowly restore it on the next success — exactly how
         a well-behaved client backs off without surrendering throughput
         forever.
-        
+
         Adaptive Cooldown: Consecutive failures increase cooldown duration
         using exponential backoff with a cap, preventing hammering of failing
         endpoints while allowing faster recovery for transient errors.
-        
+
         Detailed Error Logging: HTTP status codes and error bodies are logged
         for debugging 400/404/500 errors.
         """
@@ -374,11 +381,9 @@ class ProxyState:
                 # is stable per-key across runs.
                 import random
 
-                _r = random.Random(
-                    int(time.time()) ^ (hash(key) & 0xFFFFFFFF)
-                )
+                _r = random.Random(int(time.time()) ^ (hash(key) & 0xFFFFFFFF))
                 base_duration = COOLDOWN_DURATIONS[429] + _r.uniform(0.0, 30.0)
-            
+
             # Apply adaptive multiplier based on consecutive failures.
             # ``ks`` is None for a key that is no longer in _key_states (the
             # account manager can swap keys while a request is in flight);
@@ -395,10 +400,10 @@ class ProxyState:
             reason = f"429 rate-limited (cooldown {duration:.0f}s, attempt {failures})"
             if error_body:
                 reason += f" - {error_body[:50]}"
-            
+
             # Log detailed 429 info
             self.log_cb(f"⚠ key[{self._keys.index(key) if key in self._keys else '?'}] {reason}")
-            
+
             # Tighten the per-key RPM ceiling: if current was MAX_RPM, drop
             # it by ADAPTIVE_429_FACTOR (default 0.5) but never below
             # ADAPTIVE_FLOOR_RPM. This prevents the post-cooldown spike that
@@ -414,10 +419,14 @@ class ProxyState:
             base_duration = COOLDOWN_DURATIONS[status]
             # Apply adaptive multiplier for repeated failures (except auth errors)
             if status not in (401, 403) and ks is not None and ks.consecutive_failures > 1:
-                multiplier = min(ADAPTIVE_COOLDOWN_MULTIPLIER ** (ks.consecutive_failures - 1), 
-                               ADAPTIVE_COOLDOWN_MAX)
+                multiplier = min(
+                    ADAPTIVE_COOLDOWN_MULTIPLIER ** (ks.consecutive_failures - 1),
+                    ADAPTIVE_COOLDOWN_MAX,
+                )
                 duration = base_duration * multiplier
-                reason = f"{error_details} (cooldown {duration:.0f}s, attempt {ks.consecutive_failures})"
+                reason = (
+                    f"{error_details} (cooldown {duration:.0f}s, attempt {ks.consecutive_failures})"
+                )
             else:
                 duration = base_duration
                 reason = f"{error_details} (cooldown {duration:.0f}s)"
@@ -482,7 +491,7 @@ class ProxyState:
         *,
         ok: bool = False,
         status: int = 0,
-        ttft: Optional[float] = None,
+        ttft: float | None = None,
         too_slow: bool = False,
     ) -> None:
         """Score one attempt against a model and warn when it stops working."""
@@ -584,7 +593,7 @@ class ProxyState:
             if not self.key_can_send_rpm(key):
                 continue
             cost = (
-                (ks.in_flight * 4)   # in-flight dominates: drains fast on completion
+                (ks.in_flight * 4)  # in-flight dominates: drains fast on completion
                 + self.key_rpm(key)  # then recent rpm
                 + ks.consecutive_failures * 8  # deprioritize flaky keys
             )
@@ -593,7 +602,7 @@ class ProxyState:
                 best_idx = self._keys.index(key)
         return best_idx
 
-    def get_candidate_keys(self) -> List[tuple[int, str]]:
+    def get_candidate_keys(self) -> list[tuple[int, str]]:
         """
         Return ``(index, key)`` candidates for the current request, ordered by
         **least-loaded-first** (in-flight + recent RPM) instead of naive
@@ -605,7 +614,7 @@ class ProxyState:
         by cost, with cooldown keys appended last as a degraded fallback.
         """
         scored: list[tuple[float, int, str]] = []
-        cooldown: List[tuple[int, str, float]] = []
+        cooldown: list[tuple[int, str, float]] = []
 
         for idx, key in enumerate(self._keys):
             ks = self._key_states.get(key)
@@ -614,11 +623,7 @@ class ProxyState:
             if self.is_key_on_cooldown(key):
                 cooldown.append((idx, key, self.cooldown_remaining(key)))
                 continue
-            cost = (
-                (ks.in_flight * 4)
-                + self.key_rpm(key)
-                + ks.consecutive_failures * 8
-            )
+            cost = (ks.in_flight * 4) + self.key_rpm(key) + ks.consecutive_failures * 8
             scored.append((cost, idx, key))
 
         scored.sort(key=lambda x: (x[0], x[1]))

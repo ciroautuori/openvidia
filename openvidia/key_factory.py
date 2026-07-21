@@ -12,9 +12,9 @@ and optionally delete an old one. Runs headless Chromium via Playwright.
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from playwright.sync_api import sync_playwright, Page, BrowserContext
+from playwright.sync_api import BrowserContext, Page, sync_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ TIMEOUT = 30_000  # ms
 # ── Cookie helpers (legacy) ──────────────────────────────────────────
 
 
-def _cookies_from_json(raw: str) -> List[Dict[str, Any]]:
+def _cookies_from_json(raw: str) -> list[dict[str, Any]]:
     data = json.loads(raw)
     if isinstance(data, dict):
         data = [data]
@@ -69,7 +69,7 @@ def _browser():
     return p, b, ctx
 
 
-def _browser_chrome_channel(user_data_dir: Optional[str] = None):
+def _browser_chrome_channel(user_data_dir: str | None = None):
     """
     Launch Playwright connected to system Chrome with an optional isolated profile.
 
@@ -113,7 +113,7 @@ def _page(ctx: BrowserContext) -> Page:
 # ── Login flow ──────────────────────────────────────────────────────
 
 
-def login_generate_key(email: str, password: str, old_key: Optional[str] = None) -> str:
+def login_generate_key(email: str, password: str, old_key: str | None = None) -> str:
     """
     Launch headless Chromium, log into build.nvidia.com with *email* /
     *password*, navigate to API keys, generate a fresh key.
@@ -124,7 +124,7 @@ def login_generate_key(email: str, password: str, old_key: Optional[str] = None)
     """
     pw, browser, ctx = _browser()
     page = _page(ctx)
-    new_key: Optional[str] = None
+    new_key: str | None = None
 
     try:
         _login(page, email, password)
@@ -218,8 +218,8 @@ def _fill_and_next(page: Page, value: str):
 
 
 def chrome_channel_generate_key(
-    old_key: Optional[str] = None,
-    user_data_dir: Optional[str] = None,
+    old_key: str | None = None,
+    user_data_dir: str | None = None,
 ) -> str:
     """
     Generate API key using system Chrome with an optional isolated profile.
@@ -232,7 +232,7 @@ def chrome_channel_generate_key(
     """
     pw, browser, ctx = _browser_chrome_channel(user_data_dir)
     page = _page(ctx)
-    new_key: Optional[str] = None
+    new_key: str | None = None
     is_persistent = user_data_dir is not None
 
     try:
@@ -270,7 +270,7 @@ def chrome_channel_generate_key(
 
 
 def generate_key(
-    cookie_json: str, old_key: Optional[str] = None, email: str = "", password: str = ""
+    cookie_json: str, old_key: str | None = None, email: str = "", password: str = ""
 ) -> str:
     """Generate API key — cookies first, fallback to email+password login.
 
@@ -282,7 +282,7 @@ def generate_key(
     cookies = _cookies_from_json(cookie_json) if cookie_json else []
     pw, browser, ctx = _browser()
     page = _page(ctx)
-    new_key: Optional[str] = None
+    new_key: str | None = None
 
     try:
         if cookies:
@@ -361,8 +361,7 @@ def _do_generate(page: Page) -> str:
         key_input.wait_for(state="visible", timeout=TIMEOUT)
     except Exception:
         key_text = page.locator(
-            "[class*='keyValue'], [class*='key-display'], "
-            "[data-testid*='key-value'], text=nvapi-"
+            "[class*='keyValue'], [class*='key-display'], [data-testid*='key-value'], text=nvapi-"
         ).first
         key_text.wait_for(state="visible", timeout=5000)
         raw = key_text.text_content() or ""
@@ -408,8 +407,7 @@ def _do_delete(page: Page, old_key: str) -> bool:
     time.sleep(0.5)
 
     confirm = page.locator(
-        "button:has-text('Confirm'), button:has-text('Yes'), "
-        "button:has-text('Delete'):visible"
+        "button:has-text('Confirm'), button:has-text('Yes'), button:has-text('Delete'):visible"
     ).first
     try:
         confirm.wait_for(state="visible", timeout=5000)

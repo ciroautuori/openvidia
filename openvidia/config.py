@@ -6,7 +6,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import List
 
 
 def config_dir() -> Path:
@@ -60,8 +59,6 @@ def httpx_timeout_kwargs() -> dict:
     """Just the keys ``httpx.Timeout`` accepts."""
     t = upstream_timeouts()
     return {k: t[k] for k in _HTTPX_TIMEOUT_KEYS}
-
-
 
 
 # ── Thinking / reasoning toggle ────────────────────────────────────────
@@ -122,9 +119,9 @@ def apply_model_options(payload: dict) -> dict:
         return payload
     opts = model_options()
     model = payload.get("model") or ""
-    mode = (opts.get("per_model") or {}).get(model, {}).get(
-        "thinking"
-    ) or opts.get("thinking", "auto")
+    mode = (opts.get("per_model") or {}).get(model, {}).get("thinking") or opts.get(
+        "thinking", "auto"
+    )
     if mode == "off":
         extra = opts.get("thinking_off_payload") or {}
     elif mode == "on":
@@ -153,7 +150,7 @@ def lock_path() -> Path:
     return config_dir() / "singleton.lock"
 
 
-def load_saved_keys_file() -> List[str]:
+def load_saved_keys_file() -> list[str]:
     p = config_path()
     try:
         return json.loads(p.read_text())
@@ -168,25 +165,26 @@ def atomic_write(path: Path, content: str) -> None:
     tmp.rename(path)
 
 
-def save_keys_file(keys: List[str], create_backup: bool = True) -> None:
+def save_keys_file(keys: list[str], create_backup: bool = True) -> None:
     """Save keys with optional automatic backup.
-    
+
     Args:
         keys: List of API keys to save
         create_backup: Whether to create a backup before writing
     """
-    
+
     content = json.dumps(keys, indent=2)
     cfg_path = config_path()
-    
+
     if create_backup and cfg_path.exists():
         # Create backup before writing
         try:
             from .safe_file import create_backup as make_backup
+
             make_backup(cfg_path)
         except Exception:
             pass  # Backup is optional, continue with write
-    
+
     atomic_write(cfg_path, content)
 
 

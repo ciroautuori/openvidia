@@ -166,3 +166,15 @@ See [SECURITY.md](SECURITY.md) for more details.
 **Thank you for contributing to OpenVidia!** 🎉
 
 Every contribution, no matter how small, helps make this project better.
+
+## Before you commit
+
+```bash
+uv sync                    # installs dev tooling too
+uv run pre-commit install  # once: hooks run on every commit
+uv run pytest              # the suite is fast, run it
+```
+
+`ruff check` and `ruff format --check` gate every pull request, so the hook
+saves you a round trip. Style is automated on purpose — review time is for
+behaviour, not whitespace.

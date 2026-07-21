@@ -20,16 +20,15 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Any, AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any
 
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-
 from . import config
 from .proxy_state import ProxyState
-
 
 # ── Bounded rotation + saturation fast-fail ─────────────────────────────
 # Codex CLI blocks historically when /v1/responses rotated serially across
@@ -44,9 +43,9 @@ from .proxy_state import ProxyState
 # the key that happened to carry the request.
 _GATEWAY_TIMEOUTS = {502, 503, 504}
 
-_MAX_ROTATE_ATTEMPTS = 5          # hard cap on sends per model phase
+_MAX_ROTATE_ATTEMPTS = 5  # hard cap on sends per model phase
 _ROTATE_SEND_TIMEOUT = httpx.Timeout(**config.httpx_timeout_kwargs())
-_MIN_LIVE_FRACTION = 0.2          # <20% of valid keys live → 503 fast
+_MIN_LIVE_FRACTION = 0.2  # <20% of valid keys live → 503 fast
 
 
 # A reasoning model withholds its first byte until it has finished thinking —
@@ -66,21 +65,30 @@ async def _keepalive_until(task, result_box: list):
     while True:
         try:
             result_box.append(
-                await asyncio.wait_for(
-                    asyncio.shield(task), timeout=_KEEPALIVE_INTERVAL
-                )
+                await asyncio.wait_for(asyncio.shield(task), timeout=_KEEPALIVE_INTERVAL)
             )
             return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             yield _KEEPALIVE_BYTES
         except Exception:  # noqa: BLE001 — surfaced to the caller via the box
             result_box.append((None, None, None))
             return
 
 
-async def _rotation_phase(client, upstream, payload, headers_factory,
-                          state, candidates, *, max_attempts, timeout,
-                          stream, log_tag, seen_429_box):
+async def _rotation_phase(
+    client,
+    upstream,
+    payload,
+    headers_factory,
+    state,
+    candidates,
+    *,
+    max_attempts,
+    timeout,
+    stream,
+    log_tag,
+    seen_429_box,
+):
     """Single bounded rotation phase. Returns (resp_or_None, used_key, used_idx)."""
     attempts = 0
     for idx, k in candidates:
@@ -101,7 +109,9 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
         _model = payload.get("model", "")
         _t0 = time.monotonic()
         try:
-            req = client.build_request("POST", upstream, json=payload, headers=hdrs, timeout=timeout)
+            req = client.build_request(
+                "POST", upstream, json=payload, headers=hdrs, timeout=timeout
+            )
             resp = await client.send(req, stream=stream)
         except httpx.ReadTimeout:
             # The key connected and the upstream ACCEPTED the request — it is
@@ -140,7 +150,7 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
         error_body = ""
         try:
             error_body = await resp.aread()
-            error_body = error_body.decode('utf-8', errors='replace')[:500]
+            error_body = error_body.decode("utf-8", errors="replace")[:500]
         except Exception:
             pass
         await resp.aclose()
@@ -174,10 +184,11 @@ def _live_pool_snapshot(state, candidates):
     to skip rotation and go to model-fallback / 503 instead of serially
     hammering the few surviving keys.
     """
-    live = sum(1 for _, k in candidates if state.key_can_send_rpm(k) and not state.is_key_on_cooldown(k))
+    live = sum(
+        1 for _, k in candidates if state.key_can_send_rpm(k) and not state.is_key_on_cooldown(k)
+    )
     total_pool = len(state.keys)
     return live, total_pool
-
 
 
 # ── Defensive sanitization of chat/completions messages ────────────────
@@ -308,9 +319,7 @@ def _input_to_messages(input_data: Any) -> list[dict]:
             if isinstance(content, list):
                 # Codex uses type="input_text"; OpenAI standard uses type="text".
                 text_parts = [
-                    p.get("text", "")
-                    for p in content
-                    if p.get("type") in ("text", "input_text")
+                    p.get("text", "") for p in content if p.get("type") in ("text", "input_text")
                 ]
                 content = "\n".join(text_parts)
             messages.append({"role": role, "content": content})
@@ -321,9 +330,7 @@ def _input_to_messages(input_data: Any) -> list[dict]:
             output = item.get("output", "")
             if isinstance(output, dict):
                 output = json.dumps(output)
-            messages.append(
-                {"role": "tool", "tool_call_id": call_id, "content": str(output)}
-            )
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": str(output)})
 
         elif typ == "function_call":
             # A function call from a previous turn — reconstruct as an
@@ -406,6 +413,7 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
     # the NVIDIA default — never forward "openvidia/openvidia" to NVIDIA.
     # No hardcoded model: resolved live from the user's selection.
     from .proxy_app import default_model
+
     effective_model = model_override or default_model()
 
     payload: dict[str, Any] = {
@@ -628,15 +636,25 @@ async def _stream_responses(
     else:
 
         def _hdr(k, idx):
-            return {"Authorization": f"Bearer {k}", "Content-Type": "application/json", "User-Agent": "openvidia/2.0"}
+            return {
+                "Authorization": f"Bearer {k}",
+                "Content-Type": "application/json",
+                "User-Agent": "openvidia/2.0",
+            }
 
         _box: list = []
         _task = asyncio.ensure_future(
             _rotation_phase(
-                client, upstream, chat_payload, _hdr, state, candidates,
+                client,
+                upstream,
+                chat_payload,
+                _hdr,
+                state,
+                candidates,
                 max_attempts=_MAX_ROTATE_ATTEMPTS,
                 timeout=_ROTATE_SEND_TIMEOUT,
-                stream=True, log_tag="responses shim",
+                stream=True,
+                log_tag="responses shim",
                 seen_429_box=[False],
             )
         )
@@ -811,7 +829,7 @@ async def _stream_responses(
                         },
                     },
                 )
-            for idx, tcm in tool_calls_map.items():
+            for tcm in tool_calls_map.values():
                 yield _sse_event(
                     "response.function_call_arguments.done",
                     {
@@ -971,26 +989,37 @@ async def handle_responses(
     # candidates with the 120s client default → Codex block).
     _live, _valid = _live_pool_snapshot(state, candidates)
     if _valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION)):
-        state.log_cb(
-            f"  responses shim: pool saturated ({_live}/{_valid} live) → 503 fast"
-        )
+        state.log_cb(f"  responses shim: pool saturated ({_live}/{_valid} live) → 503 fast")
     else:
 
         def _hdr(k, idx):
-            return {"Authorization": f"Bearer {k}", "Content-Type": "application/json", "User-Agent": "openvidia/2.0"}
+            return {
+                "Authorization": f"Bearer {k}",
+                "Content-Type": "application/json",
+                "User-Agent": "openvidia/2.0",
+            }
 
         resp, used_key, used_idx = await _rotation_phase(
-            client, upstream, chat_payload, _hdr, state, candidates,
+            client,
+            upstream,
+            chat_payload,
+            _hdr,
+            state,
+            candidates,
             max_attempts=_MAX_ROTATE_ATTEMPTS,
             timeout=_ROTATE_SEND_TIMEOUT,
-            stream=False, log_tag="responses shim",
+            stream=False,
+            log_tag="responses shim",
             seen_429_box=[False],
         )
         if used_idx is not None and isinstance(resp, httpx.Response):
             await resp.aread()
 
     if resp is None or used_key is None:
-        return JSONResponse({"error": "all keys failed (pool saturated)" if _live else "all keys failed"}, status_code=503)
+        return JSONResponse(
+            {"error": "all keys failed (pool saturated)" if _live else "all keys failed"},
+            status_code=503,
+        )
 
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)
@@ -1002,7 +1031,5 @@ async def handle_responses(
     await resp.aclose()
     state.end_in_flight(used_key)  # release the load-balancer claim
 
-    responses_data = _chat_response_to_responses(
-        chat_data, model_override or chat_payload["model"]
-    )
+    responses_data = _chat_response_to_responses(chat_data, model_override or chat_payload["model"])
     return JSONResponse(responses_data)

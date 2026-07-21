@@ -27,7 +27,6 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ _UUID_RE = re.compile(
 )
 
 
-def read_ws_url() -> Optional[str]:
+def read_ws_url() -> str | None:
     """Read Chrome DevToolsActivePort and build WebSocket URL.
 
     Tries multiple paths:
@@ -83,9 +82,7 @@ async def _send(ws, msg: dict):
     await ws.send(json.dumps(msg))
 
 
-async def _eval(
-    ws, sid: str, expr: str, msg_id: int = 100, timeout_sec: float = 10
-) -> Optional[dict]:
+async def _eval(ws, sid: str, expr: str, msg_id: int = 100, timeout_sec: float = 10) -> dict | None:
     """Runtime.evaluate. Returns the ``result`` dict or None."""
     await _send(
         ws,
@@ -105,7 +102,7 @@ async def _eval(
     while time.time() < deadline:
         try:
             msg = await _recv(ws, timeout=3)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
         if msg.get("id") == msg_id:
             result = msg.get("result", {}).get("result", {})
@@ -116,9 +113,7 @@ async def _eval(
     return None
 
 
-async def _eval_val(
-    ws, sid: str, expr: str, msg_id: int = 100, timeout_sec: float = 10
-) -> any:
+async def _eval_val(ws, sid: str, expr: str, msg_id: int = 100, timeout_sec: float = 10) -> any:
     r = await _eval(ws, sid, expr, msg_id=msg_id, timeout_sec=timeout_sec)
     return r.get("value") if r else None
 
@@ -152,13 +147,11 @@ async def list_targets(ws_url: str, retries: int = 3) -> list:
 
     for attempt in range(retries):
         try:
-            async with websockets.connect(
-                ws_url, max_size=2**24, open_timeout=10
-            ) as ws:
+            async with websockets.connect(ws_url, max_size=2**24, open_timeout=10) as ws:
                 await _send(ws, {"id": 1, "method": "Target.getTargets"})
                 resp = await _recv(ws)
                 return resp.get("result", {}).get("targetInfos", [])
-        except (OSError, asyncio.TimeoutError, websockets.InvalidStatus) as e:
+        except (TimeoutError, OSError, websockets.InvalidStatus) as e:
             if attempt < retries - 1:
                 logger.warning(
                     "CDP connect attempt %d/%d failed: %s — retrying",
@@ -172,7 +165,7 @@ async def list_targets(ws_url: str, retries: int = 3) -> list:
     return []
 
 
-async def attach_and_get_sid(ws, target_id: str, timeout: float = 8) -> Optional[str]:
+async def attach_and_get_sid(ws, target_id: str, timeout: float = 8) -> str | None:
     """
     Attach to a page target with flatten=True from an already-open connection.
     Returns sessionId.
@@ -189,7 +182,7 @@ async def attach_and_get_sid(ws, target_id: str, timeout: float = 8) -> Optional
     while time.time() < deadline:
         try:
             msg = await _recv(ws, timeout=3)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             break
         if msg.get("method") == "Target.attachedToTarget":
             return msg.get("params", {}).get("sessionId", "")
@@ -221,9 +214,7 @@ async def is_authenticated(ws, sid: str) -> bool:
 # ── Key generation ─────────────────────────────────────────────────
 
 
-async def generate_one_key(
-    ws, sid: str, ws_url: str, key_name: str = ""
-) -> Optional[str]:
+async def generate_one_key(ws, sid: str, ws_url: str, key_name: str = "") -> str | None:
     """
     Generate one API key on an already-attached, authenticated page.
     Uses the same WebSocket connection throughout (sid stays valid).
@@ -331,10 +322,10 @@ async def generate_one_key(
 
 async def generate_for_all(
     ws_url: str,
-    accounts: List[dict],
+    accounts: list[dict],
     max_per_account: int = 1,
     timeout_per_context: float = 25,
-) -> List[Tuple[str, str, bool]]:
+) -> list[tuple[str, str, bool]]:
     """
     Iterate all authenticated build.nvidia.com tabs across all browser
     contexts and generate keys. Uses a single CDP connection per context.
@@ -344,9 +335,7 @@ async def generate_for_all(
 
     targets = await list_targets(ws_url)
     nv_pages = [
-        t
-        for t in targets
-        if t.get("type") == "page" and "build.nvidia.com" in t.get("url", "")
+        t for t in targets if t.get("type") == "page" and "build.nvidia.com" in t.get("url", "")
     ]
 
     if not nv_pages:
@@ -371,7 +360,7 @@ async def generate_for_all(
                 timeout=timeout_per_context,
             )
             results.extend(result)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             results.append((f"ctx_{ctx_id[:8]}", "Timed out", False))
 
     return results

@@ -10,8 +10,8 @@ don't fail proxy startup on hosts with IPv6 off.
 
 import asyncio
 import socket as socket_mod
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, List, Optional
 
 import uvicorn
 
@@ -22,8 +22,8 @@ from .proxy_state import ProxyState, ProxyStats
 class ProxyServer:
     def __init__(
         self,
-        servers: List[uvicorn.Server],
-        tasks: List[asyncio.Task],
+        servers: list[uvicorn.Server],
+        tasks: list[asyncio.Task],
         state: ProxyState,
     ):
         self._servers = servers
@@ -36,11 +36,11 @@ class ProxyServer:
         for t in self._tasks:
             try:
                 await asyncio.wait_for(t, timeout=2.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 t.cancel()
 
 
-def _bind(family: int, host: str, port: int) -> Optional[socket_mod.socket]:
+def _bind(family: int, host: str, port: int) -> socket_mod.socket | None:
     try:
         sock = socket_mod.socket(family, socket_mod.SOCK_STREAM)
     except OSError:
@@ -58,16 +58,14 @@ def _bind(family: int, host: str, port: int) -> Optional[socket_mod.socket]:
 
 async def start(
     port: int,
-    keys: List[str],
+    keys: list[str],
     log_cb: Callable[[str], None],
     stats: ProxyStats,
     index_path: Path,
-    web_dir: Optional[Path] = None,
+    web_dir: Path | None = None,
     initial_model: str = "",
 ) -> ProxyServer:
-    state = ProxyState(
-        keys=keys, stats=stats, index_path=index_path, log_cb=log_cb, port=port
-    )
+    state = ProxyState(keys=keys, stats=stats, index_path=index_path, log_cb=log_cb, port=port)
     if initial_model:
         state.active_model = initial_model
     app = create_app(state, web_dir=web_dir)
@@ -80,8 +78,8 @@ async def start(
 
     v6_sock = _bind(socket_mod.AF_INET6, "::1", port)
 
-    servers: List[uvicorn.Server] = []
-    tasks: List[asyncio.Task] = []
+    servers: list[uvicorn.Server] = []
+    tasks: list[asyncio.Task] = []
     socks = [v4_sock]
     if v6_sock is not None:
         socks.append(v6_sock)

@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any
 
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
-
 
 from .proxy_state import ProxyState
 
@@ -168,9 +168,7 @@ def _anthropic_to_chat_messages(body: dict) -> list[dict]:
     if system:
         if isinstance(system, list):
             # Anthropic system may be an array of {type:"text", text:"..."}.
-            system = "\n".join(
-                b.get("text", "") for b in system if b.get("type") == "text"
-            )
+            system = "\n".join(b.get("text", "") for b in system if b.get("type") == "text")
         if system:
             messages.append({"role": "system", "content": system})
 
@@ -286,9 +284,7 @@ def _anthropic_tools_to_chat_tools(tools: list[dict]) -> list[dict]:
                 "function": {
                     "name": name,
                     "description": tool.get("description", ""),
-                    "parameters": tool.get(
-                        "input_schema", {"type": "object", "properties": {}}
-                    ),
+                    "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
                 },
             }
         )
@@ -302,6 +298,7 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
     # model_override (from state.active_model) takes precedence.
     # No hardcoded model: resolved live from the user's selection.
     from .proxy_app import default_model
+
     effective_model = model_override or default_model()
 
     payload: dict[str, Any] = {
@@ -345,6 +342,7 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
     payload["messages"] = _sanitize_chat_messages(payload["messages"])
     # Dashboard thinking toggle — never overrides what the client asked for.
     from . import config as _cfg
+
     _cfg.apply_model_options(payload)
     return payload
 
@@ -468,23 +466,18 @@ async def _stream_anthropic(
         # responses_shim.py for why the load balancer needs this.
         state.begin_in_flight(k)
         try:
-            req = client.build_request(
-                "POST", UPSTREAM, json=chat_payload, headers=hdrs
-            )
+            req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
             resp = await client.send(req, stream=True)
         except httpx.ReadTimeout:
             # Slow model, not a bad key — see responses_shim._rotation_phase.
             state.log_cb(
-                f"  anthropic shim: key[{idx}] no first byte — model too slow, "
-                f"not a key fault"
+                f"  anthropic shim: key[{idx}] no first byte — model too slow, not a key fault"
             )
             state.end_in_flight(k)
             break
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
-            state.log_cb(
-                f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)"
-            )
+            state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
             state.end_in_flight(k)
             state.mark_key_failed(k)
             continue
@@ -649,7 +642,7 @@ async def _stream_anthropic(
                     },
                 )
             # Close tool blocks.
-            for idx, tcm in tool_map.items():
+            for tcm in tool_map.values():
                 yield _sse_event(
                     "content_block_stop",
                     {
@@ -697,7 +690,7 @@ async def _stream_anthropic(
                 "index": text_block_index,
             },
         )
-    for idx, tcm in tool_map.items():
+    for tcm in tool_map.values():
         yield _sse_event(
             "content_block_stop",
             {
@@ -760,9 +753,7 @@ async def handle_anthropic_messages(
         if isinstance(b, dict) and b.get("type") == "image"
     )
     if n_img:
-        state.log_cb(
-            f"  ⚠ anthropic: {n_img} immagine/i omessa/e (NVIDIA NIM no-vision)"
-        )
+        state.log_cb(f"  ⚠ anthropic: {n_img} immagine/i omessa/e (NVIDIA NIM no-vision)")
 
     model_override = state.active_model
     chat_payload = _build_chat_payload(body, model_override)
@@ -819,22 +810,17 @@ async def handle_anthropic_messages(
             "User-Agent": "openvidia/2.0",
         }
         try:
-            req = client.build_request(
-                "POST", UPSTREAM, json=chat_payload, headers=hdrs
-            )
+            req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
             resp = await client.send(req)
         except httpx.ReadTimeout:
             # Slow model, not a bad key — see responses_shim._rotation_phase.
             state.log_cb(
-                f"  anthropic shim: key[{idx}] no answer in time — model too slow, "
-                f"not a key fault"
+                f"  anthropic shim: key[{idx}] no answer in time — model too slow, not a key fault"
             )
             break
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
-            state.log_cb(
-                f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)"
-            )
+            state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
             state.mark_key_failed(k)
             continue
         if resp.status_code == 200:
@@ -879,7 +865,5 @@ async def handle_anthropic_messages(
     chat_data = resp.json()
     await resp.aclose()
 
-    anthropic_data = _chat_to_anthropic_response(
-        chat_data, model_override or chat_payload["model"]
-    )
+    anthropic_data = _chat_to_anthropic_response(chat_data, model_override or chat_payload["model"])
     return JSONResponse(anthropic_data)

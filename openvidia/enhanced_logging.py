@@ -6,7 +6,6 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from . import config
 
@@ -16,7 +15,7 @@ class EnhancedLogger:
 
     def __init__(
         self,
-        log_dir: Optional[Path] = None,
+        log_dir: Path | None = None,
         debug: bool = False,
         persist: bool = True,
         max_lines: int = 10000,
@@ -24,9 +23,9 @@ class EnhancedLogger:
         self.debug = debug
         self.persist = persist
         self.max_lines = max_lines
-        self.log_file: Optional[Path] = None
-        self._file_handler: Optional[logging.FileHandler] = None
-        self._console_handler: Optional[logging.StreamHandler] = None
+        self.log_file: Path | None = None
+        self._file_handler: logging.FileHandler | None = None
+        self._console_handler: logging.StreamHandler | None = None
         self._logger = logging.getLogger("openvidia")
         self._logger.setLevel(logging.DEBUG if debug else logging.INFO)
         self._logger.handlers = []
@@ -67,6 +66,7 @@ class EnhancedLogger:
         """Format message with optional structured data."""
         if kwargs:
             import json
+
             extra = json.dumps(kwargs, default=str)
             return f"{msg} | {extra}"
         return msg
@@ -106,7 +106,7 @@ class EnhancedLogger:
 
 
 # Global logger instance (lazy init)
-_logger: Optional[EnhancedLogger] = None
+_logger: EnhancedLogger | None = None
 
 
 def get_logger(debug: bool = False, persist: bool = True) -> EnhancedLogger:

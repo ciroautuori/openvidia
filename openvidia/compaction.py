@@ -27,7 +27,7 @@ import hashlib
 import json
 import re
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import httpx
 
@@ -142,15 +142,13 @@ def _load_learned() -> dict[str, int]:
             p = _limits_path()
             if p.exists():
                 data = json.loads(p.read_text())
-                _learned_limits.update(
-                    {str(k): int(v) for k, v in data.items() if int(v) > 0}
-                )
+                _learned_limits.update({str(k): int(v) for k, v in data.items() if int(v) > 0})
         except (json.JSONDecodeError, OSError, TypeError, ValueError):
             pass
     return _learned_limits
 
 
-def note_context_limit(model: str, body: str) -> Optional[int]:
+def note_context_limit(model: str, body: str) -> int | None:
     """Record the window stated in an upstream error body, if any.
 
     Passive counterpart to the probe: whenever a real request overflows, the
@@ -319,9 +317,7 @@ def _render_for_summary(messages: list[dict], msg_cap: int, total_cap: int) -> s
     return out
 
 
-_CONV_KEY_PREFIX_MSGS = (
-    4  # initial messages of `rest` used for the conversation identity
-)
+_CONV_KEY_PREFIX_MSGS = 4  # initial messages of `rest` used for the conversation identity
 
 
 def _conv_key(system_block: list[dict], rest: list[dict]) -> str:
@@ -388,7 +384,7 @@ async def _summarize(
     client,
     keys: list[str],
     model: str,
-    prev_summary: Optional[str],
+    prev_summary: str | None,
     new_msgs: list[dict],
     max_tokens: int,
     *,
@@ -470,9 +466,7 @@ async def _summarize(
         finally:
             await resp.aclose()
 
-        txt = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get(
-            "content"
-        ) or ""
+        txt = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content") or ""
         if not txt.strip():
             last_err = "summarize empty"
             continue
@@ -482,9 +476,7 @@ async def _summarize(
     raise RuntimeError((last_err or "summarize: all keys failed") + suffix)
 
 
-def _trim(
-    system_block: list[dict], rest: list[dict], budget: int, keep_recent: int
-) -> list[dict]:
+def _trim(system_block: list[dict], rest: list[dict], budget: int, keep_recent: int) -> list[dict]:
     """Deterministic fallback: keep system + first msg + as many recent as fit.
 
     GUARANTEE: the returned message list never exceeds ``budget`` tokens.
@@ -531,9 +523,7 @@ def _summary_block(summary: str) -> dict:
     return {"role": "system", "content": "Previous conversation summary:\n" + summary}
 
 
-def _split_point(
-    system_block: list[dict], rest: list[dict], target: int, reserve: int
-) -> int:
+def _split_point(system_block: list[dict], rest: list[dict], target: int, reserve: int) -> int:
     """How many trailing messages to keep verbatim.
 
     Fills the target with the largest recent suffix that fits, leaving room
@@ -583,9 +573,7 @@ def _assemble(
 
 def _healthy_keys(state) -> tuple[list[str], int]:
     """Healthy + RPM-eligible keys, least-busy first."""
-    keys = [
-        k for k in state.keys if state.is_key_healthy(k) and state.key_can_send_rpm(k)
-    ]
+    keys = [k for k in state.keys if state.is_key_healthy(k) and state.key_can_send_rpm(k)]
     try:  # least-RPM-first: land the summary on the quietest key, not key[0]
         keys.sort(key=state.key_rpm)
     except (AttributeError, TypeError):
@@ -601,7 +589,7 @@ def _start_summarize(
     client,
     keys: list[str],
     model: str,
-    base: Optional[str],
+    base: str | None,
     new_msgs: list[dict],
     cfg: dict,
     log: Callable[[str], None],
@@ -681,9 +669,7 @@ async def maybe_compact(
         keys, _ = _healthy_keys(state)
         if keys:
             _probing.add(active)
-            asyncio.ensure_future(
-                _probe_context_window(client, keys[0], active, log)
-            )
+            asyncio.ensure_future(_probe_context_window(client, keys[0], active, log))
     budget = max(_resolve_budget(cfg, active) - reserved, reserved)
     if estimate_tokens(messages) <= budget:
         return messages
@@ -768,7 +754,7 @@ async def maybe_compact(
         # survive to populate the cache for the next turn.
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=deadline)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log(
                 f"⧉ compaction: summarize still running (>{deadline:.0f}s) "
                 f"→ serving now, summary lands next turn"

@@ -253,9 +253,7 @@ def _setup_codex():
 
     changed = False
     needs_model = not re.search(r'^model\s*=\s*"openvidia"', content, re.MULTILINE)
-    needs_provider = not re.search(
-        r'^model_provider\s*=\s*"openvidia"', content, re.MULTILINE
-    )
+    needs_provider = not re.search(r'^model_provider\s*=\s*"openvidia"', content, re.MULTILINE)
     needs_block = "[model_providers.openvidia]" not in content
 
     if needs_model or needs_provider or needs_block:
@@ -269,22 +267,20 @@ def _setup_codex():
             stripped = line.strip()
 
             # Skip old model= / model_provider= lines so they get overwritten
-            if stripped.startswith("model ") or stripped.startswith("model="):
-                if not model_set:
-                    new_lines.append('model = "openvidia"')
-                    model_set = True
-                    if needs_model:
-                        changed = True
-                    continue
-            if stripped.startswith("model_provider ") or stripped.startswith(
-                "model_provider="
-            ):
-                if not provider_set:
-                    new_lines.append('model_provider = "openvidia"')
-                    provider_set = True
-                    if needs_provider:
-                        changed = True
-                    continue
+            if (stripped.startswith("model ") or stripped.startswith("model=")) and not model_set:
+                new_lines.append('model = "openvidia"')
+                model_set = True
+                if needs_model:
+                    changed = True
+                continue
+            if (
+                stripped.startswith("model_provider ") or stripped.startswith("model_provider=")
+            ) and not provider_set:
+                new_lines.append('model_provider = "openvidia"')
+                provider_set = True
+                if needs_provider:
+                    changed = True
+                continue
 
             # Skip the old [model_providers.openvidia] block if present
             if stripped == "[model_providers.openvidia]":
@@ -347,14 +343,14 @@ def _setup_grok():
         print("✓ Grok CLI already configured")
         return True
 
-    block = """
+    block = f"""
 # Provider custom: openvidia (NVIDIA NIM multi-key proxy)
 [model.openvidia]
 api_key = "ignored"
 base_url = "http://localhost:{PORT}/v1"
 api_backend = "chat_completions"
 context_window = 128000
-""".format(PORT=PORT)
+"""
 
     lines = content.splitlines()
     new_lines = []
@@ -374,23 +370,20 @@ context_window = 128000
             in_models_section = False
 
         # Replace the default model inside the [models] section
-        if in_models_section and (
-            stripped.startswith("default ") or stripped.startswith("default=")
+        if (
+            in_models_section
+            and (stripped.startswith("default ") or stripped.startswith("default="))
+            and not default_set
         ):
-            if not default_set:
-                new_lines.append('default = "openvidia"')
-                default_set = True
-                continue
+            new_lines.append('default = "openvidia"')
+            default_set = True
+            continue
 
         # Skip the old [model.openvidia] block
         if stripped == "[model.openvidia]":
             skip_old_openvidia = True
             continue
-        if (
-            skip_old_openvidia
-            and stripped.startswith("[")
-            and stripped != "[model.openvidia]"
-        ):
+        if skip_old_openvidia and stripped.startswith("[") and stripped != "[model.openvidia]":
             skip_old_openvidia = False
         if skip_old_openvidia:
             continue
@@ -607,7 +600,7 @@ def _create_tray(icon_path: str, window, port: int):
 
     from PyQt6.QtCore import QCoreApplication
     from PyQt6.QtGui import QAction, QIcon
-    from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
+    from PyQt6.QtWidgets import QMenu, QSystemTrayIcon
 
     app = QCoreApplication.instance()
     if app is None:
