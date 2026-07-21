@@ -13,6 +13,8 @@ from openvidia.proxy_state import (
     RpmTracker,
     KeyCooldown,
     MAX_RPM,
+    COOLDOWN_DURATIONS,
+    ADAPTIVE_COOLDOWN_MAX,
 )
 from openvidia.compaction import (
     estimate_tokens,
@@ -204,22 +206,42 @@ class TestProxyStateCooldown:
         assert "429" in proxy_state.cooldown_reason(key)
 
     def test_cooldown_duration_by_status(self, proxy_state):
-        """Test different status codes get different cooldown durations."""
-        key = proxy_state.keys[0]
-        
-        # Test 401/403 (long cooldown - invalid key)
-        proxy_state.mark_key_failed(key, status=401)
-        assert proxy_state.cooldown_remaining(key) > 3500  # ~3600s
-        
-        # Clear and test 429 (medium cooldown)
-        proxy_state.clear_cooldown(key)
-        proxy_state.mark_key_failed(key, status=429)
-        assert 150 < proxy_state.cooldown_remaining(key) < 220
-        
-        # Clear and test 400 (short cooldown)
-        proxy_state.clear_cooldown(key)
-        proxy_state.mark_key_failed(key, status=400)
-        assert 100 < proxy_state.cooldown_remaining(key) < 150
+        """Different status codes get different cooldown durations.
+
+        One key per status on purpose. Reusing a single key made this test
+        measure the ADAPTIVE multiplier (which keys consecutive_failures, and
+        which clear_cooldown does not reset) on top of the base duration, so
+        the assertion bounds only held for part of the jitter range — it
+        failed roughly one run in five.
+        """
+        k401, k429, k400 = proxy_state.keys[0], proxy_state.keys[1], proxy_state.keys[2]
+
+        proxy_state.mark_key_failed(k401, status=401)
+        assert proxy_state.cooldown_remaining(k401) > 3500  # ~3600s
+
+        # 429: base + up to 30s of per-key jitter, no adaptive multiplier on
+        # the first failure.
+        proxy_state.mark_key_failed(k429, status=429)
+        base_429 = COOLDOWN_DURATIONS[429]
+        assert base_429 - 1 < proxy_state.cooldown_remaining(k429) <= base_429 + 30
+
+        proxy_state.mark_key_failed(k400, status=400)
+        base_400 = COOLDOWN_DURATIONS[400]
+        assert base_400 - 1 < proxy_state.cooldown_remaining(k400) <= base_400
+
+    def test_adaptive_cooldown_grows_with_consecutive_failures(self, proxy_state):
+        """Repeat offenders back off harder, up to the cap."""
+        first, second = proxy_state.keys[0], proxy_state.keys[1]
+
+        proxy_state.mark_key_failed(first, status=400)
+        one_failure = proxy_state.cooldown_remaining(first)
+
+        for _ in range(3):
+            proxy_state.mark_key_failed(second, status=400)
+        three_failures = proxy_state.cooldown_remaining(second)
+
+        assert three_failures > one_failure
+        assert three_failures <= COOLDOWN_DURATIONS[400] * ADAPTIVE_COOLDOWN_MAX
 
     def test_clear_cooldown(self, proxy_state):
         """Test clearing a cooldown."""
@@ -740,3 +762,19 @@ class TestEdgeCases:
         tracker.record()  # Should prune old entry
         
         assert tracker.count() == 1
+
+
+class TestMarkKeyFailedUnknownKey:
+    """mark_key_failed must survive a key that is no longer in _key_states.
+
+    The account manager can swap keys while a request is in flight. An
+    AttributeError raised from the error-handling path takes the request down
+    with it — the one place that must never throw.
+    """
+
+    def test_429_for_unknown_key_does_not_raise(self, proxy_state):
+        proxy_state.mark_key_failed("nvapi-not-in-the-pool", status=429)
+
+    def test_other_statuses_for_unknown_key_do_not_raise(self, proxy_state):
+        for status in (0, 400, 401, 404, 500):
+            proxy_state.mark_key_failed("nvapi-not-in-the-pool", status=status)

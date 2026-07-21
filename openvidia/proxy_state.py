@@ -31,14 +31,19 @@ RPM_WINDOW = 60.0  # sliding window in seconds
 # 400/404 are deterministic errors, not key faults — short cooldown, no rotation.
 # 401/403 mean the key is dead — long cooldown, permanent invalidation.
 # 429 respects Retry-After when provided.
+# Adaptive: cooldowns scale with consecutive failures for repeated offenders.
 COOLDOWN_DURATIONS: Dict[int, float] = {
-    400: 120.0,
+    400: 60.0,   # Reduced from 120s - faster recovery for transient client errors
     401: 3600.0,
     403: 3600.0,
-    404: 120.0,
-    429: 180.0,
+    404: 60.0,   # Reduced from 120s - endpoint issues may resolve quickly
+    429: 120.0,  # Reduced from 180s - adaptive backoff handles repeat offenders
 }
 DEFAULT_COOLDOWN = 30.0
+
+# Adaptive cooldown multiplier: increases cooldown for repeated failures
+ADAPTIVE_COOLDOWN_MULTIPLIER = 1.5  # Each consecutive failure multiplies cooldown by this
+ADAPTIVE_COOLDOWN_MAX = 5.0         # Cap multiplier at this value (max 5x base cooldown)
 
 # Adaptive RPM: per-key ceiling is halved on a 429 (jittered backoff) and
 # restored to MAX_RPM on the next success. This prevents the post-cooldown
@@ -271,7 +276,8 @@ class ProxyState:
         self.cooldowns.pop(key, None)
 
     def mark_key_failed(
-        self, key: str, status: int = 0, retry_after: Optional[str] = None
+        self, key: str, status: int = 0, retry_after: Optional[str] = None, 
+                        error_body: Optional[str] = None
     ) -> None:
         """Record a failed attempt, set cooldown, and (on 429) tighten RPM.
 
@@ -281,30 +287,62 @@ class ProxyState:
         ceiling down and slowly restore it on the next success — exactly how
         a well-behaved client backs off without surrendering throughput
         forever.
+        
+        Adaptive Cooldown: Consecutive failures increase cooldown duration
+        using exponential backoff with a cap, preventing hammering of failing
+        endpoints while allowing faster recovery for transient errors.
+        
+        Detailed Error Logging: HTTP status codes and error bodies are logged
+        for debugging 400/404/500 errors.
         """
         ks = self._key_states.get(key)
         if ks is not None:
             ks.last_failure_at = time.time()
             ks.consecutive_failures = (ks.consecutive_failures or 0) + 1
 
+        # Build detailed error message for logging
+        error_details = f"HTTP {status}" if status else "connection error"
+        if error_body:
+            error_details += f" (body: {error_body[:100]})"  # Truncate long bodies
+
         if status == 429:
             if retry_after:
                 try:
-                    duration = float(retry_after)
+                    base_duration = float(retry_after)
                 except (ValueError, TypeError):
-                    duration = COOLDOWN_DURATIONS[429]
+                    base_duration = COOLDOWN_DURATIONS[429]
             else:
                 # Jittered backoff: avoids thundering herd when several keys
                 # 429 simultaneously and then all wake up in unison. Base
-                # 180s plus up to 30s jitter, seeded by key so the distribution
+                # 120s plus up to 30s jitter, seeded by key so the distribution
                 # is stable per-key across runs.
                 import random
 
                 _r = random.Random(
                     int(time.time()) ^ (hash(key) & 0xFFFFFFFF)
                 )
-                duration = COOLDOWN_DURATIONS[429] + _r.uniform(0.0, 30.0)
-            reason = f"429 rate-limited (cooldown {duration:.0f}s)"
+                base_duration = COOLDOWN_DURATIONS[429] + _r.uniform(0.0, 30.0)
+            
+            # Apply adaptive multiplier based on consecutive failures.
+            # ``ks`` is None for a key that is no longer in _key_states (the
+            # account manager can swap keys while a request is in flight);
+            # the guard above already allows for it, so this branch must too
+            # or an AttributeError escapes from the error-handling path and
+            # takes the request down with it.
+            failures = ks.consecutive_failures if ks is not None else 1
+            multiplier = min(
+                ADAPTIVE_COOLDOWN_MULTIPLIER ** (failures - 1),
+                ADAPTIVE_COOLDOWN_MAX,
+            )
+            duration = base_duration * multiplier
+
+            reason = f"429 rate-limited (cooldown {duration:.0f}s, attempt {failures})"
+            if error_body:
+                reason += f" - {error_body[:50]}"
+            
+            # Log detailed 429 info
+            self.log_cb(f"⚠ key[{self._keys.index(key) if key in self._keys else '?'}] {reason}")
+            
             # Tighten the per-key RPM ceiling: if current was MAX_RPM, drop
             # it by ADAPTIVE_429_FACTOR (default 0.5) but never below
             # ADAPTIVE_FLOOR_RPM. This prevents the post-cooldown spike that
@@ -317,19 +355,35 @@ class ProxyState:
                     int(ceil * ADAPTIVE_429_FACTOR),
                 )
         elif status in COOLDOWN_DURATIONS:
-            duration = COOLDOWN_DURATIONS[status]
-            reason = f"HTTP {status} (cooldown {duration:.0f}s)"
+            base_duration = COOLDOWN_DURATIONS[status]
+            # Apply adaptive multiplier for repeated failures (except auth errors)
+            if status not in (401, 403) and ks is not None and ks.consecutive_failures > 1:
+                multiplier = min(ADAPTIVE_COOLDOWN_MULTIPLIER ** (ks.consecutive_failures - 1), 
+                               ADAPTIVE_COOLDOWN_MAX)
+                duration = base_duration * multiplier
+                reason = f"{error_details} (cooldown {duration:.0f}s, attempt {ks.consecutive_failures})"
+            else:
+                duration = base_duration
+                reason = f"{error_details} (cooldown {duration:.0f}s)"
         else:
             duration = DEFAULT_COOLDOWN
-            reason = f"HTTP {status}" if status else "connection error"
+            reason = error_details
 
         self.set_cooldown(key, reason=reason, duration=duration)
+
+        # Log detailed error information for debugging
+        if status in (400, 404, 500, 502, 503):
+            log_prefix = "⧉ error" if status >= 500 else "⚠ error"
+            key_idx = self._keys.index(key) if key in self._keys else "?"
+            self.log_cb(f"{log_prefix}: key[{key_idx}] {reason}")
+            if error_body:
+                self.log_cb(f"  └─ Response body: {error_body[:200]}")
 
         if status in (401, 403):
             if ks is not None:
                 ks.is_valid = False
-                ks.last_error = f"HTTP {status}"
-            self.log_cb(f"⚠ key marked INVALID (HTTP {status})")
+                ks.last_error = error_details
+            self.log_cb(f"⚠ key marked INVALID ({error_details})")
         elif status in (400, 404, 429):
             if ks is not None:
                 ks.cooldown_until = time.time() + duration
