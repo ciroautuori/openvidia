@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Thinking toggle** — `auto` / `on` / `off` next to the active model. A
+  hybrid reasoning model emits nothing while it thinks, which is the
+  difference between a 2s and a 160s first token. Per-model, stored
+  server-side so every CLI picks it up. The flag's *name* lives in
+  `model_options.json`, not in code: a future model that wants
+  `reasoning_effort` instead needs a config edit, not a release
+- **Context windows are learned, not configured** — the proxy asks the
+  provider once, caches the answer in `model_limits.json`, and also harvests
+  it from any real overflow error. A model added by the provider tomorrow
+  runs at full context with no configuration
+- **Per-model health from live traffic** (`/api/model-health`) — success
+  rate, median time to first token, gateway timeouts and 429s, measured from
+  requests that were happening anyway. When a model degrades the Activity log
+  names the cause and says it is the provider struggling, not your keys
 - `model_budgets` guidance in the README: NVIDIA NIM does not advertise a
   context window, but an oversized request answers with the exact number
 - `inline_deadline` — an upper bound on how long a client waits for
@@ -36,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Test suite uses pytest with async support
 
 ### Removed
+- **The pinned default model.** `DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"`
+  was the last hardcoded model name in the codebase — a liability the day the
+  provider retires it, and a silent override of what you selected. The model
+  is now resolved live: active selection → first starred preset → an error
+  saying none is selected
 - **Preset-based model fallback.** A request for a model that failed on every
   key was silently retried on the next starred model, so output could come
   from a model you did not choose without the response saying so. The selected
@@ -43,6 +62,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   naming it. ★ Starred presets remain a quick-switch shortlist.
 
 ### Fixed
+- **Closing the desktop window killed the proxy.** The window's `closed` event
+  stopped the proxy even with a tray icon present, so every dashboard control
+  went dead at once — Start, Stop and the model switch all POST to an API that
+  was no longer answering. With a tray, the window is a view onto a background
+  service: closing it hides the view
+- **The Codex and Claude Code paths never joined the key load balancer.** Only
+  the catch-all claimed a key before sending, so concurrent requests through
+  the shims scored the whole pool at zero, tie-broke on index, and piled onto
+  key[0] — a 26-key pool with 713 RPM of headroom producing 429s while 25 keys
+  idled
+- **502/503/504 no longer cool a key down.** A gateway timeout is the provider
+  giving up on a slow model; every key hits the same wall, and charging it to
+  the key that carried the request empties the pool one timeout at a time
+- **The installer reported failure on a successful install.** It slept 3
+  seconds and probed once, while startup pre-warms every key and takes tens of
+  seconds. It now polls until healthy, gives up if the launcher dies, and
+  exits non-zero with the command to see the error. It also no longer `pkill`s
+  by pattern — the app frees its own port
 - **A slow model took the whole key pool down with it.** The 30s upstream read
   timeout is the wait for the *first byte*, and a reasoning model emits nothing
   while it thinks (measured: `z-ai/glm-5.2` at 117-162s to first token, at any

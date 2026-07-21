@@ -368,6 +368,7 @@ update-desktop-database ~/.local/share/applications/
 | **Stats** | Request count, success rate, rotations, cooldown counter |
 | **Keys** | Per-key status (Active filter default), live cooldown countdown, RPM, success/fail, freshness dots, add/remove/copy |
 | **Models** | Single list — filters: **★ Starred** (default; your quick-switch shortlist) · All · Popular. Search, test ▶, star/unstar. Active model highlighted and pinned to top. |
+| **Thinking** | `auto` / `on` / `off` next to the active model — a hybrid reasoning model emits nothing while it thinks |
 | **Activity** | Real-time SSE log stream with color-coded levels |
 | **CLI Setup** | Copy-paste config for opencode / Codex / Claude / Grok |
 
@@ -403,6 +404,8 @@ update-desktop-database ~/.local/share/applications/
 | `index` | Key rotation index |
 | `compaction.json` | Auto-compaction tuning (optional — see [Auto-Compaction](#auto-compaction)) |
 | `timeouts.json` | Upstream timeouts (optional — see [Slow models](#slow-models)) |
+| `model_limits.json` | Context windows the proxy learned by itself — never edit by hand |
+| `model_options.json` | Reasoning toggle + the payload used to express it (see [Thinking](#thinking-reasoning-toggle)) |
 | `accounts.json` | Legacy accounts (auto-extracted to keys.json) |
 
 Add keys via the dashboard (**Keys** section) or edit `keys.json`:
@@ -410,6 +413,70 @@ Add keys via the dashboard (**Keys** section) or edit `keys.json`:
 ```json
 ["nvapi-xxx", "nvapi-yyy", "..."]
 ```
+
+### Thinking (reasoning toggle)
+
+A hybrid reasoning model emits **nothing at all** while it thinks. That is the
+whole difference between a 2-second and a 160-second first token, and it is
+not something you can see from the outside — the socket just sits there.
+
+Three buttons next to the active model in the dashboard: `auto` (send nothing,
+let the model decide), `on`, `off`. The setting is per-model and stored
+server-side, so all four CLIs pick it up without touching their own configs.
+
+The **parameter name is configuration, not code**. Providers spell this flag
+differently and rename it every model generation, so `model_options.json`
+carries the payload to merge:
+
+```json
+{
+  "thinking": "auto",
+  "thinking_off_payload": { "chat_template_kwargs": { "thinking": false } },
+  "thinking_on_payload":  { "chat_template_kwargs": { "thinking": true } },
+  "per_model": { "vendor/model": { "thinking": "off" } }
+}
+```
+
+A future model that wants `{"reasoning_effort": "none"}` instead needs an edit
+here, not a release. The merge only fills what the client did not set, at
+every level of nesting: a CLI that spells the parameter out in its own request
+has made an explicit choice and wins.
+
+---
+
+### Context windows are learned, not configured
+
+A model the proxy has never seen must reach full context with **zero**
+configuration — providers add models continuously, and a hand-maintained
+budget table means every new model runs silently truncated until someone
+notices.
+
+NVIDIA does not advertise the window on `/v1/models`, but it states it exactly
+when a request exceeds it:
+
+```
+This model's maximum context length is 202752 tokens.
+However, your messages resulted in 320011 tokens.
+```
+
+So the proxy asks once, in the background, caches the answer in
+`model_limits.json`, and also harvests it from any real overflow. Precedence:
+your `model_budgets` override → learned → the conservative default. An unknown
+model is never allowed to overflow while it is being learned.
+
+The day your provider ships a new flagship, you select it and it runs at full
+context. Nothing to configure.
+
+---
+
+### No pinned model
+
+There is no `DEFAULT_MODEL` constant. The model a request runs on is resolved
+live: your active selection, then the first starred preset, otherwise an error
+saying no model is selected. A hardcoded model name is a liability the day the
+provider retires it, and it silently overrides what you picked.
+
+---
 
 ### Slow models
 
@@ -486,6 +553,8 @@ DEFAULT_COOLDOWN = 30.0   # Network errors, unknown 5xx
 | `POST` | `/api/keys/remove` | Remove a key |
 | `GET/POST` | `/api/model` | Get/set active model override |
 | `GET/POST` | `/api/presets` | Get/save model presets |
+| `GET/POST` | `/api/thinking` | Get/set the reasoning mode of the active model (`auto` / `on` / `off`) |
+| `GET` | `/api/model-health` | What the proxy learned from live traffic: per-model success rate, median time to first token, gateway timeouts, 429s |
 | `POST` | `/api/test-model` | Test a model directly (bypasses override) |
 | `POST` | `/api/stop` | Stop proxy (returns 503 to clients) |
 | `POST` | `/api/start` | Resume proxy |

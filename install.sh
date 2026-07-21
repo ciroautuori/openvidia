@@ -48,15 +48,37 @@ fi
 
 # ── 4. Start and verify ─────────────────────────
 echo "▶ Starting proxy + desktop app..."
-pkill -f "python.*-m openvidia" 2>/dev/null || true
+# No pkill: it matches by pattern (so it can hit unrelated processes), it does
+# not catch the launcher wrapper, and it never checks whether anything died.
+# The app frees port 1919 itself on startup, escalating if the previous
+# instance ignores the polite request.
 nohup "${RUN[@]}" > /dev/null 2>&1 &
-sleep 3
-if curl -s http://localhost:1919/health >/dev/null 2>&1; then
-    KEYS=$(curl -s http://localhost:1919/health | python3 -c "import sys,json; print(json.load(sys.stdin).get('keys','?'))" 2>/dev/null || echo "?")
+LAUNCHER=$!
+
+# Poll instead of sleeping. Startup pre-warms every key, which takes tens of
+# seconds on a large pool — a fixed `sleep 3` reported failure on a perfectly
+# good install.
+DEADLINE=$((SECONDS + 60))
+READY=""
+while [ $SECONDS -lt $DEADLINE ]; do
+    if curl -s --max-time 3 http://localhost:1919/health >/dev/null 2>&1; then
+        READY=1
+        break
+    fi
+    if ! kill -0 "$LAUNCHER" 2>/dev/null; then
+        break   # launcher exited — no point waiting out the deadline
+    fi
+    sleep 1
+done
+
+if [ -n "$READY" ]; then
+    KEYS=$(curl -s --max-time 5 http://localhost:1919/health | python3 -c "import sys,json; print(json.load(sys.stdin).get('keys','?'))" 2>/dev/null || echo "?")
     echo "  ✓ Proxy active — $KEYS keys on http://localhost:1919"
     echo "  ✓ Desktop app opened"
 else
-    echo "  ⚠ Proxy not yet active — check: ${RUN[*]} foreground"
+    echo "  ✗ Proxy did not come up. See the error with:"
+    echo "      ${RUN[*]} foreground"
+    exit 1
 fi
 echo ""
 
