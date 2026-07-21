@@ -69,11 +69,18 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
         if resp.status_code == 200:
             return resp, k, idx
         err_status = resp.status_code
+        # Read error body for detailed logging before closing
+        error_body = ""
+        try:
+            error_body = await resp.aread()
+            error_body = error_body.decode('utf-8', errors='replace')[:500]
+        except Exception:
+            pass
         await resp.aclose()
         state.log_cb(f"  {log_tag}: key[{idx}] HTTP {err_status}")
         if err_status == 429:
             seen_429_box[0] = True
-        state.mark_key_failed(k, status=err_status)
+        state.mark_key_failed(k, status=err_status, error_body=error_body if error_body else None)
     return None, None, None
 
 
