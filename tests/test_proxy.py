@@ -23,6 +23,7 @@ from openvidia.compaction import (
     _trim,
     _settings,
 )
+from openvidia.compaction import _model_budgets
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -597,8 +598,36 @@ class TestCompactionTrim:
         trimmed = _trim(system, rest, budget, keep_recent)
         
         tokens = estimate_tokens(trimmed)
-        # Should be within budget (with some margin for estimation error)
-        assert tokens <= budget * 1.2
+        # MUST respect the budget strictly — the upstream depends on this
+        # guarantee to avoid 400 context overflow.
+        assert tokens <= budget
+
+    def test_trim_never_exceeds_budget_pathological_head(self):
+        """A single head message larger than budget must not overflow."""
+        system = [{"role": "system", "content": "S" * 400_000}]
+        rest = [{"role": "user", "content": "Y" * 100} for _ in range(5)]
+        trimmed = _trim(system, rest, 92_000, 2)
+        assert estimate_tokens(trimmed) <= 92_000
+
+    def test_trim_never_exceeds_budget_pathological_messages(self):
+        """Every message larger than budget must not overflow."""
+        rest = [{"role": "user", "content": "Z" * 400_000} for _ in range(10)]
+        trimmed = _trim([], rest, 92_000, 8)
+        assert estimate_tokens(trimmed) <= 92_000
+
+    def test_trim_steamed_state_under_budget(self):
+        """Trim steady-state must sit below the trigger to avoid loops."""
+        rest = [{"role": "user", "content": "x" * 900} for _ in range(430)]
+        trimmed = _trim([], rest, 92_000, 8)
+        assert estimate_tokens(trimmed) <= 92_000
+
+    def test_no_hardcoded_model_budget(self):
+        """Per-model budgets come from compaction.json, never hardcoded."""
+        assert _model_budgets(_settings()) == {} or isinstance(
+            _model_budgets(_settings()), dict
+        )
+        cfg = {**_settings(), "model_budgets": {"z-ai/glm-5.2": 120_000}}
+        assert _model_budgets(cfg).get("z-ai/glm-5.2") == 120_000
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -612,9 +641,10 @@ class TestCompactionSettings:
         settings = _settings()
         
         assert settings["enabled"] is True
-        assert settings["budget_tokens"] == 100_000
+        assert settings["budget_tokens"] == 80_000
         assert settings["keep_recent"] == 8
         assert settings["summary_max_tokens"] == 1024
+        assert settings["summary_model"] == ""
 
 
 # ─────────────────────────────────────────────────────────────────────

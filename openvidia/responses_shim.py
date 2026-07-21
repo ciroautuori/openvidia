@@ -319,7 +319,9 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
 
     # model_override (from state.active_model) takes precedence; otherwise use
     # the NVIDIA default — never forward "openvidia/openvidia" to NVIDIA.
-    effective_model = model_override or "deepseek-ai/deepseek-v4-pro"
+    # No hardcoded model here — DEFAULT_MODEL is the single source of truth.
+    from .proxy_app import DEFAULT_MODEL
+    effective_model = model_override or DEFAULT_MODEL
 
     payload: dict[str, Any] = {
         "model": effective_model,

@@ -553,7 +553,13 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
 
 
 def _get_fallback_model(state: ProxyState, failed_model: str) -> Optional[str]:
-    """Find the next preset model after the one that just failed all keys."""
+    """Find the next preset model after the one that just failed all keys.
+
+    Pure data: reads the user's starred presets (``presets.json``). No
+    model/provider name is hardcoded here — the fallback chain is entirely
+    user-driven. ``DEFAULT_MODEL`` is only the last-resort alias when no
+    active model is selected at all.
+    """
     from . import config
 
     try:

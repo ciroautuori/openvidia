@@ -22,15 +22,22 @@ UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 _DEFAULTS = {
     "enabled": True,
-    "budget_tokens": 100_000,  # default activation threshold (~4 chars/token)
+    # Activation threshold (~4 chars/token). Below this token count we
+    # forward untouched. Keep a comfortable margin BELOW the model context
+    # window so a few new turns don't retrigger compaction every turn and
+    # create the "summarize-fail→trim→still-over→retry" loop that starves
+    # Codex/opencode. 80k is conservative for 128k-window NIM models.
+    "budget_tokens": 80_000,
     "keep_recent": 8,  # final messages kept verbatim
     "summary_max_tokens": 1024,  # cap on summarized output
-    "reserved_tokens": 8000,  # generation headroom reserved from budget
+    # Generation headroom reserved from budget. Combined with budget_tokens
+    # this yields the effective activation point: budget - reserved.
+    "reserved_tokens": 8000,
     # Summarization NEVER uses the hot streamed model the client is hammering
     # (Codex/whatever); it uses a server-local "quiet" model so a compaction
     # request competes for keys on a DIFFERENT traffic stream, never the same.
-    # Set to "" to fall back to state.active_model (legacy, NOT recommended).
-    "summary_model": "deepseek-ai/deepseek-v4-pro",
+    # Set to "" to fall back to DEFAULT_MODEL (the single source of truth).
+    "summary_model": "",
     # Hard cap on summarize attempts: if the pool is saturated we must NOT
     # serially try all 25 keys with a 30s timeout on each (= 12 min block).
     # After this many rotate-attempts we bail to deterministic trim.
@@ -44,17 +51,25 @@ _DEFAULTS = {
     "min_healthy_fraction": 0.25,
 }
 
-# Per-model context budget override (tokens). NVIDIA NIM context windows vary:
-# most NIM chat models expose 128k, but some (e.g. small/legacy) are 32k.
-# Override here only when you know the real limit; otherwise the
-# ``budget_tokens`` default applies.
-_MODEL_BUDGETS = {
-    "deepseek-ai/deepseek-v4-pro": 120_000,
-    "meta-llama/llama-3.3-70b-instruct": 120_000,
-    "nvidia/llama-3.1-nemotron-70b-instruct": 120_000,
-    "qwen/qwen2.5-7b-instruct": 30_000,
-    "mistralai/mixtral-8x7b-instruct-v0.1": 30_000,
-}
+# ── Dynamic per-model context budgets ──────────────────────────────────
+# DYNAMIC MODEL BUDGETS — no hardcoded per-model context windows.
+# NVIDIA NIM does NOT advertise a context_window/max_tokens field on
+# /v1/models, so we cannot read it live. Instead, every model gets the
+# generic ``budget_tokens`` default unless the user explicitly overrides a
+# specific model in compaction.json via the ``model_budgets`` map, e.g.:
+#     {"model_budgets": {"z-ai/glm-5.2": 120000, "qwen/...": 32000}}
+# This is the only place where per-model knowledge lives — runtime code
+# never hardcodes a provider/model name. The proxy is provider-agnostic.
+_model_budget_cache: dict[str, int] = {}
+
+
+def _model_budgets(cfg: dict) -> dict[str, int]:
+    """User-supplied per-model budget overrides from compaction.json (dynamic)."""
+    overrides = cfg.get("model_budgets") or {}
+    if overrides != _model_budget_cache:
+        _model_budget_cache.clear()
+        _model_budget_cache.update(overrides)
+    return _model_budget_cache
 
 
 def _settings() -> dict:
@@ -245,18 +260,52 @@ async def _summarize(
 def _trim(
     system_block: list[dict], rest: list[dict], budget: int, keep_recent: int
 ) -> list[dict]:
-    """Deterministic fallback: keep system + first msg + as many recent as fit."""
+    """Deterministic fallback: keep system + first msg + as many recent as fit.
+
+    GUARANTEE: the returned message list NEVER exceeds ``budget`` tokens
+    (estimation may be rough, but the post-condition holds by construction
+    because we stop adding once ``keep_recent`` is satisfied AND the next
+    message would overflow). If even the system + head + 1 recent message
+    overflow the budget, drop further recent messages rather than emit a
+    payload the upstream will 400.
+    """
     head = rest[:1]
     total = estimate_tokens(system_block + head)
+    notice = {"role": "system", "content": "[previous messages omitted to fit context]"}
+    notice_tokens = estimate_tokens([notice])
+    # Reserve room for the separator notice so headroom is accurate.
+    reserve = notice_tokens
     tail: list[dict] = []
     for m in reversed(rest[1:]):
         t = estimate_tokens([m])
-        if total + t > budget and len(tail) >= keep_recent:
+        # Refuse to add a message that would overflow once the notice and
+        # tail are accounted for. Once keep_recent is satisfied we stop
+        # eagerly; before that we keep messages that fit.
+        if total + reserve + t > budget and len(tail) >= keep_recent:
             break
+        if total + reserve + t > budget:
+            continue
         tail.insert(0, m)
         total += t
-    notice = {"role": "system", "content": "[previous messages omitted to fit context]"}
-    return system_block + head + [notice] + tail
+    # Final safety net: drop tail from the front until fit; if tail is
+    # empty and head alone still overflows (pathological single huge head),
+    # drop the head too rather than ship a guaranteed upstream 400. A
+    # shard of the overflowing head is better than an unconditional 400.
+    while tail and estimate_tokens(system_block + head + [notice] + tail) > budget:
+        tail.pop(0)
+    result = system_block + head + [notice] + tail
+    if estimate_tokens(result) > budget:
+        result = system_block + [notice] + tail
+    if estimate_tokens(result) > budget:
+        while tail and estimate_tokens(system_block + [notice] + tail) > budget:
+            tail.pop(0)
+    if estimate_tokens(result) > budget and tail:
+        tail = []
+        result = system_block + [notice]
+    if estimate_tokens(result) > budget:
+        # System block itself overflows: keep the notice only.
+        result = [notice]
+    return result
 
 
 async def maybe_compact(
@@ -269,9 +318,11 @@ async def maybe_compact(
     cfg = _settings()
     if not cfg["enabled"] or not isinstance(messages, list) or len(messages) < 4:
         return messages
-    # Per-model context budget − reserved generation headroom.
+    # Per-model context budget − reserved generation headroom. Per-model
+    # override comes from the user compaction.json ``model_budgets`` map
+    # (dynamic, no hardcoded provider names). Falls back to budget_tokens.
     reserved = cfg.get("reserved_tokens", _DEFAULTS["reserved_tokens"])
-    model_budget = _MODEL_BUDGETS.get(
+    model_budget = _model_budgets(cfg).get(
         state.active_model or "", cfg["budget_tokens"]
     )
     budget = max(model_budget - reserved, reserved)
@@ -315,7 +366,11 @@ async def maybe_compact(
     # streamed model the client is saturating (e.g. z-ai/glm-5.2 being
     # hammered by Codex). Using the same model would compete with the very
     # requests that triggered compaction and burn the only available RPM.
-    summary_model = cfg.get("summary_model") or "deepseek-ai/deepseek-v4-pro"
+    # No hardcoded model here — DEFAULT_MODEL is the single source of truth.
+    # Empty string in compaction.json means: use state.active_model (legacy,
+    # NOT recommended — competes with the hot lane).
+    from .proxy_app import DEFAULT_MODEL
+    summary_model = cfg.get("summary_model") or DEFAULT_MODEL
     # Gather all healthy+rate-feasible keys so _summarize can rotate on 429.
     # Least-RPM-first lets summarization land on the least busy key, not key[0].
     candidate_keys = [

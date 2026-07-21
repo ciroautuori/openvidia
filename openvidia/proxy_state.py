@@ -210,7 +210,12 @@ class ProxyState:
         try:
             self.loop = asyncio.get_running_loop()
         except RuntimeError:
-            self.loop = asyncio.get_event_loop()
+            # Python 3.14 removed the implicit "create if missing"
+            # behavior of get_event_loop; fall back to a new short-lived
+            # loop so ProxyState can be constructed outside a running loop
+            # (tests, ad-hoc scripts). In a FastAPI worker the running
+            # loop branch above already handles the normal path.
+            self.loop = asyncio.new_event_loop()
         self.listeners: Set[asyncio.Queue] = set()
 
     @property
