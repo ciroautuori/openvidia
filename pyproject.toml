@@ -29,11 +29,28 @@ classifiers = [
 [project.optional-dependencies]
 auto-regen = ["playwright>=1.40", "websockets>=12.0"]
 
+# Contributor tooling: `uv sync` installs these automatically, so a fresh
+# clone can run `uv run pytest` without hunting for the right packages.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
 [project.scripts]
 openvidia = "openvidia.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["openvidia*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+# Pin the fixture loop scope: left unset, pytest-asyncio picks a default that
+# changes between releases and leaks event loops across test modules.
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error::RuntimeWarning"]
 
 [build-system]
 requires = ["setuptools>=77.0"]

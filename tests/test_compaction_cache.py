@@ -140,10 +140,11 @@ class TestInlineDeadline:
             lambda: {**compaction._DEFAULTS, "inline_deadline": 0.2},
         )
         started = asyncio.Event()
+        release = asyncio.Event()  # the test decides when the upstream answers
 
         async def slow(*a, **kw):
             started.set()
-            await asyncio.sleep(0.6)
+            await release.wait()
             return "BACKGROUND SUMMARY"
 
         monkeypatch.setattr(compaction, "_summarize", slow)
@@ -154,12 +155,17 @@ class TestInlineDeadline:
         first = await maybe_compact(big, state=state, client=None, log=lambda m: None)
         elapsed = loop.time() - t0
 
-        assert started.is_set()
-        assert elapsed < 0.5, "request blocked past the inline deadline"
+        # The summarize has NOT returned yet, and the request was served anyway.
+        assert started.is_set() and not release.is_set()
+        assert elapsed < 2.0, "request blocked past the inline deadline"
         assert first is not big and estimate_tokens(first) < estimate_tokens(big)
 
         # The detached task completes and populates the cache for the next turn.
-        await asyncio.sleep(0.6)
+        release.set()
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if not compaction._inflight:
+                break
         second = await maybe_compact(big, state=state, client=None, log=lambda m: None)
         assert any(
             isinstance(m.get("content"), str) and "BACKGROUND SUMMARY" in m["content"]

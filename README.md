@@ -271,41 +271,66 @@ Before forwarding a request, if the estimated history exceeds a token budget, Op
 ```
 history > budget?
     │
-    ├─ Summarize  → fold old messages into a dense summary via ONE upstream call.
-    │               Roll-forward cache: each turn summarizes only the *new* aged-out
-    │               messages on top of the previous summary — not from scratch.
-    │               System prompt + last N turns are always kept verbatim.
+    ├─ Cached summary still fits?
+    │      └─ Serve summary + EVERY later message verbatim.  ← steady state,
+    │         zero upstream calls. The summary boundary only moves when this
+    │         no longer fits, so you pay for a summarize once every N turns.
     │
-    └─ Summarize failed (all keys down / timeout / still too long)?
-        └─ Trim  → deterministic fallback: keep system + first + most recent
-                   messages that fit the budget. Zero cost, never fails.
+    ├─ Boundary must advance → summarize the oldest slice on top of the
+    │      previous summary (incremental — never the whole history again).
+    │      The verbatim tail is sized to FILL the remaining budget.
+    │
+    └─ Summary not ready before `inline_deadline`?
+           └─ Serve now (cached summary + verbatim remainder, or a
+              deterministic trim) while the summarize keeps running
+              detached and lands in the cache for the next turn.
 ```
 
-- **Works for every client** — hooks both `/v1/chat/completions` (opencode / Codex) and the `/v1/messages` Anthropic shim (Claude Code).
-- **Cheap** — a cache-hit costs zero extra calls; only genuinely new content is ever summarized.
-- **Safe** — if summarization can't run, trimming guarantees the request still goes through.
+- **Never blocks the client** — the request waits at most `inline_deadline` seconds, regardless of how slow the upstream is. Compaction latency is bounded by config, not by the provider.
+- **Works for every client** — hooks `/v1/chat/completions` (opencode / Codex), `/v1/responses`, and the `/v1/messages` Anthropic shim (Claude Code).
+- **Cheap** — the steady state costs zero extra calls; only genuinely new content is ever summarized, and concurrent requests on the same conversation share a single summarize.
+- **Safe** — every fallback is bounded, so a request goes through even with the whole key pool rate-limited.
 
-Watch it in the **Activity** log: `⧉ compaction: summarized N msgs → …`.
+Watch it in the **Activity** log: `⧉ compaction: summarized N new msg (covers M) → …`.
 
 ### Tuning
 
-Optional — create `~/.config/openvidia/compaction.json` (defaults shown):
+> **Set `model_budgets` first.** The generic default (80k) is deliberately conservative because NVIDIA NIM does not advertise a context window on `/v1/models`. If your model accepts more, compaction at 80k throws away context you paid nothing for. To find the real number, send an oversized request — the `400` states it exactly:
+>
+> ```
+> This model's maximum context length is 202752 tokens. However, your
+> messages resulted in 320011 tokens.
+> ```
+
+Optional — create `~/.config/openvidia/compaction.json` (built-in defaults shown):
 
 ```json
 {
   "enabled": true,
-  "budget_tokens": 100000,
+  "budget_tokens": 80000,
+  "model_budgets": { "your-provider/your-model": 160000 },
+  "reserved_tokens": 8000,
+  "compact_ratio": 0.6,
   "keep_recent": 8,
-  "summary_max_tokens": 1024
+  "summary_model": "",
+  "summary_max_tokens": 1024,
+  "inline_deadline": 6.0,
+  "summarize_timeout": 45.0
 }
 ```
 
 | Field | Meaning |
 |-------|---------|
 | `enabled` | Turn compaction on/off |
-| `budget_tokens` | History size (estimated) that triggers compaction |
-| `keep_recent` | Most recent messages always kept verbatim |
+| `budget_tokens` | Generic trigger for any model without an explicit budget |
+| `model_budgets` | Per-model context window. **The one setting worth tuning** — leave ~20% headroom, the estimator is a ~4 chars/token approximation |
+| `reserved_tokens` | Generation headroom subtracted from the budget |
+| `compact_ratio` | Compact down to this fraction of the budget. Landing exactly on the threshold re-triggers compaction on the very next turn |
+| `keep_recent` | Floor for the trim fallback. On the summary path the verbatim tail is sized to fill the budget instead |
+| `summary_model` | Model used to summarize. Point it at a **fast** model: it runs on a different traffic stream than the one your agent is saturating. Empty = the default model |
 | `summary_max_tokens` | Cap on the generated summary length |
+| `inline_deadline` | Seconds the *client request* will wait for a summary before being served from the fallback ladder |
+| `summarize_timeout` | Upstream cap for the summarize call itself, which continues in the background past the deadline |
 
 ---
 

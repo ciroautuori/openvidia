@@ -1,4 +1,3 @@
-```
 # Distribution / packaging
 dist/
 build/
@@ -24,9 +23,21 @@ pip-delete-this-directory.txt
 nosetests.xml
 coverage.xml
 *.cover
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editors / OS
 *.log
 *.tmp
 *.swp
 .DS_Store
 Thumbs.db
-```
+.idea/
+.vscode/
+
+# Local secrets — keys live in ~/.config/openvidia, never in the repo
+keys.json
+accounts.json

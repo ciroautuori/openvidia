@@ -1,8 +1,7 @@
 name: CI
 
 on:
-  push:
-    branches: [ main, master ]
+  push:            # every branch, so a fix is verified before it reaches a PR
   pull_request:
     branches: [ main, master ]
 
@@ -23,10 +22,12 @@ jobs:
         python-version: ${{ matrix.python-version }}
         cache: 'pip'
     
+    # Deliberately NOT `pip install .`: the desktop extras (PyQt6, PyGObject)
+    # need system libraries that add nothing to a headless test run.
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pytest pytest-asyncio httpx fastapi
+        pip install pytest pytest-asyncio httpx fastapi psutil
     
     - name: Run tests
       run: |
