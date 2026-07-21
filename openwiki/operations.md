@@ -117,10 +117,11 @@ Cross-platform config paths defined in `openvidia/config.py`:
 | File | Purpose |
 |------|---------|
 | `keys.json` | API keys (JSON array of `nvapi-...` strings) |
-| `presets.json` | ★ Starred models shortlist — also the fallback chain (ordered list) |
+| `presets.json` | ★ Starred models — quick-switch shortlist |
 | `active_model` | Currently active model (persists across restarts) |
 | `index` | Key rotation index |
 | `compaction.json` | Auto-compaction tuning (optional — see below) |
+| `timeouts.json` | Upstream timeouts (optional): `connect`, `read`, `write`, `pool`. Default `read` is 240s because it bounds the wait for the FIRST byte, and a reasoning model emits nothing while thinking. |
 | `accounts.json` | Legacy accounts for auto-regen (auto-extracted to `keys.json` if `keys.json` is empty) |
 | `singleton.lock` | Singleton lock (prevents multiple proxy instances) |
 | `stop` | Stop flag (sent by `POST /api/stop`, checked on startup) |
@@ -163,7 +164,7 @@ If `keys.json` is empty on startup, `_extract_keys_from_accounts()` pulls keys f
 | `POST` | `/api/keys/add` | Add a key |
 | `POST` | `/api/keys/remove` | Remove a key (by index or value) |
 | `GET/POST` | `/api/model` | Get/set active model override |
-| `GET/POST` | `/api/presets` | Get/save starred model presets (fallback chain) |
+| `GET/POST` | `/api/presets` | Get/save starred model presets (shortlist) |
 | `POST` | `/api/test-model` | Test a model directly (bypasses override, tries each key) |
 | `POST` | `/api/stop` | Stop proxy (returns 503 to clients until restarted) |
 | `POST` | `/api/start` | Resume proxy |
@@ -194,7 +195,7 @@ COOLDOWN_DURATIONS = {
 DEFAULT_COOLDOWN = 30.0   # Network errors, unknown 5xx
 ```
 
-**Note:** 400 and 404 are returned to the client without rotation — they're deterministic on the payload, so rotating would waste keys. The cooldown values above are applied when these statuses come back during the preset-fallback retry path.
+**Note:** 400 and 404 are returned to the client without rotation — they're deterministic on the payload, so rotating would waste keys. The cooldown values above are applied when these statuses come back during a rotation attempt.
 
 To tune, edit the constants in `proxy_state.py` and restart. There are no environment variables for rate-limit configuration.
 
@@ -207,9 +208,9 @@ saturated. Constants in `proxy_app.py`, `responses_shim.py`, and `compaction.py`
 
 | Constant | File | Default | Meaning |
 |----------|------|---------|---------|
-| `_MAX_ROTATE_ATTEMPTS` | `proxy_app.py`, `responses_shim.py` | `5` | Hard cap on upstream sends per rotation phase (primary + per fallback model). |
-| `_ROTATE_SEND_TIMEOUT` | `proxy_app.py`, `responses_shim.py` | `Timeout(connect=4, read=30, write=10, pool=30)` | Bounded per-attempt timeout — was 120s client default × up to 25 keys. |
-| `_MIN_LIVE_FRACTION` | `proxy_app.py`, `responses_shim.py` | `0.2` | If live keys < `max(1, 20% × pool)` → skip rotation, go to fallback / 503. Weighs against the full pool size, not `len(candidates)`. |
+| `_MAX_ROTATE_ATTEMPTS` | `proxy_app.py`, `responses_shim.py` | `5` | Hard cap on upstream sends per rotation phase. |
+| `_ROTATE_SEND_TIMEOUT` | `proxy_app.py`, `responses_shim.py` | `config.upstream_timeouts()` → `read=240s` | Per-attempt timeout. `read` is the wait for the first byte; too low and a slow model fails on every key. Override in `timeouts.json`. |
+| `_MIN_LIVE_FRACTION` | `proxy_app.py`, `responses_shim.py` | `0.2` | If live keys < `max(1, 20% × pool)` → skip rotation, go to 503. Weighs against the full pool size, not `len(candidates)`. |
 | `count_live_candidates()` | `proxy_state.py` | — | `(live, valid)` probe used by saturation gates in both proxies. |
 
 Compaction (lower-stakes) uses its own boundary values in `_DEFAULTS` inside

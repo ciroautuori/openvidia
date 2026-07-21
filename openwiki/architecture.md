@@ -47,12 +47,14 @@ The proxy runs as a background subprocess (`openvidia` command) or in the foregr
       b. Build request with Authorization: Bearer <key>
       c. Send (streaming) to upstream
       d. On 2xx: record RPM, restore key, stream response back (client disconnect aware)
-      e. On ReadTimeout: mark_key_failed() (30s cooldown), rotate
+      e. On ReadTimeout: stop the phase — the upstream accepted the request
+         and is still thinking, so the key is NOT cooled down and NOT rotated
+         (the next key would run the same model and wait exactly as long)
       f. On HTTP error: mark_key_failed() (30s cooldown), rotate
       g. On should_rotate(status) [401/403/429/5xx]: mark_key_failed(), rotate
       h. On 400/404: return directly to client (no rotation — deterministic error)
-6.  All keys exhausted → try preset fallback model (_get_fallback_model)
-7.  Fallback also exhausted → return last upstream status to client
+6.  All keys exhausted → return the last upstream status to the client,
+    naming the model. NEVER retried on a different model.
 ```
 
 **Key insight — 400/404 are not rotated:** These errors are deterministic on the request payload (bad format, unknown model). Rotating would waste keys because every key gets the same error. The response is returned to the client immediately and the key is untouched. See `ROTATE_STATUSES` and `should_rotate()` in `proxy_app.py`.
@@ -61,9 +63,13 @@ The proxy runs as a background subprocess (`openvidia` command) or in the foregr
 
 `_health_check_all` runs on startup (force=True) and every 30 seconds (`_background_health_check`). For each key on cooldown with < 90s remaining, it sends a lightweight `GET /v1/models` probe. If the key responds OK, the cooldown is cleared and the key is revived.
 
-### Fallback
+### No model substitution
 
-`_get_fallback_model(state, failed_model)` reads the user's starred presets (`presets.json`). If the failed model is in the preset list, it returns the next model in that list. No hardcoded degraded models — the fallback chain is entirely user-driven.
+The model the user selected is the only model a request runs on. Answering
+from a different model when the selected one fails makes the proxy lie about
+what produced the output — the response carries no marker saying it came from
+elsewhere. When every key fails for a model, the error names that model.
+`presets.json` is a quick-switch shortlist for the dashboard, nothing more.
 
 ---
 
@@ -160,19 +166,22 @@ maybe_compact(messages):
   2.  estimate_tokens(messages) <= budget? → return as-is (no compaction needed)
   3.  Split into (system_block, rest)
   4.  If rest <= keep_recent + 1 → nothing to compact
-  5.  old = rest[:-keep_recent], tail = rest[-keep_recent:]
-  6.  Roll-forward cache check:
-      - conv_key = SHA256(system_block + first N messages of rest)
-      - If cached summary exists and fingerprint matches → summarize only NEW messages
-      - Fingerprint mismatch → collision detected, summarize from scratch
-  7.  Pick a healthy key, call _summarize() upstream
-  8.  Success → store in cache, return [system_block, summary_block, tail]
-  9.  Failure (all keys down / timeout / still too long) → _trim() fallback
+  5.  Cache hit? → serve [system_block, summary_block] + EVERY later message
+      verbatim while that fits the budget. Steady state: zero upstream calls.
+  6.  Otherwise the summary boundary must advance: keep the largest recent
+      suffix that fits compact_ratio × budget, summarize everything before it
+      on top of the previous summary (incremental, never the whole history)
+  7.  Launch the summarize; concurrent requests on the same conversation share
+      the one task. Wait at most inline_deadline for it
+  8.  Still running at the deadline → serve now, the summarize continues
+      detached and lands in the cache for the next turn
+  9.  Fallback ladder: fresh summary → cached summary + verbatim remainder →
+      deterministic _trim()
 ```
 
 ### Roll-forward cache
 
-The `_rolling` dict (capped at 256 entries) maps `conv_key → (covered_count, summary_text, fingerprint)`. Each turn summarizes only the messages **new** to that conversation (beyond what the previous summary already covered), not from scratch. A conservative fingerprint check detects residual cache collisions across unrelated conversations sharing the same system prompt.
+The `_rolling` dict (capped at 256 entries, FIFO eviction) maps `conv_key → (covered_count, summary_text, fingerprint_of_covered_prefix)`. Only messages **new** to that conversation are ever summarized. Two invariants make the hit possible, and both were once broken: `conv_key` must NOT include the message count (that minted a new key every turn), and the stored fingerprint must cover exactly `old[:covered]` (comparing it against the current, longer prefix never matched). With either one wrong the cache silently degrades to a full re-summarize per turn.
 
 `_conv_key` uses the first 4 messages of `rest` (not just 1) as the conversation identity, specifically to avoid collisions with automated tools (Codex, opencode) that send identical initial prompts.
 
@@ -191,21 +200,23 @@ Compaction is invoked in `proxy_app.py` for `chat/completions` requests, and in 
 The serial-history Codex block is fixed by three coupled mechanisms:
 
 1. **Bounded rotation attempts.** Every rotation phase (catch-all `proxy_app.py`,
-   Responses shim stream + non-stream, and the fallback-model phase within each)
+   Responses shim stream + non-stream)
    is now capped at `_MAX_ROTATE_ATTEMPTS = 5`. The `get_candidate_keys()` ordering
    already puts the healthiest key first, so the first 5 attempts are the best
    5 candidates — no need to serially probe all 25.
 
 2. **Per-attempt bounded timeout.** Each `client.send(...)` now passes
-   `_ROTATE_SEND_TIMEOUT = httpx.Timeout(connect=4, read=30, write=10, pool=30)`
-   instead of inheriting the client default (read=120s). Worst-case hold per
-   phase is `5 × 30s = 150s`, NOT `25 × 120s = 50min`. A separate compaction
-   summarize path uses `summarize_timeout=8s` × `max_summarize_attempts=3`.
+   `_ROTATE_SEND_TIMEOUT`, built from `config.upstream_timeouts()` (default
+   `read=240s`, overridable in `timeouts.json`). The read budget is the wait
+   for the FIRST byte: a reasoning model emits nothing while thinking
+   (measured 117-162s for one model while another answered in 2.1s on the
+   same keys), so a short ceiling makes it fail on every key. A ReadTimeout
+   ends the phase without cooling the key down.
 
 3. **Saturation gate.** Before any send, each loop computes a live snapshot
    (`live / total_pool`). If `live < max(1, int(total_pool * _MIN_LIVE_FRACTION))`
    with `_MIN_LIVE_FRACTION = 0.2`, the loop skips rotation entirely and goes
-   straight to model fallback / 503 + failure event. Crucially the denominator is
+   straight to 503 + failure event. Crucially the denominator is
    the **full pool size** (`len(state.keys)`) — not `len(candidates)`, which would
    post-filter to the few cooldown-free keys and never trip the gate when the
    pool is actually saturated.
@@ -214,8 +225,10 @@ Hook points:
 
 - `proxy_state.ProxyState.count_live_candidates()` — shared `(live, valid)` probe.
 - `proxy_app.py` in `proxy_handler()` — gate + cap before the for-loop.
-- `responses_shim.py` `_rotation_phase()` helper — shared bounded send loop for
-  primary and fallback phases (stream + non-stream).
+- `responses_shim.py` `_rotation_phase()` helper — shared bounded send loop
+  (stream + non-stream).
+- `responses_shim.py` `_keepalive_until()` — emits SSE comments while the
+  upstream thinks, so a client can tell a slow model from a dead socket.
 - `compaction.py` `maybe_compact()` — `min_healthy_fraction` gate (separate,
   lower-stakes path: a saturated summarize degrades to deterministic trim).
 

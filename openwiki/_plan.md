@@ -1,7 +1,7 @@
 # OpenWiki Plan — openvidia
 
 ## Repository summary
-OpenVidia is a multi-key reverse proxy for NVIDIA NIM API. Pools multiple free-tier API keys behind a single localhost endpoint (:1919/v1), with automatic key rotation, per-key cooldown, sliding-window RPM limiting, auto-compaction, degraded preset fallback, API shims (OpenAI Responses for Codex, Anthropic Messages for Claude Code), and a native desktop dashboard (pywebview). Built for opencode, Codex CLI, Claude Code, Grok, and any OpenAI-compatible client.
+OpenVidia is a multi-key reverse proxy for NVIDIA NIM API. Pools multiple free-tier API keys behind a single localhost endpoint (:1919/v1), with automatic key rotation, per-key cooldown, sliding-window RPM limiting, auto-compaction, API shims (OpenAI Responses for Codex, Anthropic Messages for Claude Code), and a native desktop dashboard (pywebview). Built for opencode, Codex CLI, Claude Code, Grok, and any OpenAI-compatible client.
 
 ## Wiki pages to create
 
@@ -13,7 +13,7 @@ OpenVidia is a multi-key reverse proxy for NVIDIA NIM API. Pools multiple free-t
 **Source evidence:** README.md, pyproject.toml, install.sh, openvidia/__main__.py
 
 ### 2. architecture.md
-- Proxy engine (proxy_app.py): request flow, key rotation, fallback, streaming
+- Proxy engine (proxy_app.py): request flow, key rotation, streaming
 - Shared state (proxy_state.py): KeyState, KeyCooldown, RpmTracker, ProxyState, get_candidate_keys
 - API shims: anthropic_shim.py, responses_shim.py — translation layers, sanitization
 - Auto-compaction (compaction.py): summarize+trim strategy, roll-forward cache

@@ -1,6 +1,6 @@
 # OpenVidia — OpenWiki Quickstart
 
-**OpenVidia** is a multi-key reverse proxy for the NVIDIA NIM API with a native desktop dashboard. It pools multiple free-tier API keys behind a single localhost endpoint, handling automatic rotation, per-key cooldowns, sliding-window RPM limiting, auto-compaction, and degraded fallback — all behind a compact desktop app (no browser needed).
+**OpenVidia** is a multi-key reverse proxy for the NVIDIA NIM API with a native desktop dashboard. It pools multiple free-tier API keys behind a single localhost endpoint, handling automatic rotation, per-key cooldowns, sliding-window RPM limiting, and auto-compaction — all behind a compact desktop app (no browser needed).
 
 Built for [opencode](https://opencode.ai), [Codex CLI](https://github.com/openai/codex), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Grok](https://x.ai), and any OpenAI-compatible client.
 
@@ -96,7 +96,7 @@ For the full breakdown — proxy engine, shims, key rotation, compaction, deskto
 | File | Responsibility |
 |------|----------------|
 | `openvidia/__main__.py` | CLI entrypoint (`main`), proxy lifecycle, desktop window (pywebview), system tray, CLI auto-setup (opencode/Codex/Grok) |
-| `openvidia/proxy_app.py` | FastAPI app factory, catch-all proxy handler, key rotation loop, model override, fallback, health check, streaming passthrough |
+| `openvidia/proxy_app.py` | FastAPI app factory, catch-all proxy handler, key rotation loop, model override, health check, streaming passthrough |
 | `openvidia/proxy_state.py` | `ProxyState` — keys, cooldowns, RPM trackers, `get_candidate_keys()`, stats, SSE log push, thread-safe key mutations |
 | `openvidia/responses_shim.py` | OpenAI Responses API → chat/completions translation (for Codex CLI) |
 | `openvidia/anthropic_shim.py` | Anthropic Messages API → chat/completions translation (for Claude Code) |
