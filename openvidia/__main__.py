@@ -35,39 +35,82 @@ _tray_ref = None  # Global tray reference (anti-GC)
 _tray_hide = None  # Global hide-function reference for close-to-tray
 
 
-def _kill_stale_port(port: int):
-    """Kill any process listening on the given port (cross-platform via psutil)."""
+def _port_listeners(port: int) -> list:
+    """Processes currently LISTENing on ``port`` (never includes ourselves)."""
+    try:
+        import psutil
+    except ImportError:
+        return []
+    me = os.getpid()
+    out = {}
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except (psutil.AccessDenied, OSError):
+        return []
+    for conn in conns:
+        try:
+            if (
+                conn.laddr
+                and conn.laddr.port == port
+                and conn.status == "LISTEN"
+                and conn.pid
+                and conn.pid != me
+            ):
+                out[conn.pid] = psutil.Process(conn.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+            continue
+    return list(out.values())
+
+
+def _kill_stale_port(port: int, *, grace: float = 6.0, hard: float = 4.0) -> bool:
+    """Free ``port``, escalating SIGTERM → SIGKILL. Returns True if it is free.
+
+    SIGTERM alone is not enough: uvicorn shuts down gracefully, and an agent
+    CLI holding an open SSE stream keeps it alive indefinitely. The previous
+    version sent SIGTERM, waited 3s, then returned silently either way — so
+    the new instance started next to a survivor that still owned the port,
+    and every request kept being served by the OLD code.
+    """
     import time as _time
 
     try:
         import psutil
     except ImportError:
-        return
+        return True
 
-    killed = []
-    for conn in psutil.net_connections():
+    procs = _port_listeners(port)
+    if not procs:
+        return True
+
+    names = ", ".join(f"{p.name()}({p.pid})" for p in procs)
+    for p in procs:
         try:
-            if conn.laddr.port == port and conn.status == "LISTEN" and conn.pid:
-                proc = psutil.Process(conn.pid)
-                proc.terminate()
-                killed.append(f"{proc.name()}({proc.pid})")
-        except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
-            continue
+            p.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    _gone, alive = psutil.wait_procs(procs, timeout=grace)
+    if alive:
+        for p in alive:
+            try:
+                p.kill()  # SIGKILL — it ignored the polite request
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        psutil.wait_procs(alive, timeout=hard)
 
-    if killed:
-        print(f"● Killed stale process on port {port}: {', '.join(killed)}", flush=True)
-
-    # Wait for the port to become free
-    for _ in range(30):
-        conns = []
-        try:
-            conns = psutil.net_connections()
-        except (psutil.AccessDenied, OSError):
-            return
-        still = any(c.laddr.port == port and c.status == "LISTEN" for c in conns)
-        if not still:
-            return
+    # The socket can outlive the process briefly; wait for it to be released.
+    deadline = _time.monotonic() + hard
+    while _time.monotonic() < deadline:
+        if not _port_listeners(port):
+            print(f"● Freed port {port} (was: {names})", flush=True)
+            return True
         _time.sleep(0.1)
+
+    print(
+        f"✗ Port {port} is STILL held by {', '.join(f'{p.name()}({p.pid})' for p in _port_listeners(port))} "
+        f"— refusing to start a second instance on top of it",
+        flush=True,
+    )
+    return False
 
 
 def _extract_keys_from_accounts() -> list:
@@ -412,7 +455,12 @@ def _setup_cmd():
 
 async def main_async():
     """Foreground entrypoint: start the proxy on the event loop."""
-    _kill_stale_port(PORT)
+    if not _kill_stale_port(PORT):
+        # Starting anyway would leave the OLD process serving every request
+        # while this one silently fails to bind — the hardest class of bug to
+        # diagnose, because the code on disk is not the code answering.
+        print(f"  Free it manually:  fuser -k {PORT}/tcp", flush=True)
+        sys.exit(1)
     _setup_opencode()
     _setup_codex()
     _setup_grok()
@@ -468,15 +516,39 @@ async def main_async():
             await srv.shutdown()
 
 
-def _kill_proxy_by_port(port: int) -> None:
-    """Kill the process listening on the port — used by the tray Quit action."""
-    try:
-        import psutil
+def _wait_until_serving(port: int, child=None, timeout: float = 20.0) -> bool:
+    """Block until the proxy answers on ``port``; report why if it never does."""
+    import socket
+    import time as _time
 
-        for conn in psutil.net_connections():
-            if conn.laddr.port == port and conn.status == "LISTEN" and conn.pid:
-                psutil.Process(conn.pid).terminate()
-    except Exception:
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if child is not None and child.poll() is not None:
+            print(
+                f"✗ Proxy exited during startup (code {child.returncode}). "
+                f"Run `openvidia foreground` to see the error.",
+                flush=True,
+            )
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except OSError:
+            _time.sleep(0.2)
+    print(f"✗ Proxy did not start listening on :{port} within {timeout:.0f}s", flush=True)
+    return False
+
+
+def _kill_proxy_by_port(port: int) -> None:
+    """Kill the process listening on the port — used by the tray Quit action.
+
+    Shares the SIGTERM→SIGKILL escalation with startup: a polite terminate
+    alone leaves the proxy alive whenever a client is holding a stream open,
+    so "Quit" looked like it worked while the port stayed busy.
+    """
+    try:
+        _kill_stale_port(port)
+    except Exception:  # noqa: BLE001 — Quit must never raise
         pass
 
 
@@ -666,19 +738,25 @@ def main():
             return
 
     import subprocess as _sp
-    import time as _time
 
-    _kill_stale_port(PORT)
+    if not _kill_stale_port(PORT):
+        print(f"  Free it manually:  fuser -k {PORT}/tcp", flush=True)
+        sys.exit(1)
 
-    _sp.Popen(
+    child = _sp.Popen(
         [sys.executable, "-m", "openvidia", "foreground"],
         stdout=_sp.DEVNULL,
         stderr=_sp.DEVNULL,
         stdin=_sp.DEVNULL,
     )
 
+    # Wait for the server to actually answer before opening the window.
+    # A fixed sleep(3) hid every startup failure: the window opened onto a
+    # dead port, or onto a survivor still running the previous build.
+    if not _wait_until_serving(PORT, child, timeout=20.0):
+        sys.exit(1)
+
     # Desk app — compact native window
-    _time.sleep(3)
     open_desk(PORT)
 
 

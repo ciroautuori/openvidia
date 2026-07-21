@@ -24,6 +24,7 @@ from openvidia.compaction import (
     _settings,
 )
 from openvidia.compaction import _model_budgets
+from openvidia.compaction import _DEFAULTS as _DEFAULTS_KEYS
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -637,14 +638,21 @@ class TestCompactionTrim:
 
 class TestCompactionSettings:
     def test_settings_defaults(self):
-        """Test compaction settings defaults."""
+        """Built-in defaults. Asserted on _DEFAULTS, not on _settings(): the
+        latter merges the user's compaction.json and is not hermetic."""
+        from openvidia.compaction import _DEFAULTS
+
+        assert _DEFAULTS["enabled"] is True
+        assert _DEFAULTS["budget_tokens"] == 80_000
+        assert _DEFAULTS["keep_recent"] == 8
+        assert _DEFAULTS["summary_max_tokens"] == 1024
+        assert _DEFAULTS["summary_model"] == ""
+
+    def test_settings_merges_user_overrides_over_defaults(self):
         settings = _settings()
-        
-        assert settings["enabled"] is True
-        assert settings["budget_tokens"] == 80_000
-        assert settings["keep_recent"] == 8
-        assert settings["summary_max_tokens"] == 1024
-        assert settings["summary_model"] == ""
+
+        assert set(_DEFAULTS_KEYS).issubset(settings.keys())
+        assert isinstance(settings["budget_tokens"], int)
 
 
 # ─────────────────────────────────────────────────────────────────────
