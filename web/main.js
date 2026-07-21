@@ -108,7 +108,7 @@ setInterval(async () => {
   } catch (_) {}
 }, 2000)
 
-/* ── Starred models (= presets = catena di fallback ordinata) ────── */
+/* ── Starred models (= presets = shortlist di scelta rapida) ────── */
 async function loadPresets() {
   try { const r = await api('GET', '/api/presets'); presets = r.presets || [] } catch (_) { presets = [] }
   renderFilters(); renderModelList()
@@ -140,7 +140,7 @@ const FILTERS = ['starred', 'all', 'popular']
 function getFilteredModels() {
   let list
   if (modelFilter === 'starred') {
-    // in ordine di stellatura = ordine della catena di fallback
+    // in ordine di stellatura
     list = presets.map(id => allModels.find(m => m.id === id) || { id, owned_by: '' })
   } else if (modelFilter === 'popular') {
     list = allModels.filter(m => POPULAR_MODELS.has(m.id))
@@ -215,7 +215,7 @@ function renderModelList() {
     const star = document.createElement('button')
     star.className = `browser-star ${starred ? 'on' : ''}`
     star.textContent = starred ? '★' : '☆'
-    star.title = starred ? 'Unstar — remove from fallback chain' : 'Star — add to fallback chain'
+    star.title = starred ? 'Unstar — remove from shortlist' : 'Star — add to shortlist'
     star.onclick = e => {
       e.stopPropagation()
       if (starred) presets = presets.filter(x => x !== m.id)

@@ -22,6 +22,48 @@ def config_dir() -> Path:
     return d
 
 
+# ── Upstream timeouts ──────────────────────────────────────────────────
+# `read` is the wait for the FIRST byte of a streamed answer, and a
+# reasoning model emits nothing at all while it thinks. Measured on the
+# NVIDIA free tier: z-ai/glm-5.2 takes ~117s to first byte on a 2k-token
+# prompt and ~143s on a 20k one — latency driven by the model, not by the
+# prompt size. The previous 30s ceiling therefore made every request to a
+# slow model time out on every key in the pool, and the proxy blamed the
+# keys for it. Single source of truth: all three request paths (chat
+# completions, /v1/responses, /v1/messages) import this.
+_TIMEOUT_DEFAULTS = {
+    "connect": 5.0,
+    "read": 240.0,
+    "write": 30.0,
+    "pool": 240.0,
+}
+
+_HTTPX_TIMEOUT_KEYS = ("connect", "read", "write", "pool")
+
+
+def upstream_timeouts() -> dict:
+    """All upstream timeout settings, overridable via ``timeouts.json``.
+
+    Read once at import time — this is startup configuration, not a hot path.
+    """
+    try:
+        p = config_dir() / "timeouts.json"
+        if p.exists():
+            loaded = json.loads(p.read_text())
+            return {**_TIMEOUT_DEFAULTS, **{k: float(v) for k, v in loaded.items()}}
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        pass
+    return dict(_TIMEOUT_DEFAULTS)
+
+
+def httpx_timeout_kwargs() -> dict:
+    """Just the keys ``httpx.Timeout`` accepts."""
+    t = upstream_timeouts()
+    return {k: t[k] for k in _HTTPX_TIMEOUT_KEYS}
+
+
+
+
 def config_path() -> Path:
     return config_dir() / "keys.json"
 

@@ -276,6 +276,62 @@ class TestBoundaryAdvance:
         assert estimate_tokens(out) <= 72_000
 
 
+class TestStreamKeepalive:
+    """A thinking model must not look like a dead socket."""
+
+    @pytest.mark.asyncio
+    async def test_emits_keepalives_until_the_task_finishes(self, monkeypatch):
+        from openvidia import responses_shim as rs
+
+        monkeypatch.setattr(rs, "_KEEPALIVE_INTERVAL", 0.02)
+        gate = asyncio.Event()
+
+        async def slow_rotation():
+            await gate.wait()
+            return ("RESP", "key", 3)
+
+        task = asyncio.ensure_future(slow_rotation())
+        box: list = []
+        sent = []
+
+        async def drain():
+            async for chunk in rs._keepalive_until(task, box):
+                sent.append(chunk)
+                if len(sent) >= 3:
+                    gate.set()
+
+        await drain()
+        assert sent and all(c == b": keepalive\n\n" for c in sent)
+        assert box == [("RESP", "key", 3)]
+
+    @pytest.mark.asyncio
+    async def test_no_keepalive_when_the_upstream_is_fast(self, monkeypatch):
+        from openvidia import responses_shim as rs
+
+        monkeypatch.setattr(rs, "_KEEPALIVE_INTERVAL", 5.0)
+
+        async def fast():
+            return ("RESP", "key", 0)
+
+        box: list = []
+        sent = [c async for c in rs._keepalive_until(asyncio.ensure_future(fast()), box)]
+        assert sent == []
+        assert box == [("RESP", "key", 0)]
+
+    @pytest.mark.asyncio
+    async def test_failure_yields_a_null_result_instead_of_raising(self, monkeypatch):
+        from openvidia import responses_shim as rs
+
+        monkeypatch.setattr(rs, "_KEEPALIVE_INTERVAL", 5.0)
+
+        async def boom():
+            raise RuntimeError("upstream exploded")
+
+        box: list = []
+        [c async for c in rs._keepalive_until(asyncio.ensure_future(boom()), box)]
+        assert box == [(None, None, None)]
+
+
 class TestCompactionTarget:
     @pytest.mark.asyncio
     async def test_result_sits_well_below_the_trigger(self, state, monkeypatch):

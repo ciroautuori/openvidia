@@ -464,11 +464,12 @@ async def _stream_anthropic(
             )
             resp = await client.send(req, stream=True)
         except httpx.ReadTimeout:
+            # Slow model, not a bad key — see responses_shim._rotation_phase.
             state.log_cb(
-                f"  anthropic shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)"
+                f"  anthropic shim: key[{idx}] no first byte — model too slow, "
+                f"not a key fault"
             )
-            state.mark_key_failed(k)
-            continue
+            break
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
             state.log_cb(
@@ -501,59 +502,6 @@ async def _stream_anthropic(
             )
             return
         state.mark_key_failed(k, status=err_status)
-
-    if resp is None or used_key is None:
-        # All keys exhausted on the primary model → try a preset fallback model.
-        from .proxy_app import _get_fallback_model
-
-        fb_model = _get_fallback_model(state, model)
-        if fb_model and fb_model != model:
-            state.log_cb(
-                f"  anthropic shim: all keys failed for {model}, fallback to {fb_model}"
-            )
-            chat_payload["model"] = fb_model
-            for idx, k in candidates:
-                if not state.key_can_send_rpm(k):
-                    continue
-                hdrs = {
-                    "Authorization": f"Bearer {k}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "openvidia/2.0",
-                }
-                try:
-                    req = client.build_request(
-                        "POST", UPSTREAM, json=chat_payload, headers=hdrs
-                    )
-                    resp = await client.send(req, stream=True)
-                except httpx.ReadTimeout:
-                    state.mark_key_failed(k)
-                    continue
-                except httpx.HTTPError:
-                    state.mark_key_failed(k)
-                    continue
-                if resp.status_code == 200:
-                    used_key = k
-                    used_idx = idx
-                    model = fb_model
-                    break
-                err_status = resp.status_code
-                err_raw = await resp.aread()
-                await resp.aclose()
-                resp = None
-                if err_status in _CLIENT_ERR:
-                    yield _sse_event(
-                        "error",
-                        {
-                            "type": "error",
-                            "error": {
-                                "type": "invalid_request_error",
-                                "message": _extract_err(err_raw, err_status),
-                            },
-                        },
-                    )
-                    return
-                state.log_cb(f"  anthropic shim fallback: key[{idx}] HTTP {err_status}")
-                state.mark_key_failed(k, status=err_status)
 
     if resp is None or used_key is None:
         yield _sse_event(
@@ -856,11 +804,12 @@ async def handle_anthropic_messages(
             )
             resp = await client.send(req)
         except httpx.ReadTimeout:
+            # Slow model, not a bad key — see responses_shim._rotation_phase.
             state.log_cb(
-                f"  anthropic shim: key[{idx}] ReadTimeout (rotating, cooldown 30s)"
+                f"  anthropic shim: key[{idx}] no answer in time — model too slow, "
+                f"not a key fault"
             )
-            state.mark_key_failed(k)
-            continue
+            break
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
             state.log_cb(

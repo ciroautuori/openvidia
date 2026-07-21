@@ -16,6 +16,7 @@ flow are frozen; only prose (docstrings/comments) is reformatted.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -26,6 +27,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 
+from . import config
 from .proxy_state import ProxyState
 
 
@@ -38,8 +40,37 @@ from .proxy_state import ProxyState
 # bounded connect+read+write+pool timeout, and fast-fail the whole loop as
 # soon as the live (RPM-eligible) pool is too small to bother.
 _MAX_ROTATE_ATTEMPTS = 5          # hard cap on sends per model phase
-_ROTATE_SEND_TIMEOUT = httpx.Timeout(connect=4.0, read=30.0, write=10.0, pool=30.0)
+_ROTATE_SEND_TIMEOUT = httpx.Timeout(**config.httpx_timeout_kwargs())
 _MIN_LIVE_FRACTION = 0.2          # <20% of valid keys live → 503 fast
+
+
+# A reasoning model withholds its first byte until it has finished thinking —
+# measured at 117-144s for z-ai/glm-5.2 on the NVIDIA free tier, for prompts
+# of any size. During that window the SSE socket carries nothing, and a client
+# (or any proxy in between) cannot tell a thinking model from a dead
+# connection. Emit an SSE comment periodically: comments are stripped by the
+# SSE parser before events are dispatched, so the client's protocol handling
+# never sees them — the bytes exist purely to keep the stream demonstrably
+# alive.
+_KEEPALIVE_INTERVAL = 10.0
+_KEEPALIVE_BYTES = b": keepalive\n\n"
+
+
+async def _keepalive_until(task, result_box: list):
+    """Yield keepalive comments until ``task`` finishes; append its result."""
+    while True:
+        try:
+            result_box.append(
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=_KEEPALIVE_INTERVAL
+                )
+            )
+            return
+        except asyncio.TimeoutError:
+            yield _KEEPALIVE_BYTES
+        except Exception:  # noqa: BLE001 — surfaced to the caller via the box
+            result_box.append((None, None, None))
+            return
 
 
 async def _rotation_phase(client, upstream, payload, headers_factory,
@@ -58,9 +89,19 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
             req = client.build_request("POST", upstream, json=payload, headers=hdrs, timeout=timeout)
             resp = await client.send(req, stream=stream)
         except httpx.ReadTimeout:
-            state.log_cb(f"  {log_tag}: key[{idx}] ReadTimeout (rotating)")
-            state.mark_key_failed(k)
-            continue
+            # The key connected and the upstream ACCEPTED the request — it is
+            # simply still thinking. Two things must NOT happen here:
+            #   - cooling the key down, which blames 25 healthy keys for one
+            #     slow model and drains the pool
+            #   - rotating, since the next key runs the same model and will
+            #     wait exactly as long
+            # Stop the phase instead and let the caller fall back to a
+            # different (faster) model, which is the real escalation.
+            state.log_cb(
+                f"  {log_tag}: key[{idx}] no first byte in {timeout.read:.0f}s "
+                f"— model too slow, not a key fault"
+            )
+            break
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
             state.log_cb(f"  {log_tag}: key[{idx}] {err_msg} (rotating)")
@@ -543,50 +584,22 @@ async def _stream_responses(
         def _hdr(k, idx):
             return {"Authorization": f"Bearer {k}", "Content-Type": "application/json", "User-Agent": "openvidia/2.0"}
 
-        resp, used_key, used_idx = await _rotation_phase(
-            client, upstream, chat_payload, _hdr, state, candidates,
-            max_attempts=_MAX_ROTATE_ATTEMPTS,
-            timeout=_ROTATE_SEND_TIMEOUT,
-            stream=True, log_tag="responses shim",
-            seen_429_box=[False],
-        )
-
-    if resp is None or used_key is None:
-        # All keys exhausted on the primary model → try a preset fallback model.
-        from .proxy_app import _get_fallback_model
-
-        fb_model = _get_fallback_model(state, model)
-        if fb_model and fb_model != model:
-            state.log_cb(
-                f"  responses shim: all keys failed for {model}, fallback to {fb_model}"
+        _box: list = []
+        _task = asyncio.ensure_future(
+            _rotation_phase(
+                client, upstream, chat_payload, _hdr, state, candidates,
+                max_attempts=_MAX_ROTATE_ATTEMPTS,
+                timeout=_ROTATE_SEND_TIMEOUT,
+                stream=True, log_tag="responses shim",
+                seen_429_box=[False],
             )
-            chat_payload["model"] = fb_model
-
-            # Same saturation gate on the fallback model: if the pool is still
-            # saturated when we reach the fallback, do NOT serially hammer it.
-            async with state.lock:
-                fb_candidates = state.get_candidate_keys()
-            _fb_live, _fb_total = _live_pool_snapshot(state, fb_candidates)
-            if _fb_total and _fb_live < max(1, int(_fb_total * _MIN_LIVE_FRACTION)):
-                state.log_cb(
-                    f"  responses shim: pool still saturated ({_fb_live}/{_fb_total} live) → "
-                    f"skip fallback {fb_model}"
-                )
-            else:
-
-                def _fb_hdr(k, idx):
-                    return {"Authorization": f"Bearer {k}", "Content-Type": "application/json", "User-Agent": "openvidia/2.0"}
-
-                fb_seen_429 = [False]
-                resp, used_key, used_idx = await _rotation_phase(
-                    client, upstream, chat_payload, _fb_hdr, state, fb_candidates,
-                    max_attempts=_MAX_ROTATE_ATTEMPTS,
-                    timeout=_ROTATE_SEND_TIMEOUT,
-                    stream=True, log_tag="responses shim fallback",
-                    seen_429_box=fb_seen_429,
-                )
-                if used_key is not None:
-                    model = fb_model
+        )
+        # No deadline and no model substitution: the selected model is THE
+        # model. We wait for it (keepalives keep the stream alive meanwhile)
+        # and never silently answer from a different one.
+        async for _ka in _keepalive_until(_task, _box):
+            yield _ka
+        resp, used_key, used_idx = _box[0]
 
     if resp is None or used_key is None:
         # Definitive failure: emit error + response.failed and terminate.

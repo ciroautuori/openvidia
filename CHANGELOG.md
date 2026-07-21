@@ -35,7 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Version bumped from 2.0.0 to 1.0.0 (first stable release)
 - Test suite uses pytest with async support
 
+### Removed
+- **Preset-based model fallback.** A request for a model that failed on every
+  key was silently retried on the next starred model, so output could come
+  from a model you did not choose without the response saying so. The selected
+  model is now the only model a request runs on; when it fails you get a 503
+  naming it. ★ Starred presets remain a quick-switch shortlist.
+
 ### Fixed
+- **A slow model took the whole key pool down with it.** The 30s upstream read
+  timeout is the wait for the *first byte*, and a reasoning model emits nothing
+  while it thinks (measured: `z-ai/glm-5.2` at 117-162s to first token, at any
+  prompt size, while `deepseek-v4-flash` answered in 2.1s on the same keys in
+  the same minute). Every request to such a model timed out on every key, and
+  each timeout put a healthy key on cooldown. Timeouts now default to 240s,
+  live in `timeouts.json`, and a read timeout no longer blames the key
+- SSE keepalive comments during the wait, so a thinking model is
+  distinguishable from a dead connection
 - **Compaction re-summarized the whole history every turn.** The rolling cache
   could never hit: the conversation key included the message count (new key
   each turn) and the stored fingerprint was compared against a longer prefix

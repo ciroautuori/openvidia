@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
+from . import config
 from .proxy_state import ProxyState, persist_index
 from .responses_shim import handle_responses
 from .anthropic_shim import handle_anthropic_messages
@@ -33,7 +34,7 @@ DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"
 # historically iterated ALL candidates with the client default read=120s, so
 # 25 saturated keys could block a Codex request for up to 25×120s = 50min.
 _MAX_ROTATE_ATTEMPTS = 5
-_ROTATE_SEND_TIMEOUT = httpx.Timeout(connect=4.0, read=30.0, write=10.0, pool=30.0)
+_ROTATE_SEND_TIMEOUT = httpx.Timeout(**config.httpx_timeout_kwargs())
 _MIN_LIVE_FRACTION = 0.2  # <20% live keys → skip rotation, go to fallback/503
 
 STRIPPED_RESPONSE_HEADERS = {
@@ -160,7 +161,7 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
     client = httpx.AsyncClient(
         http2=True,
         limits=limits,
-        timeout=httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=120.0),
+        timeout=httpx.Timeout(**config.httpx_timeout_kwargs()),
     )
 
     @asynccontextmanager
@@ -417,13 +418,16 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 )
                 resp = await client.send(req, stream=True)
             except httpx.ReadTimeout:
+                # Slow model, not a bad key: the upstream accepted the request
+                # and is still thinking. Cooling the key down would drain the
+                # pool, and rotating would just re-run the same model.
                 state.end_in_flight(key)
-                state.log_cb(f"key[{orig_idx}] ReadTimeout (rotating, cooldown 30s)")
+                state.log_cb(
+                    f"key[{orig_idx}] no first byte in "
+                    f"{_ROTATE_SEND_TIMEOUT.read:.0f}s — model too slow, not a key fault"
+                )
                 state.stats.record_key_usage(key, ok=False, error="ReadTimeout")
-                state.mark_key_failed(key)
-                state.stats.rotations += 1
-                persist_index(state, (orig_idx + 1) % total_keys)
-                continue
+                break
             except httpx.HTTPError as e:
                 state.end_in_flight(key)
                 err_msg = str(e) or type(e).__name__
@@ -490,60 +494,14 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
                 headers={"access-control-allow-origin": "*"},
             )
 
-        # ── Preset-based model fallback ────────────────────────────────
+        # NO model substitution. The model the user selected is the model the
+        # request runs on: silently answering from a different one makes the
+        # proxy lie about what produced the output. If every key failed for
+        # that model, say so.
         model_name = payload.get("model", "") if isinstance(payload, dict) else ""
-        fallback_model = _get_fallback_model(state, model_name)
-
-        if fallback_model:
-            state.log_cb(
-                f"↻ {model_name} failed on all keys — retry with preset fallback: {fallback_model}"
-            )
-            fb_body = json.dumps({**payload, "model": fallback_model}).encode()
-            for fb_idx, fb_key in enumerate(state.keys):
-                if not state.is_key_healthy(fb_key) or not state.key_can_send_rpm(fb_key):
-                    continue
-                hdrs = {
-                    "Authorization": f"Bearer {fb_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "openvidia/2.0",
-                }
-                try:
-                    fb_req = client.build_request(
-                        "POST", url, content=fb_body, headers=hdrs
-                    )
-                    fb_resp = await client.send(fb_req)
-                    if fb_resp.is_success:
-                        state.log_cb(f"✔ fallback key[{fb_idx}] → {fallback_model}")
-                        state.record_request(fb_key)
-                        state.stats.record_key_usage(fb_key, ok=True)
-                        fb_body_raw = await fb_resp.aread()
-                        persist_index(state, (fb_idx + 1) % len(state.keys))
-                        await fb_resp.aclose()
-                        fb_data = json.loads(fb_body_raw)
-                        fb_data["model"] = fallback_model
-                        return JSONResponse(
-                            content=fb_data,
-                            headers={"access-control-allow-origin": "*"},
-                        )
-                    fb_status = fb_resp.status_code
-                    await fb_resp.aclose()
-                    state.stats.record_key_usage(fb_key, ok=False, error=f"HTTP {fb_status}")
-                    if should_rotate(fb_status):
-                        state.mark_key_failed(fb_key, status=fb_status)
-                        continue
-                    state.log_cb(f"✗ fallback HTTP {fb_status}")
-                    break
-                except httpx.HTTPError as e:
-                    err_msg = str(e) or type(e).__name__
-                    state.log_cb(f"  ⏳ fallback key error: {err_msg}")
-                    state.mark_key_failed(fb_key)
-                    continue
-
         msg = "all keys exhausted"
-        if fallback_model:
-            msg += (
-                f" — {model_name} failed, preset fallback {fallback_model} also failed"
-            )
+        if model_name:
+            msg += f" for {model_name}"
         return JSONResponse(
             {"error": msg, "last_upstream_status": last_status},
             status_code=last_status,
@@ -552,26 +510,3 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
     return app
 
 
-def _get_fallback_model(state: ProxyState, failed_model: str) -> Optional[str]:
-    """Find the next preset model after the one that just failed all keys.
-
-    Pure data: reads the user's starred presets (``presets.json``). No
-    model/provider name is hardcoded here — the fallback chain is entirely
-    user-driven. ``DEFAULT_MODEL`` is only the last-resort alias when no
-    active model is selected at all.
-    """
-    from . import config
-
-    try:
-        presets = config.load_saved_presets()
-    except Exception:
-        return None
-
-    if not presets or failed_model not in presets:
-        return None
-
-    idx = presets.index(failed_model)
-    if idx + 1 < len(presets):
-        return presets[idx + 1]
-
-    return None

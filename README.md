@@ -10,7 +10,7 @@
 **Multi-key proxy for NVIDIA NIM with a native desktop dashboard.**
 
 <p align="center">
-  <img src="web/assets/dashboard.gif" alt="OpenVidia dashboard — pooled keys, ★ Starred model shortlist, star any model into the fallback chain" width="400">
+  <img src="web/assets/dashboard.gif" alt="OpenVidia dashboard — pooled keys, ★ Starred model shortlist, live activity log" width="400">
 </p>
 
 Pool multiple free-tier API keys behind one endpoint. Automatic rotation, per-key cooldown, sliding-window RPM limiting, and a compact desktop app — no browser needed.
@@ -129,7 +129,7 @@ NVIDIA's free NIM tier limits each API key to ~40 RPM. Aggressive bursts trigger
 - **Per-key cooldown timers** — respects `Retry-After` headers, exponential backoff
 - **Sliding-window RPM limiting** — keeps each key under 28 RPM (safe margin below 40)
 - **Health checks** — revives keys whose cooldowns have expired
-- **Degraded fallback** — if a model fails on all keys, tries the next preset
+- **No silent model substitution** — the model you select is the model that answers; if it fails on every key you are told so, never handed output from a different model
 - **Auto-compaction** — summarizes long histories so requests never fail on context overflow ([details](#auto-compaction))
 
 ---
@@ -249,7 +249,7 @@ Request arrives
     │                  → 401? set 3600s cooldown, rotate
     │                  → 5xx? set 30s cooldown, rotate
     │
-    └─ All keys exhausted? → try next preset model (degraded fallback)
+    └─ All keys exhausted? → 503 naming the model (never a substitute model)
 ```
 
 ### Health Check
@@ -366,7 +366,7 @@ update-desktop-database ~/.local/share/applications/
 | **Status** | Proxy state, active model, start/stop/restart controls |
 | **Stats** | Request count, success rate, rotations, cooldown counter |
 | **Keys** | Per-key status (Active filter default), live cooldown countdown, RPM, success/fail, freshness dots, add/remove/copy |
-| **Models** | Single list — filters: **★ Starred** (default; your shortlist, doubles as the fallback chain) · All · Popular. Search, test ▶, star/unstar. Active model highlighted and pinned to top. |
+| **Models** | Single list — filters: **★ Starred** (default; your quick-switch shortlist) · All · Popular. Search, test ▶, star/unstar. Active model highlighted and pinned to top. |
 | **Activity** | Real-time SSE log stream with color-coded levels |
 | **CLI Setup** | Copy-paste config for opencode / Codex / Claude / Grok |
 
@@ -397,10 +397,11 @@ update-desktop-database ~/.local/share/applications/
 | File | Purpose |
 |------|---------|
 | `keys.json` | API keys (JSON array) |
-| `presets.json` | ★ Starred models — quick-switch shortlist + ordered fallback chain |
+| `presets.json` | ★ Starred models — quick-switch shortlist |
 | `active_model` | Currently active model (persists across restarts) |
 | `index` | Key rotation index |
 | `compaction.json` | Auto-compaction tuning (optional — see [Auto-Compaction](#auto-compaction)) |
+| `timeouts.json` | Upstream timeouts (optional — see [Slow models](#slow-models)) |
 | `accounts.json` | Legacy accounts (auto-extracted to keys.json) |
 
 Add keys via the dashboard (**Keys** section) or edit `keys.json`:
@@ -408,6 +409,36 @@ Add keys via the dashboard (**Keys** section) or edit `keys.json`:
 ```json
 ["nvapi-xxx", "nvapi-yyy", "..."]
 ```
+
+### Slow models
+
+A `read` timeout is the wait for the **first byte**, and a reasoning model
+emits nothing at all while it thinks. Measured on the NVIDIA free tier, the
+same key, within the same minute:
+
+| Model | Time to first token |
+|-------|---------------------|
+| `deepseek-ai/deepseek-v4-flash` | 2.1s |
+| `deepseek-ai/deepseek-v4-pro` | 12.3s |
+| `minimaxai/minimax-m3` | 44.5s |
+| `z-ai/glm-5.2` | 162s |
+
+Provider capacity for one model can collapse without warning while the others
+stay fast — so a timeout short enough to feel responsive is also short enough
+to make a slow model **fail on every key in the pool**. OpenVidia therefore
+waits (default 240s) and keeps the SSE stream alive with periodic comments, so
+your CLI can tell "thinking" from "dead". A read timeout never puts a key on
+cooldown: the key connected fine and the upstream accepted the request — it is
+the model that is slow, and cooling keys down for it drains the whole pool.
+
+Override in `~/.config/openvidia/timeouts.json`:
+
+```json
+{ "connect": 5.0, "read": 240.0, "write": 30.0, "pool": 240.0 }
+```
+
+If a model is too slow to work with, switch model in the dashboard. OpenVidia
+will not silently answer from a different one.
 
 ### Rate limit tuning
 
