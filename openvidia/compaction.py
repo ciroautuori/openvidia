@@ -10,6 +10,7 @@ trimming so the request still goes through.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from typing import Callable, Optional
@@ -34,14 +35,17 @@ _DEFAULTS = {
     # Hard cap on summarize attempts: if the pool is saturated we must NOT
     # serially try all 25 keys with a 30s timeout on each (= 12 min block).
     # After this many rotate-attempts we bail to deterministic trim.
-    "max_summarize_attempts": 3,
+    "max_summarize_attempts": 5,  # increased from 3 to improve success rate
     # Per-attempt connect/read total cap (was unbounded read=30s on a hung
-    # upstream, amplifying the block). 8s is enough for a short summary.
-    "summarize_timeout": 8.0,
+    # upstream, amplifying the block). 12s allows for slower summary models.
+    "summarize_timeout": 12.0,  # increased from 8.0
     # When the pool health is below this fraction of live keys, skip the
     # summarize attempt entirely and go straight to deterministic trim —
     # there is no point burning 8s×3 on a pool that is mostly rate-limited.
-    "min_healthy_fraction": 0.25,
+    "min_healthy_fraction": 0.15,  # lowered from 0.25 to allow more attempts
+    # Retry configuration for summarize failures
+    "summarize_retry_delay": 0.5,  # seconds between retry attempts
+    "summarize_max_retries": 2,  # additional retries on transient errors
 }
 
 # Per-model context budget override (tokens). NVIDIA NIM context windows vary:
@@ -149,8 +153,10 @@ async def _summarize(
     max_tokens: int,
     log: Optional[Callable[[str], None]] = None,
     *,
-    max_attempts: int = 3,
-    attempt_timeout: float = 8.0,
+    max_attempts: int = 5,
+    attempt_timeout: float = 12.0,
+    retry_delay: float = 0.5,
+    max_retries: int = 2,
 ) -> str:
     """Summarize with rotation across the given keys + bounded attempts.
 
@@ -159,7 +165,11 @@ async def _summarize(
     previously meant 25×30s = 12 min of hard block while Codex waited). Each
     attempt is capped at ``attempt_timeout`` seconds total connect+read so a
     hung or rate-limited upstream falls back to deterministic trim quickly.
+    
+    Added detailed error logging for 400/404/500 errors and retry logic for
+    transient failures.
     """
+    
     sys = (
         "You are a conversation history compressor. Produce a concise but dense "
         "summary that preserves decisions, facts, file modifications and their "
@@ -188,57 +198,140 @@ async def _summarize(
     # saturated via the compaction path.
     attempts = 0
     seen_429 = False
+    error_details: list[str] = []  # Collect detailed error info for logging
+    
     for key in keys:
         if attempts >= max_attempts:
             break
         attempts += 1
-        hdrs = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "User-Agent": "openvidia/2.0",
-        }
-        try:
-            req = client.build_request(
-                "POST",
-                UPSTREAM,
-                json=payload,
-                headers=hdrs,
-                extensions={
-                    "timeout": {
-                        "connect": 3.0,
-                        "read": attempt_timeout,
-                        "write": 3.0,
-                        "pool": attempt_timeout,
-                    }
-                },
-            )
-            resp = await client.send(req)
-        except httpx.HTTPError as e:
-            last_err = str(e) or type(e).__name__
-            continue
-        try:
-            if resp.status_code != 200:
-                last_err = f"summarize HTTP {resp.status_code}"
-                if resp.status_code == 429:
-                    seen_429 = True
-                    # Hint the caller (maybe_compact) that the pool is
-                    # saturated so it skips further summarize attempts on
-                    # the NEXT compaction cycle until keys recover.
-                    last_err = "summarize HTTP 429 (pool saturated)"
+        
+        # Retry loop for transient errors on same key
+        retries_left = max_retries
+        while retries_left >= 0:
+            hdrs = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "User-Agent": "openvidia/2.0",
+            }
+            try:
+                req = client.build_request(
+                    "POST",
+                    UPSTREAM,
+                    json=payload,
+                    headers=hdrs,
+                    extensions={
+                        "timeout": {
+                            "connect": 3.0,
+                            "read": attempt_timeout,
+                            "write": 3.0,
+                            "pool": attempt_timeout,
+                        }
+                    },
+                )
+                resp = await client.send(req)
+            except httpx.ConnectTimeout as e:
+                err_msg = f"ConnectTimeout after 3s"
+                error_details.append(f"key[{keys.index(key)}] {err_msg}")
+                if log:
+                    log(f"⧉ compaction: key[{keys.index(key)}] {err_msg} (attempt {attempts}/{max_attempts})")
+                last_err = err_msg
+                break  # Don't retry connection timeouts
+            except httpx.ReadTimeout as e:
+                err_msg = f"ReadTimeout after {attempt_timeout}s"
+                error_details.append(f"key[{keys.index(key)}] {err_msg}")
+                if log:
+                    log(f"⧉ compaction: key[{keys.index(key)}] {err_msg} (attempt {attempts}/{max_attempts})")
+                last_err = err_msg
+                retries_left -= 1
+                if retries_left >= 0 and log:
+                    log(f"⧉ compaction: retrying key[{keys.index(key)}] ({retries_left} retries left)")
+                    await asyncio.sleep(retry_delay)
                 continue
-            data = resp.json()
-        finally:
-            await resp.aclose()
+            except httpx.HTTPError as e:
+                err_msg = str(e) or type(e).__name__
+                error_details.append(f"key[{keys.index(key)}] {err_msg}")
+                if log:
+                    log(f"⧉ compaction: key[{keys.index(key)}] {err_msg} (attempt {attempts}/{max_attempts})")
+                last_err = err_msg
+                retries_left -= 1
+                if retries_left >= 0 and log:
+                    log(f"⧉ compaction: retrying key[{keys.index(key)}] ({retries_left} retries left)")
+                    await asyncio.sleep(retry_delay)
+                continue
+            
+            try:
+                if resp.status_code != 200:
+                    body_text = ""
+                    try:
+                        body_text = resp.text[:200]  # First 200 chars of error body
+                    except Exception:
+                        pass
+                    
+                    err_msg = f"summarize HTTP {resp.status_code}"
+                    if body_text:
+                        err_msg += f" (body: {body_text})"
+                    
+                    error_details.append(f"key[{keys.index(key)}] {err_msg}")
+                    
+                    if log:
+                        log(f"⧉ compaction: key[{keys.index(key)}] {err_msg} (attempt {attempts}/{max_attempts})")
+                    
+                    if resp.status_code == 429:
+                        seen_429 = True
+                        last_err = "summarize HTTP 429 (pool saturated)"
+                        # Don't retry 429 - move to next key
+                        break
+                    elif resp.status_code in (400, 404):
+                        # Client errors - likely bad request or endpoint issue
+                        # Don't retry, move to next key
+                        last_err = err_msg
+                        break
+                    elif resp.status_code >= 500:
+                        # Server errors - may be transient, retry
+                        last_err = err_msg
+                        retries_left -= 1
+                        if retries_left >= 0 and log:
+                            log(f"⧉ compaction: server error, retrying key[{keys.index(key)}] ({retries_left} retries left)")
+                            await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        # Other errors - don't retry
+                        last_err = err_msg
+                        break
+                    
+                data = resp.json()
+            finally:
+                await resp.aclose()
 
-        txt = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get(
-            "content"
-        ) or ""
-        if not txt.strip():
-            last_err = "summarize empty"
-            continue
-        return txt.strip()
+            txt = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get(
+                "content"
+            ) or ""
+            if not txt.strip():
+                last_err = "summarize empty"
+                error_details.append(f"key[{keys.index(key)}] empty response")
+                if log:
+                    log(f"⧉ compaction: key[{keys.index(key)}] empty response (attempt {attempts}/{max_attempts})")
+                retries_left -= 1
+                if retries_left >= 0 and log:
+                    log(f"⧉ compaction: retrying key[{keys.index(key)}] ({retries_left} retries left)")
+                    await asyncio.sleep(retry_delay)
+                continue
+            
+            # Success! Log any accumulated errors for debugging
+            if error_details and log:
+                log(f"⧉ compaction: summarize succeeded after {len(error_details)} failed attempts")
+                for err in error_details[-3:]:  # Log last 3 errors
+                    log(f"  └─ {err}")
+            return txt.strip()
 
     suffix = " (pool rate-limited)" if seen_429 else ""
+    
+    # Log all collected error details before raising
+    if error_details and log:
+        log(f"⧉ compaction: all {attempts} summarize attempts failed:")
+        for err in error_details:
+            log(f"  └─ {err}")
+    
     raise RuntimeError(last_err or "summarize: all keys failed" + suffix)
 
 
@@ -333,8 +426,10 @@ async def maybe_compact(
             f"⧉ compaction: pool saturated ({len(candidate_keys)}/{n_keys} healthy) → trim fallback (no summarize)"
         )
     elif candidate_keys:
-        max_attempts = cfg.get("max_summarize_attempts", 3)
-        attempt_timeout = cfg.get("summarize_timeout", 8.0)
+        max_attempts = cfg.get("max_summarize_attempts", _DEFAULTS["max_summarize_attempts"])
+        attempt_timeout = cfg.get("summarize_timeout", _DEFAULTS["summarize_timeout"])
+        retry_delay = cfg.get("summarize_retry_delay", _DEFAULTS["summarize_retry_delay"])
+        max_retries = cfg.get("summarize_max_retries", _DEFAULTS["summarize_max_retries"])
         try:
             summary = await _summarize(
                 client,
@@ -346,6 +441,8 @@ async def maybe_compact(
                 log=log,
                 max_attempts=max_attempts,
                 attempt_timeout=attempt_timeout,
+                retry_delay=retry_delay,
+                max_retries=max_retries,
             )
             if len(_rolling) >= _ROLLING_CAP:
                 _rolling.clear()
