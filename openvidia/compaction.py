@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from typing import Callable, Optional
 
@@ -55,7 +56,7 @@ _DEFAULTS = {
     # Summarization NEVER uses the hot streamed model the client is hammering
     # (Codex/whatever); it uses a server-local "quiet" model so a compaction
     # request competes for keys on a DIFFERENT traffic stream, never the same.
-    # Set to "" to fall back to DEFAULT_MODEL (the single source of truth).
+    # Set to "" to fall back to the user's selected model.
     # Strongly recommended: point this at a FAST model — a reasoning-heavy
     # model needs 25s+ to compress 70k tokens.
     "summary_model": "",
@@ -101,6 +102,124 @@ def _model_budgets(cfg: dict) -> dict[str, int]:
         _model_budget_cache.clear()
         _model_budget_cache.update(overrides)
     return _model_budget_cache
+
+
+# ── Learned context windows ────────────────────────────────────────────
+# A model the proxy has never seen must work at full context with ZERO
+# configuration: providers add models continuously, and hand-maintaining a
+# budget table means every new model silently runs truncated until someone
+# notices. NVIDIA does not advertise the window on /v1/models, but it states
+# it exactly when a request exceeds it:
+#
+#     This model's maximum context length is 202752 tokens. However, your
+#     messages resulted in 320011 tokens.
+#
+# So we ask once, in the background, with a payload above every window the
+# provider currently serves. The upstream rejects it before doing any
+# inference, which makes the probe cheap; the answer is cached on disk
+# forever. Until it lands, the conservative default applies — an unknown
+# model is never allowed to overflow.
+_CTX_PROBE_CHARS = 1_300_000  # ≈325k tokens
+_CTX_LIMIT_RE = re.compile(r"maximum context length is (\d+)")
+# The ~4 chars/token estimator underestimates on code and JSON, so only spend
+# this fraction of a learned window.
+_LEARNED_SAFETY = 0.8
+
+_learned_limits: dict[str, int] = {}
+_learned_loaded = False
+_probing: set[str] = set()
+
+
+def _limits_path():
+    return config.config_dir() / "model_limits.json"
+
+
+def _load_learned() -> dict[str, int]:
+    global _learned_loaded
+    if not _learned_loaded:
+        _learned_loaded = True
+        try:
+            p = _limits_path()
+            if p.exists():
+                data = json.loads(p.read_text())
+                _learned_limits.update(
+                    {str(k): int(v) for k, v in data.items() if int(v) > 0}
+                )
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            pass
+    return _learned_limits
+
+
+def note_context_limit(model: str, body: str) -> Optional[int]:
+    """Record the window stated in an upstream error body, if any.
+
+    Passive counterpart to the probe: whenever a real request overflows, the
+    answer is right there in the error and costs nothing to keep.
+    """
+    if not model or not body:
+        return None
+    m = _CTX_LIMIT_RE.search(body)
+    if not m:
+        return None
+    limit = int(m.group(1))
+    _load_learned()
+    if _learned_limits.get(model) == limit:
+        return limit
+    _learned_limits[model] = limit
+    try:
+        config.atomic_write(_limits_path(), json.dumps(_learned_limits, indent=2))
+    except OSError:
+        pass
+    return limit
+
+
+async def _probe_context_window(client, key: str, model: str, log) -> None:
+    """One oversized request; the rejection states the window exactly."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "word " * (_CTX_PROBE_CHARS // 5)}],
+        "max_completion_tokens": 1,
+        "stream": False,
+    }
+    try:
+        resp = await client.post(
+            UPSTREAM,
+            json=payload,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            timeout=httpx.Timeout(connect=5.0, read=60.0, write=120.0, pool=60.0),
+        )
+        body = resp.text
+    except httpx.HTTPError as e:
+        log(f"⧉ compaction: context probe for {model} failed ({type(e).__name__})")
+        return
+    finally:
+        _probing.discard(model)
+
+    limit = note_context_limit(model, body)
+    if limit:
+        log(f"⧉ compaction: learned {model} context window = {limit} tokens")
+    else:
+        # It accepted a payload larger than anything the provider currently
+        # serves. Record that as a lower bound rather than probing higher.
+        lower = _CTX_PROBE_CHARS // 4
+        _load_learned()
+        _learned_limits[model] = lower
+        try:
+            config.atomic_write(_limits_path(), json.dumps(_learned_limits, indent=2))
+        except OSError:
+            pass
+        log(f"⧉ compaction: {model} accepted ≥{lower} tokens — using that as the window")
+
+
+def _resolve_budget(cfg: dict, model: str) -> int:
+    """User override → learned window → conservative default."""
+    override = _model_budgets(cfg).get(model or "")
+    if override:
+        return int(override)
+    learned = _load_learned().get(model or "")
+    if learned:
+        return int(learned * _LEARNED_SAFETY)
+    return int(cfg["budget_tokens"])
 
 
 _settings_cache: tuple[float, float, dict] | None = None
@@ -548,10 +667,24 @@ async def maybe_compact(
     # override comes from the user compaction.json ``model_budgets`` map
     # (dynamic, no hardcoded provider names). Falls back to budget_tokens.
     reserved = cfg.get("reserved_tokens", _DEFAULTS["reserved_tokens"])
-    model_budget = _model_budgets(cfg).get(
-        state.active_model or "", cfg["budget_tokens"]
-    )
-    budget = max(model_budget - reserved, reserved)
+    active = state.active_model or ""
+    # An unseen model runs on the conservative default while a one-off
+    # background probe learns its real window. No per-model configuration is
+    # ever required — a model added by the provider tomorrow works at full
+    # context the request after we first see it.
+    if (
+        active
+        and active not in _model_budgets(cfg)
+        and active not in _load_learned()
+        and active not in _probing
+    ):
+        keys, _ = _healthy_keys(state)
+        if keys:
+            _probing.add(active)
+            asyncio.ensure_future(
+                _probe_context_window(client, keys[0], active, log)
+            )
+    budget = max(_resolve_budget(cfg, active) - reserved, reserved)
     if estimate_tokens(messages) <= budget:
         return messages
 
@@ -596,11 +729,11 @@ async def maybe_compact(
     # Summarize ALWAYS runs on the server-local "quiet" model, NOT the hot
     # streamed model the client is saturating. Using the same model would
     # compete with the very requests that triggered compaction and burn the
-    # only available RPM. No hardcoded model here — DEFAULT_MODEL is the
-    # single source of truth when summary_model is unset.
-    from .proxy_app import DEFAULT_MODEL
+    # only available RPM. No hardcoded model here — the user's selection
+    # is the source of truth when summary_model is unset.
+    from .proxy_app import default_model
 
-    summary_model = cfg.get("summary_model") or DEFAULT_MODEL
+    summary_model = cfg.get("summary_model") or default_model(state)
     candidate_keys, n_keys = _healthy_keys(state)
     min_healthy = max(1, int(n_keys * cfg.get("min_healthy_fraction", 0.25)))
 

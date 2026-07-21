@@ -350,3 +350,50 @@ class TestCompactionTarget:
         out = await maybe_compact(big, state=state, client=None, log=lambda m: None)
         budget = 80_000 - 8_000
         assert estimate_tokens(out) <= budget * 0.6 + 1
+
+
+class TestLearnedContextWindows:
+    """A model the proxy has never seen must reach full context with no config."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(compaction.config, "config_dir", lambda: tmp_path)
+        compaction._learned_limits.clear()
+        compaction._learned_loaded = False
+        compaction._probing.clear()
+        yield
+        compaction._learned_limits.clear()
+        compaction._learned_loaded = False
+
+    def test_learns_the_window_from_an_upstream_error(self):
+        body = (
+            '{"message":"This model\'s maximum context length is 202752 tokens. '
+            'However, your messages resulted in 320011 tokens."}'
+        )
+        assert compaction.note_context_limit("vendor/new-model", body) == 202752
+        assert compaction._learned_limits["vendor/new-model"] == 202752
+
+    def test_learned_window_survives_a_reload(self, tmp_path):
+        compaction.note_context_limit("vendor/new-model", "maximum context length is 131072 tokens")
+        compaction._learned_limits.clear()
+        compaction._learned_loaded = False
+        assert compaction._load_learned()["vendor/new-model"] == 131072
+
+    def test_unrelated_errors_are_ignored(self):
+        assert compaction.note_context_limit("vendor/m", "rate limit exceeded") is None
+        assert compaction._learned_limits == {}
+
+    def test_budget_precedence_override_then_learned_then_default(self):
+        cfg = {**compaction._DEFAULTS, "model_budgets": {"vendor/pinned": 50_000}}
+        compaction.note_context_limit("vendor/learned", "maximum context length is 200000 tokens")
+
+        assert compaction._resolve_budget(cfg, "vendor/pinned") == 50_000
+        # a learned window is spent only up to the safety margin
+        assert compaction._resolve_budget(cfg, "vendor/learned") == int(
+            200_000 * compaction._LEARNED_SAFETY
+        )
+        assert compaction._resolve_budget(cfg, "vendor/unknown") == cfg["budget_tokens"]
+
+    def test_unknown_model_stays_conservative_until_learned(self):
+        cfg = dict(compaction._DEFAULTS)
+        assert compaction._resolve_budget(cfg, "vendor/brand-new") == cfg["budget_tokens"]

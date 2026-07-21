@@ -39,6 +39,11 @@ from .proxy_state import ProxyState
 # least-loaded ordering already puts the best keys first), give each send a
 # bounded connect+read+write+pool timeout, and fast-fail the whole loop as
 # soon as the live (RPM-eligible) pool is too small to bother.
+# Upstream gateway timeouts: the provider's edge gave up waiting for the
+# model. Every key would hit the same wall, so these must not be charged to
+# the key that happened to carry the request.
+_GATEWAY_TIMEOUTS = {502, 503, 504}
+
 _MAX_ROTATE_ATTEMPTS = 5          # hard cap on sends per model phase
 _ROTATE_SEND_TIMEOUT = httpx.Timeout(**config.httpx_timeout_kwargs())
 _MIN_LIVE_FRACTION = 0.2          # <20% of valid keys live → 503 fast
@@ -85,6 +90,14 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
             break
         attempts += 1
         hdrs = headers_factory(k, idx)
+        # Claim the key BEFORE sending. get_candidate_keys() scores a key by
+        # in_flight + recent RPM, and neither is set until a request finishes:
+        # without this claim, N requests arriving together all score every key
+        # at zero, tie-break on index, and pile onto key[0] while the rest of
+        # the pool idles. That is how a 26-key pool produces 429s.
+        state.begin_in_flight(k)
+        released = False
+        resp = None
         try:
             req = client.build_request("POST", upstream, json=payload, headers=hdrs, timeout=timeout)
             resp = await client.send(req, stream=stream)
@@ -101,12 +114,21 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
                 f"  {log_tag}: key[{idx}] no first byte in {timeout.read:.0f}s "
                 f"— model too slow, not a key fault"
             )
+            state.end_in_flight(k)
+            released = True
             break
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
             state.log_cb(f"  {log_tag}: key[{idx}] {err_msg} (rotating)")
+            state.end_in_flight(k)
+            released = True
             state.mark_key_failed(k)
             continue
+        finally:
+            # A 200 keeps the claim: the key stays busy for as long as the
+            # stream runs, and the caller releases it when the body ends.
+            if not released and (resp is None or resp.status_code != 200):
+                state.end_in_flight(k)
         if resp.status_code == 200:
             return resp, k, idx
         err_status = resp.status_code
@@ -121,6 +143,16 @@ async def _rotation_phase(client, upstream, payload, headers_factory,
         state.log_cb(f"  {log_tag}: key[{idx}] HTTP {err_status}")
         if err_status == 429:
             seen_429_box[0] = True
+        # A gateway timeout is the MODEL being slow, not the key being bad:
+        # NVIDIA's edge gave up waiting for it, and every other key would hit
+        # the same wall. Cooling keys down for it empties the pool one 504 at
+        # a time, which is precisely what a 26-key pool exists to prevent.
+        if err_status in _GATEWAY_TIMEOUTS:
+            state.log_cb(
+                f"  {log_tag}: HTTP {err_status} is an upstream gateway timeout "
+                f"— key[{idx}] left healthy"
+            )
+            continue
         state.mark_key_failed(k, status=err_status, error_body=error_body if error_body else None)
     return None, None, None
 
@@ -367,9 +399,9 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
 
     # model_override (from state.active_model) takes precedence; otherwise use
     # the NVIDIA default — never forward "openvidia/openvidia" to NVIDIA.
-    # No hardcoded model here — DEFAULT_MODEL is the single source of truth.
-    from .proxy_app import DEFAULT_MODEL
-    effective_model = model_override or DEFAULT_MODEL
+    # No hardcoded model: resolved live from the user's selection.
+    from .proxy_app import default_model
+    effective_model = model_override or default_model()
 
     payload: dict[str, Any] = {
         "model": effective_model,
@@ -858,6 +890,9 @@ async def _stream_responses(
     )
 
     await resp.aclose()
+    # Release the load-balancer claim taken in _rotation_phase. Without this
+    # the key looks permanently busy and the scheduler stops choosing it.
+    state.end_in_flight(used_key)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────
@@ -958,6 +993,7 @@ async def handle_responses(
 
     chat_data = resp.json()
     await resp.aclose()
+    state.end_in_flight(used_key)  # release the load-balancer claim
 
     responses_data = _chat_response_to_responses(
         chat_data, model_override or chat_payload["model"]

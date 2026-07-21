@@ -778,3 +778,60 @@ class TestMarkKeyFailedUnknownKey:
     def test_other_statuses_for_unknown_key_do_not_raise(self, proxy_state):
         for status in (0, 400, 401, 404, 500):
             proxy_state.mark_key_failed("nvapi-not-in-the-pool", status=status)
+
+
+class TestKeySpreadUnderConcurrency:
+    """N requests arriving together must land on N different keys.
+
+    get_candidate_keys() scores a key by in_flight + recent RPM. Neither is
+    set until a request completes, so a caller that does not claim the key
+    before sending makes every concurrent request score the whole pool at
+    zero, tie-break on index, and pile onto key[0] — a 26-key pool producing
+    429s while 25 keys idle.
+    """
+
+    def test_concurrent_selection_spreads_across_the_pool(self, sample_keys):
+        state = ProxyState(
+            keys=sample_keys,
+            stats=ProxyStats(current_index=0),
+            index_path=Path("/tmp/test_spread_index.json"),
+            log_cb=MagicMock(),
+            port=3940,
+        )
+        chosen = []
+        for _ in range(len(sample_keys)):
+            candidates = state.get_candidate_keys()
+            _idx, key = candidates[0]
+            state.begin_in_flight(key)  # what the request paths must do
+            chosen.append(key)
+
+        assert len(set(chosen)) == len(sample_keys), (
+            f"concurrent requests collapsed onto {len(set(chosen))} of "
+            f"{len(sample_keys)} keys: {chosen}"
+        )
+
+    def test_without_claiming_they_all_pick_the_same_key(self, sample_keys):
+        """Documents the failure mode the claim exists to prevent."""
+        state = ProxyState(
+            keys=sample_keys,
+            stats=ProxyStats(current_index=0),
+            index_path=Path("/tmp/test_spread_index2.json"),
+            log_cb=MagicMock(),
+            port=3940,
+        )
+        chosen = [state.get_candidate_keys()[0][1] for _ in range(len(sample_keys))]
+        assert len(set(chosen)) == 1
+
+    def test_released_key_becomes_selectable_again(self, sample_keys):
+        state = ProxyState(
+            keys=sample_keys,
+            stats=ProxyStats(current_index=0),
+            index_path=Path("/tmp/test_spread_index3.json"),
+            log_cb=MagicMock(),
+            port=3940,
+        )
+        first = state.get_candidate_keys()[0][1]
+        state.begin_in_flight(first)
+        assert state.get_candidate_keys()[0][1] != first
+        state.end_in_flight(first)
+        assert state.get_candidate_keys()[0][1] == first

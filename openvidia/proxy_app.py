@@ -27,7 +27,22 @@ MAX_BODY_BYTES = 64 * 1024 * 1024
 # just burns cooldown budget. 401/403/429 are key-specific → rotate + cooldown.
 ROTATE_STATUSES = {401, 403, 429}
 
-DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"
+def default_model(state: Optional[ProxyState] = None) -> str:
+    """The model a request runs on when the client sends the ``openvidia`` alias.
+
+    Resolved live, never hardcoded: a pinned model name is a liability the day
+    the provider retires it or ships something better, and it silently
+    overrides what the user picked in the dashboard. Order: the active
+    selection, then the first starred preset. Empty means the user has not
+    chosen a model yet, and the caller must say so rather than invent one.
+    """
+    if state is not None and state.active_model:
+        return state.active_model
+    try:
+        presets = config.load_saved_presets()
+    except Exception:  # noqa: BLE001 — model choice must never break a request
+        presets = []
+    return presets[0] if presets else ""
 
 # Bounded rotation: cap the number of upstream sends per rotation phase and
 # give each send a bounded connect+read+write+pool timeout. The catch-all
@@ -320,14 +335,20 @@ def create_app(state: ProxyState, web_dir: Optional[Path] = None) -> FastAPI:
             except json.JSONDecodeError:
                 payload = None
 
-        # Model alias: "openvidia" resolves to the user's active model or the default.
+        # Model alias: "openvidia" resolves to the user's active model.
         if isinstance(payload, dict):
             m = state.active_model or payload.get("model")
             if isinstance(m, str) and m != "openvidia":
                 payload["model"] = m
                 body = json.dumps(payload).encode()
             elif m == "openvidia":
-                payload["model"] = DEFAULT_MODEL
+                resolved = default_model(state)
+                if not resolved:
+                    return JSONResponse(
+                        {"error": "no model selected — pick one in the dashboard"},
+                        status_code=400,
+                    )
+                payload["model"] = resolved
                 body = json.dumps(payload).encode()
 
         # Auto-compaction: if conversation history exceeds the token budget,

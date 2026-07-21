@@ -131,6 +131,9 @@ UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
 # rotating keys cannot fix them and would only waste quota. Surface them
 # directly to the client.
 _CLIENT_ERR = {400, 404}
+# Provider edge gave up waiting for the model — every key hits the same wall,
+# so these must not be charged to the key that carried the request.
+_GATEWAY_TIMEOUTS = {502, 503, 504}
 
 
 def _extract_err(raw: bytes, status: int) -> str:
@@ -297,9 +300,9 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
     messages = _anthropic_to_chat_messages(body)
 
     # model_override (from state.active_model) takes precedence.
-    # No hardcoded model here — DEFAULT_MODEL is the single source of truth.
-    from .proxy_app import DEFAULT_MODEL
-    effective_model = model_override or DEFAULT_MODEL
+    # No hardcoded model: resolved live from the user's selection.
+    from .proxy_app import default_model
+    effective_model = model_override or default_model()
 
     payload: dict[str, Any] = {
         "model": effective_model,
@@ -458,6 +461,9 @@ async def _stream_anthropic(
             "Content-Type": "application/json",
             "User-Agent": "openvidia/2.0",
         }
+        # Claim the key before sending — see _rotation_phase in
+        # responses_shim.py for why the load balancer needs this.
+        state.begin_in_flight(k)
         try:
             req = client.build_request(
                 "POST", UPSTREAM, json=chat_payload, headers=hdrs
@@ -469,20 +475,23 @@ async def _stream_anthropic(
                 f"  anthropic shim: key[{idx}] no first byte — model too slow, "
                 f"not a key fault"
             )
+            state.end_in_flight(k)
             break
         except httpx.HTTPError as e:
             err_msg = str(e) or type(e).__name__
             state.log_cb(
                 f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)"
             )
+            state.end_in_flight(k)
             state.mark_key_failed(k)
             continue
 
         if resp.status_code == 200:
-            used_key = k
+            used_key = k  # claim held until the stream ends
             used_idx = idx
             break
 
+        state.end_in_flight(k)
         err_status = resp.status_code
         err_raw = await resp.aread()
         await resp.aclose()
@@ -501,6 +510,13 @@ async def _stream_anthropic(
                 },
             )
             return
+        if err_status in _GATEWAY_TIMEOUTS:
+            # Provider edge gave up on the model; not this key's fault.
+            state.log_cb(
+                f"  anthropic shim: HTTP {err_status} is an upstream gateway "
+                f"timeout — key[{idx}] left healthy"
+            )
+            continue
         state.mark_key_failed(k, status=err_status)
 
     if resp is None or used_key is None:
@@ -697,6 +713,7 @@ async def _stream_anthropic(
         yield _sse_event("message_stop", {"type": "message_stop"})
 
     await resp.aclose()
+    state.end_in_flight(used_key)  # release the load-balancer claim
 
 
 # ── Entry point ─────────────────────────────────────────────────────────
