@@ -10,7 +10,7 @@ jobs:
     runs-on: [self-hosted, soliso, openvidia]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install / update package
         run: python3 -m pip install --break-system-packages -e . --quiet
