@@ -458,6 +458,7 @@ async def _stream_anthropic(
     for pass_num in range(3):
         if pass_num > 0:
             import asyncio
+
             await asyncio.sleep(1.0)
         for idx, k in candidates:
             if not state.key_can_send_rpm(k) or state.is_key_on_cooldown(k):
@@ -499,6 +500,7 @@ async def _stream_anthropic(
 
             if err_status == 429 and is_resource_exhausted(err_raw):
                 import asyncio
+
                 state.log_cb(
                     f"  anthropic shim: key[{idx}] ResourceExhausted (worker full) — pausing 0.8s"
                 )
@@ -520,8 +522,7 @@ async def _stream_anthropic(
                 return
             if err_status in _GATEWAY_TIMEOUTS:
                 state.log_cb(
-                    f"  anthropic shim: HTTP {err_status} gateway timeout — "
-                    f"key[{idx}] 10s cooldown"
+                    f"  anthropic shim: HTTP {err_status} gateway timeout — key[{idx}] 10s cooldown"
                 )
                 state.mark_key_failed(k, status=err_status, retry_after=10)
                 continue
@@ -818,6 +819,7 @@ async def handle_anthropic_messages(
     for pass_num in range(3):
         if pass_num > 0:
             import asyncio
+
             await asyncio.sleep(1.0)
         for idx, k in candidates:
             if not state.key_can_send_rpm(k) or state.is_key_on_cooldown(k):
@@ -851,6 +853,7 @@ async def handle_anthropic_messages(
             resp = None
             if err_status == 429 and is_resource_exhausted(err_raw):
                 import asyncio
+
                 state.log_cb(
                     f"  anthropic shim: key[{idx}] ResourceExhausted (worker full) — pausing 0.8s"
                 )

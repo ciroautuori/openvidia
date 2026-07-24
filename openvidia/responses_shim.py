@@ -183,12 +183,13 @@ async def _rotation_phase(
             # a time, which is precisely what a 26-key pool exists to prevent.
             if err_status in _GATEWAY_TIMEOUTS:
                 state.log_cb(
-                    f"  {log_tag}: HTTP {err_status} gateway timeout — "
-                    f"key[{idx}] 10s cooldown"
+                    f"  {log_tag}: HTTP {err_status} gateway timeout — key[{idx}] 10s cooldown"
                 )
                 state.mark_key_failed(k, status=err_status, retry_after=10)
                 continue
-            state.mark_key_failed(k, status=err_status, error_body=error_body if error_body else None)
+            state.mark_key_failed(
+                k, status=err_status, error_body=error_body if error_body else None
+            )
     return None, None, None
 
 

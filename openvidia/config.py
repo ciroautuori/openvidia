@@ -97,7 +97,6 @@ def outbound_proxy() -> str | None:
     return None
 
 
-
 # ── Thinking / reasoning toggle ────────────────────────────────────────
 # Hybrid reasoning models emit nothing until they finish thinking, which is
 # the difference between a 2s and a 160s first token. Providers expose the

@@ -340,7 +340,9 @@ def _setup_codex():
         # Provider custom: openai-direct per modelli GPT/Codex (gpt-5-codex, gpt-5.5)
         # Non possiamo usare "openai" perché Codex lo riserva come built-in.
         # Richiede una vera OPENAI_API_KEY (sk-...) nell'env.
-        new_lines.append("# Provider custom: openai-direct (GPT/Codex — richiede OPENAI_API_KEY sk-...)")
+        new_lines.append(
+            "# Provider custom: openai-direct (GPT/Codex — richiede OPENAI_API_KEY sk-...)"
+        )
         new_lines.append("[model_providers.openai-direct]")
         new_lines.append('name = "OpenAI Direct"')
         new_lines.append('base_url = "https://api.openai.com/v1"')
@@ -403,8 +405,8 @@ def _setup_claude_code():
         if content and not content.endswith("\n"):
             f.write("\n")
         f.write("\n# Claude Code → OpenVidia Anthropic shim\n")
-        for l in lines_to_add:
-            f.write(l + "\n")
+        for line in lines_to_add:
+            f.write(line + "\n")
 
     print(f"✓ Configured Claude Code → {rc}")
     print(f"  ANTHROPIC_BASE_URL=http://localhost:{PORT}")
@@ -508,7 +510,7 @@ def _setup_proxy_config():
     if not p.exists():
         default_cfg = {
             "outbound_proxy": "",
-            "comment": "Set outbound_proxy (e.g. http://user:pass@proxy.example.com:8080) for IP rotation across large key pools"
+            "comment": "Set outbound_proxy (e.g. http://user:pass@proxy.example.com:8080) for IP rotation across large key pools",
         }
         config.atomic_write(p, json.dumps(default_cfg, indent=2))
         print(f"✓ Created proxy config template → {p}")

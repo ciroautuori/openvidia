@@ -42,14 +42,15 @@ DEFAULT_COOLDOWN = 30.0
 
 # Adaptive cooldown multiplier: increases cooldown for repeated failures
 ADAPTIVE_COOLDOWN_MULTIPLIER = 1.5  # Each consecutive failure multiplies cooldown by this
-ADAPTIVE_COOLDOWN_MAX = 1.5  # Capped at 1.5x base cooldown (~65s max) to prevent indefinite lockouts
+ADAPTIVE_COOLDOWN_MAX = (
+    1.5  # Capped at 1.5x base cooldown (~65s max) to prevent indefinite lockouts
+)
 
 # Adaptive RPM: per-key ceiling is halved on a 429 (jittered backoff) and
 # restored to MAX_RPM on the next success.
 ADAPTIVE_429_FACTOR = 0.5  # multiply per-key ceiling by this on each 429
 ADAPTIVE_FLOOR_RPM = 14  # minimum floor per-key to maintain throughput
 ADAPTIVE_REHAB_STEP = 10  # fast per-key ceiling growth (+10 RPM) on success
-
 
 
 # ── Per-key state ──────────────────────────────────────────────────────
@@ -418,6 +419,7 @@ class ProxyState:
             # herd while still staggering simultaneous 429s.
             if multiplier is None:
                 import random
+
                 _r = random.Random(int(time.time()) ^ (hash(key) & 0xFFFFFFFF))
                 base_duration = COOLDOWN_DURATIONS[429] + _r.uniform(0.0, 10.0)
             # Apply adaptive multiplier only when we chose the base (no

@@ -71,7 +71,9 @@ def should_rotate(status: int) -> bool:
     return status in ROTATE_STATUSES or status >= 500
 
 
-async def _check_key_health(client: httpx.AsyncClient, key: str, sem: asyncio.Semaphore | None = None) -> bool:
+async def _check_key_health(
+    client: httpx.AsyncClient, key: str, sem: asyncio.Semaphore | None = None
+) -> bool:
     headers = {"Authorization": f"Bearer {key}", "User-Agent": "openvidia/2.0"}
     try:
         if sem is not None:
@@ -185,8 +187,6 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         limits=limits,
         timeout=httpx.Timeout(**config.httpx_timeout_kwargs()),
     )
-
-
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -371,7 +371,6 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 payload["model"] = resolved
                 body = json.dumps(payload).encode()
 
-
         # Thinking toggle (dashboard setting; never overrides the client).
         if isinstance(payload, dict) and payload.get("model"):
             before = json.dumps(payload, sort_keys=True)
@@ -416,9 +415,7 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 None,
             )
             if fallback and isinstance(payload, dict):
-                state.log_cb(
-                    f"🔴 {requested_model} circuit OPEN → auto-failover to {fallback}"
-                )
+                state.log_cb(f"🔴 {requested_model} circuit OPEN → auto-failover to {fallback}")
                 payload["model"] = fallback
                 body = json.dumps(payload).encode()
                 requested_model = fallback
@@ -596,7 +593,9 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                         pass
                     await resp.aclose()
                     if status == 429 and is_resource_exhausted(_resp_body):
-                        _rotate_attempts -= 1  # Don't burn attempt budget on worker-level transient peak
+                        _rotate_attempts -= (
+                            1  # Don't burn attempt budget on worker-level transient peak
+                        )
                         state.log_cb(
                             f"key[{orig_idx}] ResourceExhausted (worker full) — "
                             f"pausing 0.8s for worker slot to free"
@@ -639,41 +638,49 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
     async def _ops_health() -> JSONResponse:
         """Structured health report: model circuit states, pool stats, recent logs."""
         import time as _time
+
         now = _time.time()
         models_out = []
         for model, h in state.model_health.items():
-            models_out.append({
-                "model": model,
-                "requests": h.requests,
-                "success": h.success,
-                "failure_rate": round(h.failure_rate, 2),
-                "too_slow": h.too_slow,
-                "gateway_timeouts": h.gateway_timeouts,
-                "rate_limited": h.rate_limited,
-                "median_ttft_s": round(h.median_ttft, 1),
-                "circuit_open": h.is_circuit_open,
-                "consecutive_failures": h.consecutive_failures,
-                "circuit_reset_in_s": max(0, round(h.CIRCUIT_RESET_AFTER - (now - h.circuit_opened_at), 1))
-                    if h.is_circuit_open else 0,
-            })
+            models_out.append(
+                {
+                    "model": model,
+                    "requests": h.requests,
+                    "success": h.success,
+                    "failure_rate": round(h.failure_rate, 2),
+                    "too_slow": h.too_slow,
+                    "gateway_timeouts": h.gateway_timeouts,
+                    "rate_limited": h.rate_limited,
+                    "median_ttft_s": round(h.median_ttft, 1),
+                    "circuit_open": h.is_circuit_open,
+                    "consecutive_failures": h.consecutive_failures,
+                    "circuit_reset_in_s": max(
+                        0, round(h.CIRCUIT_RESET_AFTER - (now - h.circuit_opened_at), 1)
+                    )
+                    if h.is_circuit_open
+                    else 0,
+                }
+            )
         live_keys, valid_keys = state.count_live_candidates()
         recent_logs = list(state.log_buffer)[-50:]
-        return JSONResponse({
-            "pool": {
-                "n_keys": len(state.keys),
-                "n_healthy": valid_keys,
-                "n_live_rpm": live_keys,
-                "n_on_cooldown": sum(1 for k in state.keys if state.is_key_on_cooldown(k)),
-                "aggregate_rpm": sum(state.key_rpm(k) for k in state.keys),
-                "rpm_ceiling": len(state.keys) * 28,
-            },
-            "models": models_out,
-            "presets": config.load_saved_presets(),
-            "active_model": state.active_model,
-            "total_requests": state.stats.requests,
-            "total_success": state.stats.success,
-            "total_rotations": state.stats.rotations,
-            "recent_logs": recent_logs,
-        })
+        return JSONResponse(
+            {
+                "pool": {
+                    "n_keys": len(state.keys),
+                    "n_healthy": valid_keys,
+                    "n_live_rpm": live_keys,
+                    "n_on_cooldown": sum(1 for k in state.keys if state.is_key_on_cooldown(k)),
+                    "aggregate_rpm": sum(state.key_rpm(k) for k in state.keys),
+                    "rpm_ceiling": len(state.keys) * 28,
+                },
+                "models": models_out,
+                "presets": config.load_saved_presets(),
+                "active_model": state.active_model,
+                "total_requests": state.stats.requests,
+                "total_success": state.stats.success,
+                "total_rotations": state.stats.rotations,
+                "recent_logs": recent_logs,
+            }
+        )
 
     return app
