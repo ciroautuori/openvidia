@@ -97,7 +97,7 @@ async def _rotation_phase(
         if pass_num > 0:
             await asyncio.sleep(1.0)
         for idx, k in candidates:
-            if not state.key_can_send_rpm(k):
+            if not state.key_can_send_rpm(k) or state.is_key_on_cooldown(k):
                 continue
             if attempts >= max_attempts:
                 break

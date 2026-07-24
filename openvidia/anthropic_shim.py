@@ -460,7 +460,7 @@ async def _stream_anthropic(
             import asyncio
             await asyncio.sleep(1.0)
         for idx, k in candidates:
-            if not state.key_can_send_rpm(k):
+            if not state.key_can_send_rpm(k) or state.is_key_on_cooldown(k):
                 continue
             hdrs = {
                 "Authorization": f"Bearer {k}",
@@ -820,7 +820,7 @@ async def handle_anthropic_messages(
             import asyncio
             await asyncio.sleep(1.0)
         for idx, k in candidates:
-            if not state.key_can_send_rpm(k):
+            if not state.key_can_send_rpm(k) or state.is_key_on_cooldown(k):
                 continue
             hdrs = {
                 "Authorization": f"Bearer {k}",
