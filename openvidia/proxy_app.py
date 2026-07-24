@@ -469,148 +469,147 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                         f"(fallback/503)"
                     )
                     break
-                if not state.key_can_send_rpm(key):
-                    state.log_cb(f"  key[{orig_idx}] RPM saturated ({state.key_rpm(key)}/min), skip")
+                if not state.key_can_send_rpm(key) or state.is_key_on_cooldown(key):
                     continue
 
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "User-Agent": "openvidia/2.0",
-            }
-            for k, v in request.headers.items():
-                if k.lower() in CLIENT_FWD_HEADERS:
-                    headers[k] = v
-            if isinstance(payload, dict) and "content-type" not in {k.lower() for k in headers}:
-                headers["Content-Type"] = "application/json"
-
-            state.begin_in_flight(key)
-            _rotate_attempts += 1
-            _model = payload.get("model", "") if isinstance(payload, dict) else ""
-            _t0 = time.monotonic()
-            # First attempt uses the fast probe timeout to detect dead models
-            # immediately. Subsequent attempts (the model is probably just slow)
-            # use the full streaming timeout.
-            _timeout = _MODEL_PROBE_TIMEOUT if _rotate_attempts == 1 else _ROTATE_SEND_TIMEOUT
-            try:
-                req = client.build_request(
-                    request.method,
-                    url,
-                    content=body,
-                    headers=headers,
-                    timeout=_timeout,
-                )
-                # Global concurrency semaphore: never exceed 28 concurrent
-                # upstream sends (NVIDIA worker limit is 32/32).
-                async with get_upstream_sem():
-                    resp = await client.send(req, stream=True)
-            except httpx.ReadTimeout:
-                # Slow model or dead model.
-                state.end_in_flight(key)
-                _ttft_wait = _timeout.read
-                state.log_cb(
-                    f"key[{orig_idx}] no first byte in {_ttft_wait:.0f}s — model too slow/down"
-                )
-                state.stats.record_key_usage(key, ok=False, error="ReadTimeout")
-                state.record_model_result(_model, too_slow=True)
-                # On first attempt with probe timeout: continue rotating to confirm
-                # it's a model issue not a single-key fluke.
-                if _rotate_attempts == 1:
-                    continue
-                # After 2nd timeout: model is confirmed dead, break immediately.
-                break
-            except httpx.HTTPError as e:
-                state.end_in_flight(key)
-                err_msg = str(e) or type(e).__name__
-                state.log_cb(f"key[{orig_idx}] {err_msg}")
-                state.stats.record_key_usage(key, ok=False, error=err_msg)
-                state.mark_key_failed(key)
-                state.stats.rotations += 1
-                persist_index(state, (orig_idx + 1) % total_keys)
-                continue
-
-            status = resp.status_code
-
-            if 200 <= status < 300:
-                state.stats.success += 1
-                state.stats.record_key_usage(key, ok=True)
-                state.record_request(key)
-                state.restore_key(key)
-                _ttft = time.monotonic() - _t0
-                state.record_model_result(_model, ok=True, ttft=_ttft)
-                if nv_path != "models":
-                    state.log_cb(f"✔ key[{orig_idx}] OK ({_ttft:.1f}s TTFT)")
-
-                out_headers = {
-                    k: v
-                    for k, v in resp.headers.items()
-                    if k.lower() not in STRIPPED_RESPONSE_HEADERS
+                headers = {
+                    "Authorization": f"Bearer {key}",
+                    "User-Agent": "openvidia/2.0",
                 }
-                out_headers["access-control-allow-origin"] = "*"
-                out_headers["access-control-allow-headers"] = "Content-Type, Authorization"
-                out_headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
+                for k, v in request.headers.items():
+                    if k.lower() in CLIENT_FWD_HEADERS:
+                        headers[k] = v
+                if isinstance(payload, dict) and "content-type" not in {k.lower() for k in headers}:
+                    headers["Content-Type"] = "application/json"
 
-                # Bind the loop variables explicitly. The return below leaves
-                # the loop immediately, so late binding could not bite here —
-                # but a reader (and the linter) should not have to prove that.
-                async def body_iter(resp=resp, key=key, orig_idx=orig_idx):
-                    try:
-                        async for chunk in resp.aiter_raw():
-                            if await request.is_disconnected():
-                                break
-                            yield chunk
-                    except (httpx.ReadTimeout, httpx.StreamError, httpx.HTTPError) as e:
-                        state.log_cb(f"key[{orig_idx}] stream timeout/error: {e}")
-                    finally:
-                        state.end_in_flight(key)
-                        await resp.aclose()
-
-                return StreamingResponse(body_iter(), status_code=status, headers=out_headers)
-
-            state.end_in_flight(key)
-            state.log_cb(f"key[{orig_idx}] HTTP {status}")
-            last_status = status
-
-            # Gateway timeouts (502/503/504): upstream overload, not the
-            # key's fault. Short cooldown prevents hammering the same
-            # broken upstream instance while still letting the next key
-            # try — if the entire pool is hitting the same wall, all keys
-            # will briefly cooldown and the saturation gate will kick in.
-            if status in {502, 503, 504}:
-                state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
-                state.mark_key_failed(key, status=status, retry_after=10)
-                state.record_model_result(_model, status=status)
-                state.stats.rotations += 1
-                await resp.aclose()
-                continue
-
-            if should_rotate(status):
-                retry_after = resp.headers.get("retry-after")
-                # Check if this 429 is a ResourceExhausted (worker concurrency
-                # limit) vs. a real RPM rate-limit. Concurrency errors are
-                # transient: the worker frees a slot as soon as any in-flight
-                # request finishes, so burning the key with a 45s+ cooldown
-                # just depletes the pool. Treat it as a brief skip instead.
-                _resp_body = None
+                state.begin_in_flight(key)
+                _rotate_attempts += 1
+                _model = payload.get("model", "") if isinstance(payload, dict) else ""
+                _t0 = time.monotonic()
+                # First attempt uses the fast probe timeout to detect dead models
+                # immediately. Subsequent attempts (the model is probably just slow)
+                # use the full streaming timeout.
+                _timeout = _MODEL_PROBE_TIMEOUT if _rotate_attempts == 1 else _ROTATE_SEND_TIMEOUT
                 try:
-                    _resp_body = await resp.aread()
-                except Exception:
-                    pass
-                await resp.aclose()
-                if status == 429 and is_resource_exhausted(_resp_body):
-                    _rotate_attempts -= 1  # Don't burn attempt budget on worker-level transient peak
-                    state.log_cb(
-                        f"key[{orig_idx}] ResourceExhausted (worker full) — "
-                        f"pausing 0.8s for worker slot to free"
+                    req = client.build_request(
+                        request.method,
+                        url,
+                        content=body,
+                        headers=headers,
+                        timeout=_timeout,
                     )
-                    state.stats.record_key_usage(key, ok=False, error="ResourceExhausted")
+                    # Global concurrency semaphore: never exceed 28 concurrent
+                    # upstream sends (NVIDIA worker limit is 32/32).
+                    async with get_upstream_sem():
+                        resp = await client.send(req, stream=True)
+                except httpx.ReadTimeout:
+                    # Slow model or dead model.
+                    state.end_in_flight(key)
+                    _ttft_wait = _timeout.read
+                    state.log_cb(
+                        f"key[{orig_idx}] no first byte in {_ttft_wait:.0f}s — model too slow/down"
+                    )
+                    state.stats.record_key_usage(key, ok=False, error="ReadTimeout")
+                    state.record_model_result(_model, too_slow=True)
+                    # On first attempt with probe timeout: continue rotating to confirm
+                    # it's a model issue not a single-key fluke.
+                    if _rotate_attempts == 1:
+                        continue
+                    # After 2nd timeout: model is confirmed dead, break immediately.
+                    break
+                except httpx.HTTPError as e:
+                    state.end_in_flight(key)
+                    err_msg = str(e) or type(e).__name__
+                    state.log_cb(f"key[{orig_idx}] {err_msg}")
+                    state.stats.record_key_usage(key, ok=False, error=err_msg)
+                    state.mark_key_failed(key)
                     state.stats.rotations += 1
-                    await asyncio.sleep(0.8)
+                    persist_index(state, (orig_idx + 1) % total_keys)
                     continue
-                state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
-                state.mark_key_failed(key, status=status, retry_after=retry_after)
-                state.stats.rotations += 1
-                persist_index(state, (orig_idx + 1) % total_keys)
-                continue
+
+                status = resp.status_code
+
+                if 200 <= status < 300:
+                    state.stats.success += 1
+                    state.stats.record_key_usage(key, ok=True)
+                    state.record_request(key)
+                    state.restore_key(key)
+                    _ttft = time.monotonic() - _t0
+                    state.record_model_result(_model, ok=True, ttft=_ttft)
+                    if nv_path != "models":
+                        state.log_cb(f"✔ key[{orig_idx}] OK ({_ttft:.1f}s TTFT)")
+
+                    out_headers = {
+                        k: v
+                        for k, v in resp.headers.items()
+                        if k.lower() not in STRIPPED_RESPONSE_HEADERS
+                    }
+                    out_headers["access-control-allow-origin"] = "*"
+                    out_headers["access-control-allow-headers"] = "Content-Type, Authorization"
+                    out_headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
+
+                    # Bind the loop variables explicitly. The return below leaves
+                    # the loop immediately, so late binding could not bite here —
+                    # but a reader (and the linter) should not have to prove that.
+                    async def body_iter(resp=resp, key=key, orig_idx=orig_idx):
+                        try:
+                            async for chunk in resp.aiter_raw():
+                                if await request.is_disconnected():
+                                    break
+                                yield chunk
+                        except (httpx.ReadTimeout, httpx.StreamError, httpx.HTTPError) as e:
+                            state.log_cb(f"key[{orig_idx}] stream timeout/error: {e}")
+                        finally:
+                            state.end_in_flight(key)
+                            await resp.aclose()
+
+                    return StreamingResponse(body_iter(), status_code=status, headers=out_headers)
+
+                state.end_in_flight(key)
+                state.log_cb(f"key[{orig_idx}] HTTP {status}")
+                last_status = status
+
+                # Gateway timeouts (502/503/504): upstream overload, not the
+                # key's fault. Short cooldown prevents hammering the same
+                # broken upstream instance while still letting the next key
+                # try — if the entire pool is hitting the same wall, all keys
+                # will briefly cooldown and the saturation gate will kick in.
+                if status in {502, 503, 504}:
+                    state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
+                    state.mark_key_failed(key, status=status, retry_after=10)
+                    state.record_model_result(_model, status=status)
+                    state.stats.rotations += 1
+                    await resp.aclose()
+                    continue
+
+                if should_rotate(status):
+                    retry_after = resp.headers.get("retry-after")
+                    # Check if this 429 is a ResourceExhausted (worker concurrency
+                    # limit) vs. a real RPM rate-limit. Concurrency errors are
+                    # transient: the worker frees a slot as soon as any in-flight
+                    # request finishes, so burning the key with a 45s+ cooldown
+                    # just depletes the pool. Treat it as a brief skip instead.
+                    _resp_body = None
+                    try:
+                        _resp_body = await resp.aread()
+                    except Exception:
+                        pass
+                    await resp.aclose()
+                    if status == 429 and is_resource_exhausted(_resp_body):
+                        _rotate_attempts -= 1  # Don't burn attempt budget on worker-level transient peak
+                        state.log_cb(
+                            f"key[{orig_idx}] ResourceExhausted (worker full) — "
+                            f"pausing 0.8s for worker slot to free"
+                        )
+                        state.stats.record_key_usage(key, ok=False, error="ResourceExhausted")
+                        state.stats.rotations += 1
+                        await asyncio.sleep(0.8)
+                        continue
+                    state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
+                    state.mark_key_failed(key, status=status, retry_after=retry_after)
+                    state.stats.rotations += 1
+                    persist_index(state, (orig_idx + 1) % total_keys)
+                    continue
 
             resp_bytes = await resp.aread()
             await resp.aclose()

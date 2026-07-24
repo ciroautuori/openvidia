@@ -42,7 +42,7 @@ DEFAULT_COOLDOWN = 30.0
 
 # Adaptive cooldown multiplier: increases cooldown for repeated failures
 ADAPTIVE_COOLDOWN_MULTIPLIER = 1.5  # Each consecutive failure multiplies cooldown by this
-ADAPTIVE_COOLDOWN_MAX = 2.5  # Capped at 2.5x base cooldown (~112s max) to prevent indefinite lockouts
+ADAPTIVE_COOLDOWN_MAX = 1.5  # Capped at 1.5x base cooldown (~65s max) to prevent indefinite lockouts
 
 # Adaptive RPM: per-key ceiling is halved on a 429 (jittered backoff) and
 # restored to MAX_RPM on the next success.
@@ -401,32 +401,33 @@ class ProxyState:
             error_details += f" (body: {error_body[:100]})"  # Truncate long bodies
 
         if status == 429:
+            multiplier = None  # set below; None means "compute from adaptive formula"
             if retry_after:
                 try:
+                    # Trust NVIDIA's Retry-After exactly — do NOT apply the
+                    # adaptive multiplier. NVIDIA's value already encodes how
+                    # long to wait; multiplying it just makes recovery slower
+                    # than the server actually requires, extending the doom
+                    # loop where all keys sit locked out longer than needed.
                     base_duration = float(retry_after)
+                    multiplier = 1.0  # honour upstream's explicit window
                 except (ValueError, TypeError):
                     base_duration = COOLDOWN_DURATIONS[429]
-            else:
-                # Jittered backoff: avoids thundering herd when several keys
-                # 429 simultaneously and then all wake up in unison. Base
-                # 120s plus up to 30s jitter, seeded by key so the distribution
-                # is stable per-key across runs.
+                    multiplier = None  # compute adaptively below
+            # Jitter up to 10s (was 30s): smaller spread reduces thundering
+            # herd while still staggering simultaneous 429s.
+            if multiplier is None:
                 import random
-
                 _r = random.Random(int(time.time()) ^ (hash(key) & 0xFFFFFFFF))
-                base_duration = COOLDOWN_DURATIONS[429] + _r.uniform(0.0, 30.0)
-
-            # Apply adaptive multiplier based on consecutive failures.
-            # ``ks`` is None for a key that is no longer in _key_states (the
-            # account manager can swap keys while a request is in flight);
-            # the guard above already allows for it, so this branch must too
-            # or an AttributeError escapes from the error-handling path and
-            # takes the request down with it.
+                base_duration = COOLDOWN_DURATIONS[429] + _r.uniform(0.0, 10.0)
+            # Apply adaptive multiplier only when we chose the base (no
+            # Retry-After was provided).
             failures = ks.consecutive_failures if ks is not None else 1
-            multiplier = min(
-                ADAPTIVE_COOLDOWN_MULTIPLIER ** (failures - 1),
-                ADAPTIVE_COOLDOWN_MAX,
-            )
+            if multiplier is None:
+                multiplier = min(
+                    ADAPTIVE_COOLDOWN_MULTIPLIER ** (failures - 1),
+                    ADAPTIVE_COOLDOWN_MAX,
+                )
             duration = base_duration * multiplier
 
             reason = f"429 rate-limited (cooldown {duration:.0f}s, attempt {failures})"
