@@ -141,62 +141,121 @@ NVIDIA's free NIM tier limits each API key to ~40 RPM. Aggressive bursts trigger
 |---------|-------------|
 | `openvidia` | Start proxy in background + open desktop app |
 | `openvidia foreground` | Foreground mode (logs to stdout, no UI) |
-| `openvidia setup` | Auto-configure opencode (provider, model, compaction, instructions) |
+| `openvidia setup` | Auto-configure **all** detected CLIs: opencode, Codex, Claude Code, Grok |
 
 ---
 
 ## CLI Setup Guides
 
-The desktop app has a built-in **CLI Setup** tab with copy-paste instructions for:
+> **TL;DR — run `openvidia setup` once.** It auto-detects and configures every CLI you have installed. You only need to read the manual steps below if something doesn't work or you prefer to configure things yourself.
 
-| CLI | Protocol | Endpoint |
-|-----|----------|----------|
-| **opencode** | OpenAI-compatible | `http://localhost:1919/v1` |
-| **Codex CLI** | OpenAI Responses API | `http://localhost:1919/v1/responses` |
-| **Claude Code** | Anthropic Messages API | `http://localhost:1919/v1/messages` |
-| **Grok (xAI)** | OpenAI-compatible | `http://localhost:1919/v1/chat/completions` |
+Supported clients:
+
+| CLI | Protocol | Endpoint | Auto-setup |
+|-----|----------|----------|------------|
+| **opencode** | OpenAI-compatible | `http://localhost:1919/v1` | ✅ `openvidia setup` |
+| **Codex CLI** | OpenAI Responses API | `http://localhost:1919/v1` | ✅ `openvidia setup` |
+| **Claude Code** | Anthropic Messages API | `http://localhost:1919` | ✅ `openvidia setup` |
+| **Grok (xAI)** | OpenAI-compatible | `http://localhost:1919/v1` | ✅ `openvidia setup` |
+
+---
 
 ### opencode
 
 ```bash
-openvidia setup    # auto-configures provider + model + compaction
-opencode           # launch with /model openvidia
+openvidia setup    # configures provider + model + compaction + instructions
+opencode           # then /model openvidia
 ```
+
+Manual (if `setup` didn't find it):
+
+```bash
+# ~/.config/opencode/opencode.json
+{
+  "provider": {
+    "openvidia": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "apiKey": "ignored", "baseURL": "http://localhost:1919/v1" },
+      "models": { "openvidia": { "name": "OpenVidia", "tools": true } }
+    }
+  },
+  "model": "openvidia/openvidia"
+}
+```
+
+---
 
 ### Codex CLI
 
-Point Codex at the Responses API shim:
-
 ```bash
-export OPENAI_BASE_URL=http://localhost:1919/v1
-export OPENAI_API_KEY=ignored
+openvidia setup    # writes ~/.codex/config.toml automatically
 codex --model openvidia
 ```
 
-### Claude Code
+Manual (if `setup` didn't find it):
 
-Point Claude Code at the Anthropic Messages shim:
+```toml
+# ~/.codex/config.toml
+model = "openvidia"
+model_provider = "openvidia"
+
+[model_providers.openvidia]
+name = "OpenVidia"
+base_url = "http://localhost:1919/v1"
+env_key = "OPENVIDIA_API_KEY"
+wire_api = "responses"
+```
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:1919
-export ANTHROPIC_API_KEY=ignored
+export OPENVIDIA_API_KEY=ignored   # also added automatically by setup
+```
+
+---
+
+### Claude Code
+
+```bash
+openvidia setup    # writes ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY to your shell rc
+source ~/.zshrc    # (or restart your terminal)
 claude --model openvidia
 ```
 
-> The `/v1/messages` endpoint translates Anthropic format ↔ OpenAI chat/completions bidirectionally (streaming, tool use, system prompts). Claude Code works unmodified.
+Manual (if `setup` didn't find `claude`):
+
+```bash
+# Add to ~/.zshrc or ~/.bashrc
+export ANTHROPIC_BASE_URL=http://localhost:1919
+export ANTHROPIC_API_KEY=ignored
+```
+
+> The `/v1/messages` endpoint translates Anthropic Messages format ↔ NVIDIA chat/completions bidirectionally — streaming, tool use, and system prompts all work.
 >
-> **Images:** NVIDIA NIM models are text-only, so image blocks (e.g. screenshots) can't be processed. Instead of silently dropping them, OpenVidia replaces each with a `[image omitted: model has no vision]` placeholder so the model stays aware, and logs a warning in the **Activity** panel.
+> **Images:** NVIDIA NIM models are text-only. Image blocks (e.g. screenshots) are replaced with `[image omitted: model has no vision]` so the model stays aware of the context and logs a warning in the Activity panel.
+
+---
 
 ### Grok (xAI)
 
-Grok supports OpenAI-compatible providers natively:
+```bash
+openvidia setup    # writes ~/.grok/config.toml automatically
+grok -m openvidia
+```
+
+Manual (if `setup` didn't find `~/.grok/`):
 
 ```toml
 # ~/.grok/config.toml
-[provider.openvidia]
-base_url = "http://localhost:1919/v1"
+[models]
+default = "openvidia"
+
+[model.openvidia]
 api_key = "ignored"
+base_url = "http://localhost:1919/v1"
+api_backend = "chat_completions"
+context_window = 128000
 ```
+
+---
 
 ### Any OpenAI-compatible client
 
@@ -205,7 +264,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:1919/v1", api_key="ignored")
 response = client.chat.completions.create(
-    model="openvidia",  # proxy overrides with the dashboard-selected model
+    model="openvidia",
     messages=[{"role": "user", "content": "Hello!"}]
 )
 ```

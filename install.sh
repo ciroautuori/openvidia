@@ -29,7 +29,7 @@ fi
 echo ""
 
 # ── 2. Auto-configure detected CLIs ─────────────
-echo "▶ Auto-configuring CLIs (opencode, Codex, Grok)..."
+echo "▶ Auto-configuring CLIs (opencode, Codex, Claude Code, Grok)..."
 "${RUN[@]}" setup 2>/dev/null || true
 echo ""
 

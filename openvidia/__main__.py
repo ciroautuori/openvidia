@@ -7,7 +7,7 @@ Install:
 Usage:
     openvidia              # start proxy + desktop window
     openvidia foreground    # foreground mode (logs stdout)
-    openvidia setup        # auto-configure ALL detected CLIs (opencode, Codex, Grok)
+    openvidia setup        # auto-configure ALL detected CLIs (opencode, Codex, Claude Code, Grok)
 
 Dashboard + API at http://localhost:1919
 Edit keys via ~/.config/openvidia/keys.json or dashboard Keys tab.
@@ -352,6 +352,58 @@ def _setup_codex():
     return True
 
 
+def _setup_claude_code():
+    """Write ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY to the shell rc file.
+
+    Claude Code picks up ANTHROPIC_BASE_URL automatically at startup; no
+    config file is needed. The shim at /v1/messages translates Anthropic
+    Messages format to NVIDIA chat/completions bidirectionally.
+    """
+    import shutil
+
+    if not shutil.which("claude"):
+        print("ℹ Claude Code not found — skipping")
+        return False
+
+    shell = os.environ.get("SHELL", "")
+    home = Path.home()
+    if "bash" in shell:
+        rc = home / ".bashrc"
+    elif "fish" in shell:
+        rc = home / ".config" / "fish" / "config.fish"
+    else:
+        rc = home / ".zshrc"
+
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        content = rc.read_text() if rc.exists() else ""
+    except OSError:
+        content = ""
+
+    lines_to_add = []
+    if "ANTHROPIC_BASE_URL" not in content:
+        lines_to_add.append(f"export ANTHROPIC_BASE_URL=http://localhost:{PORT}")
+    if "ANTHROPIC_API_KEY" not in content:
+        lines_to_add.append("export ANTHROPIC_API_KEY=ignored")
+
+    if not lines_to_add:
+        print("✓ Claude Code already configured")
+        return False
+
+    with open(rc, "a") as f:
+        if content and not content.endswith("\n"):
+            f.write("\n")
+        f.write("\n# Claude Code → OpenVidia Anthropic shim\n")
+        for l in lines_to_add:
+            f.write(l + "\n")
+
+    print(f"✓ Configured Claude Code → {rc}")
+    print(f"  ANTHROPIC_BASE_URL=http://localhost:{PORT}")
+    print("  ANTHROPIC_API_KEY=ignored")
+    print("✓ Claude Code ready — run: claude --model openvidia")
+    return True
+
+
 def _setup_grok():
     """Configure the Grok CLI (~/.grok/config.toml) to use OpenVidia."""
     grok_dir = Path.home() / ".grok"
@@ -455,7 +507,7 @@ def _setup_proxy_config():
 
 
 def _setup_cmd():
-    """Full setup: configure every detected CLI (opencode, Codex, Grok)."""
+    """Full setup: configure every detected CLI (opencode, Codex, Claude Code, Grok)."""
     print("╔════════════════════════════════════════════╗")
     print("║   OpenVidia — Setup CLI auto-config        ║")
     print("╚════════════════════════════════════════════╝")
@@ -473,18 +525,22 @@ def _setup_cmd():
     _setup_codex()
     print()
 
+    _setup_claude_code()
+    print()
+
     _setup_grok()
     print()
 
     print("╔════════════════════════════════════════════╗")
-    print("║   Setup complete!                         ║")
+    print("║         Setup complete!                    ║")
     print("╠════════════════════════════════════════════╣")
-    print(f"║   Proxy:       http://localhost:{PORT}/v1")
-    print(f"║   Dashboard:   http://localhost:{PORT}")
+    print(f"║   Proxy:      http://localhost:{PORT}/v1      ║")
+    print(f"║   Dashboard:  http://localhost:{PORT}         ║")
     print("║                                            ║")
     print("║   opencode → /model openvidia              ║")
     print("║   codex    → codex --model openvidia       ║")
-    print("║   grok     → grok -model openvidia         ║")
+    print("║   claude   → claude --model openvidia      ║")
+    print("║   grok     → grok -m openvidia             ║")
     print("╚════════════════════════════════════════════╝")
 
     sys.exit(0)
@@ -500,6 +556,7 @@ async def main_async():
         sys.exit(1)
     _setup_opencode()
     _setup_codex()
+    _setup_claude_code()
     _setup_grok()
     keys = config.load_saved_keys_file()
     if not keys:
