@@ -1,0 +1,19 @@
+name: Deploy to Soliso
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    name: Install & Restart
+    runs-on: [self-hosted, soliso, openvidia]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install / update package
+        run: pip install -e . --quiet
+
+      - name: Restart service
+        run: sudo systemctl restart openvidia
