@@ -127,7 +127,7 @@ NVIDIA's free NIM tier limits each API key to ~40 RPM. Aggressive bursts trigger
 
 - **Pools multiple keys** behind a single endpoint
 - **Rotates automatically** on 429/401/403/5xx — zero manual intervention
-- **Per-key cooldown timers** — respects `Retry-After` headers, exponential backoff
+- **Per-key cooldown timers** — on real 429s, trusts `Retry-After` exactly (no multiplication); distinguishes transient worker saturation (`ResourceExhausted`) from true RPM limits and never burns key cooldowns for the former
 - **Sliding-window RPM limiting** — keeps each key under 28 RPM (safe margin below 40)
 - **Health checks** — revives keys whose cooldowns have expired
 - **No silent model substitution** — the model you select is the model that answers; if it fails on every key you are told so, never handed output from a different model
@@ -226,31 +226,39 @@ Streaming (SSE) is fully supported — tokens flow through unbuffered.
 ### Per-Key Cooldown
 
 | HTTP Status | Cooldown | Reason |
-|-------------|----------|--------|
-| **429** | `Retry-After` header (or 180s) | Rate limited — respect NVIDIA's backoff |
+|-------------|----------|---------|
+| **429** (real RPM limit) | `Retry-After` header (trusted as-is, no multiplication), or 45s + jitter | Rate limited — honour NVIDIA's own window exactly |
+| **429** (worker concurrency) | 0 — retried after 0.8s pause | `ResourceExhausted: Worker local total request limit reached` — transient pool saturation, key is healthy |
 | **401 / 403** | 3600s | Dead key — don't waste requests |
-| **400 / 404** | — (no cooldown) | Deterministic request error (bad payload / unknown model) — returned to the client immediately, **key untouched**. Rotating wouldn't help: every key gets the same error. |
-| **5xx** | 30s | Server error — retry soon |
+| **400 / 404** | — (no cooldown) | Deterministic request error — returned to the client immediately, **key untouched**. Rotating wouldn't help: every key gets the same error. |
+| **5xx** | 10s (gateway timeout) / 30s (other) | Server error — retry soon |
 | **Network error** | 30s | Transient connectivity issue |
+
+> **Retry-After is used as-is.** When NVIDIA provides a `Retry-After` header (e.g. 60s), the cooldown is exactly that value. Earlier versions multiplied it by an adaptive factor (`1.5^N`), which caused a doom loop: at 3 failures a 60s backoff became 135s and all 26 keys locked out longer than the real rate-limit window required.
+>
+> When no `Retry-After` is provided the proxy uses 45s + random jitter (≤10s), scaled at most 1.5× for repeated failures — capped at ~65s max.
 
 ### Sliding-Window RPM
 
-Each key tracks requests in a rolling 60-second window. If a key has sent **28+ requests** in the last 60s, it's skipped. Only if all keys are saturated does the proxy return 429 to the client.
+Each key tracks requests in a rolling 60-second window. If a key has sent **28+ requests** in the last 60s, it is skipped. Only if all keys are simultaneously RPM-saturated or on cooldown does the proxy return 429 to the client.
 
 ### Key Rotation Flow
 
 ```
 Request arrives
     │
-    ├─ Key on cooldown? → skip, try next
-    ├─ Key RPM ≥ 28?   → skip, try next
-    ├─ Send to NVIDIA  → 200? ✅ record RPM, return response
-    │                  → 400/404? return to client (no rotation, key untouched)
-    │                  → 429? read Retry-After, set cooldown, rotate
-    │                  → 401? set 3600s cooldown, rotate
-    │                  → 5xx? set 30s cooldown, rotate
+    ├─ For each candidate key (ordered least-loaded first):
+    │   ├─ Key on cooldown?  → skip (including keys cooled mid-pass)
+    │   ├─ Key RPM ≥ 28?    → skip
+    │   ├─ Send to NVIDIA   → 200? ✅ record RPM, return response
+    │   │                   → 400/404? return to client (no rotation, key untouched)
+    │   │                   → 429 ResourceExhausted? pause 0.8s, retry (key untouched)
+    │   │                   → 429 rate-limit? use Retry-After as-is, set cooldown, next key
+    │   │                   → 401? set 3600s cooldown, next key
+    │   │                   → 5xx? set 10–30s cooldown, next key
+    │   └─ (max 5 sends per pass, 3 passes with 1s pause between)
     │
-    └─ All keys exhausted? → 503 naming the model (never a substitute model)
+    └─ All candidates exhausted? → 503 naming the model (never a substitute model)
 ```
 
 ### Health Check
