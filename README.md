@@ -431,8 +431,8 @@ carries the payload to merge:
 ```json
 {
   "thinking": "auto",
-  "thinking_off_payload": { "chat_template_kwargs": { "thinking": false } },
-  "thinking_on_payload":  { "chat_template_kwargs": { "thinking": true } },
+  "thinking_off_payload": { "chat_template_kwargs": { "enable_thinking": false } },
+  "thinking_on_payload":  { "chat_template_kwargs": { "enable_thinking": true } },
   "per_model": { "vendor/model": { "thinking": "off" } }
 }
 ```
@@ -489,7 +489,7 @@ same key, within the same minute:
 | `deepseek-ai/deepseek-v4-flash` | 2.1s |
 | `deepseek-ai/deepseek-v4-pro` | 12.3s |
 | `minimaxai/minimax-m3` | 44.5s |
-| `z-ai/glm-5.2` | 162s |
+| `z-ai/glm-5.2` | 2–4s (thinking=off) / 162s (thinking=on) |
 
 Provider capacity for one model can collapse without warning while the others
 stay fast — so a timeout short enough to feel responsive is also short enough

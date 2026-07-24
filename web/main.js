@@ -134,6 +134,7 @@ async function setModel(id) {
 async function loadModel() {
   try { const r = await api('GET', '/api/model'); activeModel = r.model || ''; $('activeModelDisplay').textContent = activeModel || 'none' } catch (_) {}
   loadThinking()
+  loadEffort()
 }
 
 document.querySelectorAll('.think-btn').forEach(b => {
@@ -170,6 +171,42 @@ async function setThinking(mode) {
     thinkingMode = mode
     renderThinking()
     toast(`Thinking: ${mode}${activeModel ? ' — ' + activeModel : ''}`, 'ok')
+  } catch (_) {}
+}
+
+/* ── Reasoning effort ──────────────────────────
+   Granularità oltre thinking on/off:
+   low (fast), medium (balanced), high (deep). */
+let reasoningEffort = 'auto'
+
+document.querySelectorAll('.effort-btn').forEach(b => {
+  b.addEventListener('click', () => setEffort(b.dataset.effort))
+})
+
+function renderEffort() {
+  document.querySelectorAll('.effort-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.effort === reasoningEffort)
+  })
+}
+
+async function loadEffort() {
+  try {
+    const r = await api('GET', '/api/reasoning-effort')
+    reasoningEffort = r.effort || 'auto'
+    renderEffort()
+  } catch (_) {}
+}
+
+async function setEffort(effort) {
+  try {
+    await fetch('/api/reasoning-effort', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ effort })
+    })
+    reasoningEffort = effort
+    renderEffort()
+    toast(`Effort: ${effort}${activeModel ? ' — ' + activeModel : ''}`, 'ok')
   } catch (_) {}
 }
 

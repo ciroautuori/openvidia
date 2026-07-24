@@ -28,6 +28,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import config
+from ._upstream_utils import get_upstream_sem, is_resource_exhausted
 from .proxy_state import ProxyState
 
 # ── Bounded rotation + saturation fast-fail ─────────────────────────────
@@ -45,7 +46,8 @@ _GATEWAY_TIMEOUTS = {502, 503, 504}
 
 _MAX_ROTATE_ATTEMPTS = 5  # hard cap on sends per model phase
 _ROTATE_SEND_TIMEOUT = httpx.Timeout(**config.httpx_timeout_kwargs())
-_MIN_LIVE_FRACTION = 0.2  # <20% of valid keys live → 503 fast
+_MODEL_PROBE_TIMEOUT = httpx.Timeout(connect=5.0, read=90.0, write=10.0, pool=95.0)
+_MIN_LIVE_FRACTION = 0.05  # <5% of valid keys live → 503 fast
 
 
 # A reasoning model withholds its first byte until it has finished thinking —
@@ -91,84 +93,102 @@ async def _rotation_phase(
 ):
     """Single bounded rotation phase. Returns (resp_or_None, used_key, used_idx)."""
     attempts = 0
-    for idx, k in candidates:
-        if not state.key_can_send_rpm(k):
-            continue
-        if attempts >= max_attempts:
-            break
-        attempts += 1
-        hdrs = headers_factory(k, idx)
-        # Claim the key BEFORE sending. get_candidate_keys() scores a key by
-        # in_flight + recent RPM, and neither is set until a request finishes:
-        # without this claim, N requests arriving together all score every key
-        # at zero, tie-break on index, and pile onto key[0] while the rest of
-        # the pool idles. That is how a 26-key pool produces 429s.
-        state.begin_in_flight(k)
-        released = False
-        resp = None
-        _model = payload.get("model", "")
-        _t0 = time.monotonic()
-        try:
-            req = client.build_request(
-                "POST", upstream, json=payload, headers=hdrs, timeout=timeout
-            )
-            resp = await client.send(req, stream=stream)
-        except httpx.ReadTimeout:
-            # The key connected and the upstream ACCEPTED the request — it is
-            # simply still thinking. Two things must NOT happen here:
-            #   - cooling the key down, which blames 25 healthy keys for one
-            #     slow model and drains the pool
-            #   - rotating, since the next key runs the same model and will
-            #     wait exactly as long
-            # Stop the phase instead and let the caller fall back to a
-            # different (faster) model, which is the real escalation.
-            state.log_cb(
-                f"  {log_tag}: key[{idx}] no first byte in {timeout.read:.0f}s "
-                f"— model too slow, not a key fault"
-            )
-            state.record_model_result(_model, too_slow=True)
-            state.end_in_flight(k)
-            released = True
-            break
-        except httpx.HTTPError as e:
-            err_msg = str(e) or type(e).__name__
-            state.log_cb(f"  {log_tag}: key[{idx}] {err_msg} (rotating)")
-            state.end_in_flight(k)
-            released = True
-            state.mark_key_failed(k)
-            continue
-        finally:
-            # A 200 keeps the claim: the key stays busy for as long as the
-            # stream runs, and the caller releases it when the body ends.
-            if not released and (resp is None or resp.status_code != 200):
+    for pass_num in range(3):
+        if pass_num > 0:
+            await asyncio.sleep(1.0)
+        for idx, k in candidates:
+            if not state.key_can_send_rpm(k):
+                continue
+            if attempts >= max_attempts:
+                break
+            attempts += 1
+            hdrs = headers_factory(k, idx)
+            # Claim the key BEFORE sending. get_candidate_keys() scores a key by
+            # in_flight + recent RPM, and neither is set until a request finishes:
+            # without this claim, N requests arriving together all score every key
+            # at zero, tie-break on index, and pile onto key[0] while the rest of
+            # the pool idles. That is how a 26-key pool produces 429s.
+            state.begin_in_flight(k)
+            released = False
+            resp = None
+            _model = payload.get("model", "")
+            _t0 = time.monotonic()
+            try:
+                req = client.build_request(
+                    "POST", upstream, json=payload, headers=hdrs, timeout=timeout
+                )
+                # Global concurrency semaphore (shared with proxy_app): never
+                # exceed 28 concurrent upstream sends (NVIDIA worker cap is 32).
+                async with get_upstream_sem():
+                    resp = await client.send(req, stream=stream)
+            except httpx.ReadTimeout:
+                # The key connected and the upstream ACCEPTED the request — it is
+                # simply still thinking. Two things must NOT happen here:
+                #   - cooling the key down, which blames 25 healthy keys for one
+                #     slow model and drains the pool
+                #   - rotating, since the next key runs the same model and will
+                #     wait exactly as long
+                # Stop the phase instead and let the caller fall back to a
+                # different (faster) model, which is the real escalation.
+                state.log_cb(
+                    f"  {log_tag}: key[{idx}] no first byte in {timeout.read:.0f}s "
+                    f"— model too slow, not a key fault"
+                )
+                state.record_model_result(_model, too_slow=True)
                 state.end_in_flight(k)
-        if resp.status_code == 200:
-            state.record_model_result(_model, ok=True, ttft=time.monotonic() - _t0)
-            return resp, k, idx
-        err_status = resp.status_code
-        # Read error body for detailed logging before closing
-        error_body = ""
-        try:
-            error_body = await resp.aread()
-            error_body = error_body.decode("utf-8", errors="replace")[:500]
-        except Exception:
-            pass
-        await resp.aclose()
-        state.log_cb(f"  {log_tag}: key[{idx}] HTTP {err_status}")
-        state.record_model_result(_model, status=err_status)
-        if err_status == 429:
-            seen_429_box[0] = True
-        # A gateway timeout is the MODEL being slow, not the key being bad:
-        # NVIDIA's edge gave up waiting for it, and every other key would hit
-        # the same wall. Cooling keys down for it empties the pool one 504 at
-        # a time, which is precisely what a 26-key pool exists to prevent.
-        if err_status in _GATEWAY_TIMEOUTS:
-            state.log_cb(
-                f"  {log_tag}: HTTP {err_status} is an upstream gateway timeout "
-                f"— key[{idx}] left healthy"
-            )
-            continue
-        state.mark_key_failed(k, status=err_status, error_body=error_body if error_body else None)
+                released = True
+                break
+            except httpx.HTTPError as e:
+                err_msg = str(e) or type(e).__name__
+                state.log_cb(f"  {log_tag}: key[{idx}] {err_msg} (rotating)")
+                state.end_in_flight(k)
+                released = True
+                state.mark_key_failed(k)
+                continue
+            finally:
+                # A 200 keeps the claim: the key stays busy for as long as the
+                # stream runs, and the caller releases it when the body ends.
+                if not released and (resp is None or resp.status_code != 200):
+                    state.end_in_flight(k)
+            if resp.status_code == 200:
+                state.record_model_result(_model, ok=True, ttft=time.monotonic() - _t0)
+                return resp, k, idx
+            err_status = resp.status_code
+            # Read error body for detailed logging before closing
+            error_body = ""
+            try:
+                error_body = await resp.aread()
+                error_body_bytes = error_body
+                error_body = error_body.decode("utf-8", errors="replace")[:500]
+            except Exception:
+                error_body_bytes = None
+            await resp.aclose()
+            state.log_cb(f"  {log_tag}: key[{idx}] HTTP {err_status}")
+            state.record_model_result(_model, status=err_status)
+            if err_status == 429:
+                # ResourceExhausted = worker concurrency limit, not RPM.
+                # Don't burn the key — just skip and let the next key try.
+                if is_resource_exhausted(error_body_bytes):
+                    attempts -= 1  # Don't burn attempt budget on worker-level transient peak
+                    state.log_cb(
+                        f"  {log_tag}: key[{idx}] ResourceExhausted (worker full) — pausing 0.8s"
+                    )
+                    state.stats.record_key_usage(k, ok=False, error="ResourceExhausted")
+                    await asyncio.sleep(0.8)
+                    continue
+                seen_429_box[0] = True
+            # A gateway timeout is the MODEL being slow, not the key being bad:
+            # NVIDIA's edge gave up waiting for it, and every other key would hit
+            # the same wall. Cooling keys down for it empties the pool one 504 at
+            # a time, which is precisely what a 26-key pool exists to prevent.
+            if err_status in _GATEWAY_TIMEOUTS:
+                state.log_cb(
+                    f"  {log_tag}: HTTP {err_status} gateway timeout — "
+                    f"key[{idx}] 10s cooldown"
+                )
+                state.mark_key_failed(k, status=err_status, retry_after=10)
+                continue
+            state.mark_key_failed(k, status=err_status, error_body=error_body if error_body else None)
     return None, None, None
 
 
@@ -486,6 +506,13 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
         payload["response_format"] = body["response_format"]
 
     payload["messages"] = _sanitize_chat_messages(payload["messages"])
+    # Traduci reasoning_effort di Codex in parametri NVIDIA NIM thinking.
+    # Il _fill_missing гаранти che il client vinca sempre sul dashboard.
+    effort = body.get("reasoning_effort")
+    if effort == "low":
+        config._fill_missing(payload, {"chat_template_kwargs": {"enable_thinking": False}})
+    elif effort in ("medium", "high"):
+        config._fill_missing(payload, {"chat_template_kwargs": {"enable_thinking": True}})
     # Dashboard thinking toggle — never overrides what the client asked for.
     config.apply_model_options(payload)
     return payload
@@ -704,9 +731,11 @@ async def _stream_responses(
     text_item_id = f"msg_{uuid.uuid4().hex[:24]}"
     text_started = False
     text_full = ""
+    text_output_index = 0
     # output_index: 0 = text (if any), then tool_calls in arrival order.
     tool_calls_map: dict[int, dict] = {}  # index → tool_call state
     next_output_index = 0
+    items_done_emitted = False
 
     async for line in resp.aiter_lines():
         if await request.is_disconnected():
@@ -804,7 +833,8 @@ async def _stream_responses(
 
         # Finish: close all open items, then emit response.completed.
         finish = choice.get("finish_reason")
-        if finish:
+        if finish and not items_done_emitted:
+            items_done_emitted = True
             if text_started:
                 yield _sse_event(
                     "response.output_text.done",
@@ -855,6 +885,59 @@ async def _stream_responses(
                     },
                 )
             break
+
+    # Safety catch: ensure items are closed even if finish_reason was omitted or [DONE] arrived early
+    if not items_done_emitted:
+        items_done_emitted = True
+        if text_started:
+            yield _sse_event(
+                "response.output_text.done",
+                {
+                    "type": "response.output_text.done",
+                    "item_id": text_item_id,
+                    "output_index": text_output_index,
+                    "text": text_full,
+                },
+            )
+            yield _sse_event(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": text_output_index,
+                    "item": {
+                        "type": "message",
+                        "id": text_item_id,
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": text_full}],
+                    },
+                },
+            )
+        for tcm in tool_calls_map.values():
+            yield _sse_event(
+                "response.function_call_arguments.done",
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": tcm["fc_id"],
+                    "output_index": tcm["output_index"],
+                    "arguments": tcm["arguments"],
+                },
+            )
+            yield _sse_event(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": tcm["output_index"],
+                    "item": {
+                        "type": "function_call",
+                        "id": tcm["fc_id"],
+                        "call_id": tcm["call_id"],
+                        "name": tcm["name"],
+                        "arguments": tcm["arguments"],
+                        "status": "completed",
+                    },
+                },
+            )
 
     # Capture usage from the terminal chunk (NVIDIA streams usage only when
     # stream_options.include_usage=true). If absent we report zeros — Codex
@@ -946,6 +1029,25 @@ async def handle_responses(
 
     model_override = state.active_model
     chat_payload = _build_chat_payload(body, model_override)
+
+    # ── Circuit breaker: skip dead models, auto-failover to next preset ───
+    _req_model = chat_payload.get("model", "")
+    if _req_model and state.is_model_circuit_open(_req_model):
+        _presets = config.load_saved_presets()
+        _fallback = next(
+            (m for m in _presets if m != _req_model and not state.is_model_circuit_open(m)),
+            None,
+        )
+        if _fallback:
+            state.log_cb(f"🔴 {_req_model} circuit OPEN → auto-failover to {_fallback}")
+            chat_payload["model"] = _fallback
+            config.apply_model_options(chat_payload)  # re-apply opts for new model
+        else:
+            state.log_cb(f"🔴 {_req_model} circuit OPEN, no healthy fallback")
+            return JSONResponse(
+                {"error": f"{_req_model} is down (circuit open), no fallback available"},
+                status_code=503,
+            )
 
     # Auto-compaction: summarize oversized history in place (trim fallback).
     from .compaction import maybe_compact

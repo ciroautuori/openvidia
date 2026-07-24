@@ -305,6 +305,44 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         state.log_cb(f"◆ thinking={mode} for {model or 'all models'}")
         return {"ok": True, "model": model, "mode": mode}
 
+    @app.get("/api/reasoning-effort")
+    async def api_get_effort() -> dict:
+        opts = config.model_options()
+        model = state.active_model or ""
+        per = (opts.get("per_model") or {}).get(model, {})
+        return {
+            "model": model,
+            "effort": per.get("reasoning_effort") or opts.get("reasoning_effort", "auto"),
+            "inherited": "reasoning_effort" not in per,
+        }
+
+    @app.post("/api/reasoning-effort")
+    async def api_set_effort(request: Request) -> dict:
+        """Set reasoning effort: low (fast, no thinking), medium (balanced), high (deep)."""
+        body = await request.json()
+        effort = body.get("effort", "auto")
+        if effort not in ("auto", "low", "medium", "high"):
+            return {"ok": False, "error": "effort must be auto, low, medium or high"}
+        opts = config.model_options()
+        model = body.get("model", state.active_model or "")
+        if model:
+            per = dict(opts.get("per_model") or {})
+            entry = dict(per.get(model) or {})
+            if effort == "auto":
+                entry.pop("reasoning_effort", None)
+            else:
+                entry["reasoning_effort"] = effort
+            if entry:
+                per[model] = entry
+            else:
+                per.pop(model, None)
+            opts["per_model"] = per
+        else:
+            opts["reasoning_effort"] = effort
+        config.save_model_options(opts)
+        state.log_cb(f"◆ reasoning_effort={effort} for {model or 'all models'}")
+        return {"ok": True, "model": model, "effort": effort}
+
     @app.get("/api/model-health")
     async def api_model_health() -> dict:
         """What the proxy has learned about each model from real traffic."""

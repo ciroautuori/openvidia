@@ -657,7 +657,7 @@ class TestCompactionSettings:
         assert _DEFAULTS["budget_tokens"] == 80_000
         assert _DEFAULTS["keep_recent"] == 8
         assert _DEFAULTS["summary_max_tokens"] == 1024
-        assert _DEFAULTS["summary_model"] == ""
+        assert _DEFAULTS["summary_model"] == "meta/llama-3.1-8b-instruct"
 
     def test_settings_merges_user_overrides_over_defaults(self):
         settings = _settings()
@@ -847,7 +847,7 @@ class TestThinkingToggle:
 
         cfg.save_model_options({**cfg._MODEL_OPTIONS_DEFAULTS, "thinking": "off"})
         out = cfg.apply_model_options({"model": "vendor/m", "messages": []})
-        assert out["chat_template_kwargs"] == {"thinking": False}
+        assert out["chat_template_kwargs"] == {"enable_thinking": False}
 
     def test_per_model_beats_the_global_setting(self):
         from openvidia import config as cfg
@@ -860,7 +860,7 @@ class TestThinkingToggle:
             }
         )
         out = cfg.apply_model_options({"model": "vendor/keeps-thinking"})
-        assert out["chat_template_kwargs"] == {"thinking": True}
+        assert out["chat_template_kwargs"] == {"enable_thinking": True}
 
     def test_client_choice_is_not_overridden(self):
         from openvidia import config as cfg

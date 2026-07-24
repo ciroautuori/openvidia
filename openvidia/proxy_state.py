@@ -36,20 +36,20 @@ COOLDOWN_DURATIONS: dict[int, float] = {
     401: 3600.0,
     403: 3600.0,
     404: 60.0,  # Reduced from 120s - endpoint issues may resolve quickly
-    429: 120.0,  # Reduced from 180s - adaptive backoff handles repeat offenders
+    429: 45.0,  # Reduced to 45s for faster key recovery under high pool load
 }
 DEFAULT_COOLDOWN = 30.0
 
 # Adaptive cooldown multiplier: increases cooldown for repeated failures
 ADAPTIVE_COOLDOWN_MULTIPLIER = 1.5  # Each consecutive failure multiplies cooldown by this
-ADAPTIVE_COOLDOWN_MAX = 5.0  # Cap multiplier at this value (max 5x base cooldown)
+ADAPTIVE_COOLDOWN_MAX = 2.5  # Capped at 2.5x base cooldown (~112s max) to prevent indefinite lockouts
 
 # Adaptive RPM: per-key ceiling is halved on a 429 (jittered backoff) and
-# restored to MAX_RPM on the next success. This prevents the post-cooldown
-# spike that re-triggers 429 the instant a key is revived.
+# restored to MAX_RPM on the next success.
 ADAPTIVE_429_FACTOR = 0.5  # multiply per-key ceiling by this on each 429
-ADAPTIVE_FLOOR_RPM = 8  # never go below this per-key (keeps SOME flow)
-ADAPTIVE_REHAB_STEP = 4  # per-key ceiling growth on each success (until MAX_RPM)
+ADAPTIVE_FLOOR_RPM = 14  # minimum floor per-key to maintain throughput
+ADAPTIVE_REHAB_STEP = 10  # fast per-key ceiling growth (+10 RPM) on success
+
 
 
 # ── Per-key state ──────────────────────────────────────────────────────
@@ -175,7 +175,14 @@ class ModelHealth:
         "too_slow",
         "ttfts",
         "warned_at",
+        "consecutive_failures",
+        "circuit_opened_at",
     )
+
+    # Circuit breaker: open after this many consecutive failures
+    CIRCUIT_OPEN_AFTER = 3
+    # Auto-reset after this many seconds (allow model to recover)
+    CIRCUIT_RESET_AFTER = 120.0
 
     def __init__(self):
         self.requests = 0
@@ -185,6 +192,29 @@ class ModelHealth:
         self.too_slow = 0  # no first byte before our own read timeout
         self.ttfts: deque[float] = deque(maxlen=20)
         self.warned_at = 0.0
+        self.consecutive_failures = 0
+        self.circuit_opened_at = 0.0
+
+    @property
+    def is_circuit_open(self) -> bool:
+        """True when this model should be skipped (too many consecutive failures)."""
+        if self.consecutive_failures < self.CIRCUIT_OPEN_AFTER:
+            return False
+        if time.time() - self.circuit_opened_at > self.CIRCUIT_RESET_AFTER:
+            # Auto-reset: give model a chance to recover
+            self.consecutive_failures = 0
+            self.circuit_opened_at = 0.0
+            return False
+        return True
+
+    def record_failure(self) -> None:
+        self.consecutive_failures += 1
+        if self.consecutive_failures == self.CIRCUIT_OPEN_AFTER:
+            self.circuit_opened_at = time.time()
+
+    def record_success_reset(self) -> None:
+        self.consecutive_failures = 0
+        self.circuit_opened_at = 0.0
 
     @property
     def median_ttft(self) -> float:
@@ -208,6 +238,8 @@ class ModelHealth:
             "too_slow": self.too_slow,
             "median_ttft": round(self.median_ttft, 1),
             "failure_rate": round(self.failure_rate, 2),
+            "circuit_open": self.is_circuit_open,
+            "consecutive_failures": self.consecutive_failures,
         }
 
 
@@ -504,9 +536,12 @@ class ProxyState:
         h.requests += 1
         if ok:
             h.success += 1
+            h.record_success_reset()
             if ttft is not None:
                 h.ttfts.append(ttft)
             return
+        # Record failure for circuit breaker
+        h.record_failure()
         if too_slow:
             h.too_slow += 1
         elif status in (502, 503, 504):
@@ -522,18 +557,24 @@ class ProxyState:
             h.warned_at = time.time()
             detail = []
             if h.gateway_timeouts:
-                detail.append(f"{h.gateway_timeouts}× 504 provider gave up")
+                detail.append(f"{h.gateway_timeouts}× 503/504 provider down")
             if h.too_slow:
-                detail.append(f"{h.too_slow}× no answer in time")
+                detail.append(f"{h.too_slow}× timeout")
             if h.rate_limited:
                 detail.append(f"{h.rate_limited}× 429")
             if h.median_ttft:
-                detail.append(f"first token ~{h.median_ttft:.0f}s")
+                detail.append(f"TTFT ~{h.median_ttft:.0f}s")
+            circuit = " 🔴 CIRCUIT OPEN" if h.is_circuit_open else ""
             self.log_cb(
-                f"⚠ {model}: {h.success}/{h.requests} requests succeeded"
+                f"⚠ {model}: {h.success}/{h.requests} OK"
                 + (f" ({', '.join(detail)})" if detail else "")
-                + " — the provider is struggling with this model, not your keys"
+                + circuit
             )
+
+    def is_model_circuit_open(self, model: str) -> bool:
+        """True if circuit breaker has tripped for this model."""
+        h = self.model_health.get(model)
+        return h is not None and h.is_circuit_open
 
     def record_request(self, key: str) -> None:
         t = self.rpm.get(key)

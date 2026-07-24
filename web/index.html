@@ -43,6 +43,15 @@
               <button class="btn btn-xs think-btn" data-think="on" title="Force reasoning on">on</button>
               <button class="btn btn-xs think-btn" data-think="off" title="Force reasoning off — much faster first token">off</button>
             </span>
+            <!-- Reasoning effort: granularità oltre on/off.
+                 low = fast/zero thinking, medium = balanced, high = deep/focused -->
+            <span class="status-meta effort-row">
+              Effort
+              <button class="btn btn-xs effort-btn" data-effort="auto" title="Defer to thinking toggle">auto</button>
+              <button class="btn btn-xs effort-btn" data-effort="low" title="Fast — no reasoning, temp 0.7">low</button>
+              <button class="btn btn-xs effort-btn" data-effort="medium" title="Balanced — thinking on, temp 0.5">med</button>
+              <button class="btn btn-xs effort-btn" data-effort="high" title="Deep — thinking on, temp 0.2">high</button>
+            </span>
           </div>
           <div class="status-acts">
             <button class="btn btn-sm" id="stopBtn" title="Stop">⏹</button>

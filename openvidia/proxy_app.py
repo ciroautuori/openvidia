@@ -26,6 +26,8 @@ MAX_BODY_BYTES = 64 * 1024 * 1024
 # just burns cooldown budget. 401/403/429 are key-specific → rotate + cooldown.
 ROTATE_STATUSES = {401, 403, 429}
 
+from ._upstream_utils import get_upstream_sem, is_resource_exhausted  # noqa: E402
+
 
 def default_model(state: ProxyState | None = None) -> str:
     """The model a request runs on when the client sends the ``openvidia`` alias.
@@ -51,7 +53,11 @@ def default_model(state: ProxyState | None = None) -> str:
 # 25 saturated keys could block a Codex request for up to 25×120s = 50min.
 _MAX_ROTATE_ATTEMPTS = 5
 _ROTATE_SEND_TIMEOUT = httpx.Timeout(**config.httpx_timeout_kwargs())
-_MIN_LIVE_FRACTION = 0.2  # <20% live keys → skip rotation, go to fallback/503
+# Fast probe timeout: used only to detect dead/overloaded models quickly.
+# If NVIDIA doesn't reply in 30s on ANY key → model is down → circuit opens.
+# Full streaming answers still use _ROTATE_SEND_TIMEOUT (180s).
+_MODEL_PROBE_TIMEOUT = httpx.Timeout(connect=5.0, read=90.0, write=10.0, pool=95.0)
+_MIN_LIVE_FRACTION = 0.05  # <5% live keys → skip rotation, go to fallback/503
 
 STRIPPED_RESPONSE_HEADERS = {
     "content-encoding",
@@ -65,11 +71,16 @@ def should_rotate(status: int) -> bool:
     return status in ROTATE_STATUSES or status >= 500
 
 
-async def _check_key_health(client: httpx.AsyncClient, key: str) -> bool:
+async def _check_key_health(client: httpx.AsyncClient, key: str, sem: asyncio.Semaphore | None = None) -> bool:
     headers = {"Authorization": f"Bearer {key}", "User-Agent": "openvidia/2.0"}
     try:
-        req = client.build_request("GET", UPSTREAM_BASE + "models", headers=headers)
-        resp = await client.send(req)
+        if sem is not None:
+            async with sem:
+                req = client.build_request("GET", UPSTREAM_BASE + "models", headers=headers)
+                resp = await client.send(req)
+        else:
+            req = client.build_request("GET", UPSTREAM_BASE + "models", headers=headers)
+            resp = await client.send(req)
         ok = resp.is_success
         await resp.aclose()
         return ok
@@ -80,26 +91,27 @@ async def _check_key_health(client: httpx.AsyncClient, key: str) -> bool:
 async def _health_check_all(
     state: ProxyState, client: httpx.AsyncClient, force: bool = False
 ) -> None:
-    """Probe cooldown-expired keys in parallel (pre-warm touches all keys).
+    """Probe cooldown-expired keys in parallel with concurrency bounds.
 
     Serial probing was fine for <5 keys but stalls pre-warm beyond ~2s when
-    many keys are dead and each probe takes the full ReadTimeout. We batch
-    them with asyncio.gather so the whole pass completes in ~one round-trip.
+    many keys are dead. We batch them with asyncio.gather bounded by a
+    Semaphore to prevent blasting dozens of requests at once.
     """
     targets: list[str] = []
     for key in state.keys:
         if not force and not state.is_key_on_cooldown(key):
             continue
-        # Skip keys with most of their cooldown left — probing too early wastes quota.
-        if not force and state.cooldown_remaining(key) > 90:
+        # Skip keys with most of their cooldown left — probe only when nearing expiry.
+        if not force and state.cooldown_remaining(key) > 30:
             continue
         targets.append(key)
 
     if not targets:
         return
 
+    sem = asyncio.Semaphore(5)
     results = await asyncio.gather(
-        *(_check_key_health(client, k) for k in targets),
+        *(_check_key_health(client, k, sem) for k in targets),
         return_exceptions=True,
     )
 
@@ -124,7 +136,7 @@ async def _health_check_all(
 async def _background_health_check(state: ProxyState, client: httpx.AsyncClient) -> None:
     try:
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
             await _health_check_all(state, client)
     except asyncio.CancelledError:
         pass
@@ -165,14 +177,16 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
 
 
 def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
-    # Tuned for many concurrent streaming completions: generous keepalive pool,
-    # long read timeout for slow LLM generation, HTTP/2 for connection reuse.
     limits = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0)
+    proxy_url = config.outbound_proxy()
     client = httpx.AsyncClient(
         http2=True,
+        proxy=proxy_url if proxy_url else None,
         limits=limits,
         timeout=httpx.Timeout(**config.httpx_timeout_kwargs()),
     )
+
+
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -254,12 +268,28 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 if resp.is_success:
                     data = resp.json()
                     await resp.aclose()
+                    # Mantieni entrambe le chiavi: "data" (standard OpenAI,
+                    # usata da Codex) e "models" (usata da altri client).
                     if "data" in data and "models" not in data:
-                        models = data.pop("data")
+                        models = list(data["data"])
                         for m in models:
                             m["slug"] = m.get("id", "")
                             m["display_name"] = m.get("id", "")
                         data["models"] = models
+                    # Inietta l'alias "openvidia" in cima a entrambe le liste
+                    # così i picker dei CLI (Codex, opencode) lo mostrano come
+                    # opzione selezionabile. Il proxy lo risolve a runtime nel
+                    # modello selezionato nella dashboard.
+                    alias = {
+                        "id": "openvidia",
+                        "object": "model",
+                        "slug": "openvidia",
+                        "display_name": "OpenVidia (dashboard auto-select)",
+                    }
+                    if isinstance(data.get("models"), list):
+                        data["models"].insert(0, alias)
+                    if isinstance(data.get("data"), list):
+                        data["data"].insert(0, dict(alias))
                     return JSONResponse(data)
                 await resp.aclose()
             except httpx.HTTPError:
@@ -330,11 +360,8 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
 
         # Model alias: "openvidia" resolves to the user's active model.
         if isinstance(payload, dict):
-            m = state.active_model or payload.get("model")
-            if isinstance(m, str) and m != "openvidia":
-                payload["model"] = m
-                body = json.dumps(payload).encode()
-            elif m == "openvidia":
+            req_model = payload.get("model")
+            if req_model == "openvidia" or not req_model:
                 resolved = default_model(state)
                 if not resolved:
                     return JSONResponse(
@@ -343,6 +370,7 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                     )
                 payload["model"] = resolved
                 body = json.dumps(payload).encode()
+
 
         # Thinking toggle (dashboard setting; never overrides the client).
         if isinstance(payload, dict) and payload.get("model"):
@@ -375,6 +403,32 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
             state.log_cb("✗ No valid keys available")
             return JSONResponse({"error": "no valid keys available"}, status_code=503)
 
+        # ── Circuit breaker: skip model if too many consecutive failures ──────
+        # When glm-5.2 or laguna-xs are down on NVIDIA, ALL keys will timeout.
+        # Instead of spending 30s×5 attempts = 2.5min on a known-dead model,
+        # check the circuit and auto-failover to the next healthy preset.
+        requested_model = payload.get("model", "") if isinstance(payload, dict) else ""
+        if requested_model and state.is_model_circuit_open(requested_model):
+            # Try to failover to the next working preset
+            presets = config.load_saved_presets()
+            fallback = next(
+                (m for m in presets if m != requested_model and not state.is_model_circuit_open(m)),
+                None,
+            )
+            if fallback and isinstance(payload, dict):
+                state.log_cb(
+                    f"🔴 {requested_model} circuit OPEN → auto-failover to {fallback}"
+                )
+                payload["model"] = fallback
+                body = json.dumps(payload).encode()
+                requested_model = fallback
+            else:
+                state.log_cb(f"🔴 {requested_model} circuit OPEN, no healthy fallback")
+                return JSONResponse(
+                    {"error": f"{requested_model} is down (circuit open), no fallback available"},
+                    status_code=503,
+                )
+
         nv_path = full_path[3:] if full_path.startswith("v1/") else full_path
         url = UPSTREAM_BASE + nv_path
 
@@ -405,16 +459,19 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
             last_status = 429
 
         _rotate_attempts = 0
-        for orig_idx, key in candidates:
-            if _rotate_attempts >= _MAX_ROTATE_ATTEMPTS:
-                state.log_cb(
-                    f"  rotation cap reached ({_MAX_ROTATE_ATTEMPTS} attempts) → stop "
-                    f"(fallback/503)"
-                )
-                break
-            if not state.key_can_send_rpm(key):
-                state.log_cb(f"  key[{orig_idx}] RPM saturated ({state.key_rpm(key)}/min), skip")
-                continue
+        for _pass in range(3):
+            if _pass > 0:
+                await asyncio.sleep(1.0)
+            for orig_idx, key in candidates:
+                if _rotate_attempts >= _MAX_ROTATE_ATTEMPTS:
+                    state.log_cb(
+                        f"  rotation cap reached ({_MAX_ROTATE_ATTEMPTS} attempts) → stop "
+                        f"(fallback/503)"
+                    )
+                    break
+                if not state.key_can_send_rpm(key):
+                    state.log_cb(f"  key[{orig_idx}] RPM saturated ({state.key_rpm(key)}/min), skip")
+                    continue
 
             headers = {
                 "Authorization": f"Bearer {key}",
@@ -428,25 +485,38 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
 
             state.begin_in_flight(key)
             _rotate_attempts += 1
+            _model = payload.get("model", "") if isinstance(payload, dict) else ""
+            _t0 = time.monotonic()
+            # First attempt uses the fast probe timeout to detect dead models
+            # immediately. Subsequent attempts (the model is probably just slow)
+            # use the full streaming timeout.
+            _timeout = _MODEL_PROBE_TIMEOUT if _rotate_attempts == 1 else _ROTATE_SEND_TIMEOUT
             try:
                 req = client.build_request(
                     request.method,
                     url,
                     content=body,
                     headers=headers,
-                    timeout=_ROTATE_SEND_TIMEOUT,
+                    timeout=_timeout,
                 )
-                resp = await client.send(req, stream=True)
+                # Global concurrency semaphore: never exceed 28 concurrent
+                # upstream sends (NVIDIA worker limit is 32/32).
+                async with get_upstream_sem():
+                    resp = await client.send(req, stream=True)
             except httpx.ReadTimeout:
-                # Slow model, not a bad key: the upstream accepted the request
-                # and is still thinking. Cooling the key down would drain the
-                # pool, and rotating would just re-run the same model.
+                # Slow model or dead model.
                 state.end_in_flight(key)
+                _ttft_wait = _timeout.read
                 state.log_cb(
-                    f"key[{orig_idx}] no first byte in "
-                    f"{_ROTATE_SEND_TIMEOUT.read:.0f}s — model too slow, not a key fault"
+                    f"key[{orig_idx}] no first byte in {_ttft_wait:.0f}s — model too slow/down"
                 )
                 state.stats.record_key_usage(key, ok=False, error="ReadTimeout")
+                state.record_model_result(_model, too_slow=True)
+                # On first attempt with probe timeout: continue rotating to confirm
+                # it's a model issue not a single-key fluke.
+                if _rotate_attempts == 1:
+                    continue
+                # After 2nd timeout: model is confirmed dead, break immediately.
                 break
             except httpx.HTTPError as e:
                 state.end_in_flight(key)
@@ -465,8 +535,10 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 state.stats.record_key_usage(key, ok=True)
                 state.record_request(key)
                 state.restore_key(key)
+                _ttft = time.monotonic() - _t0
+                state.record_model_result(_model, ok=True, ttft=_ttft)
                 if nv_path != "models":
-                    state.log_cb(f"✔ key[{orig_idx}] OK")
+                    state.log_cb(f"✔ key[{orig_idx}] OK ({_ttft:.1f}s TTFT)")
 
                 out_headers = {
                     k: v
@@ -480,12 +552,14 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 # Bind the loop variables explicitly. The return below leaves
                 # the loop immediately, so late binding could not bite here —
                 # but a reader (and the linter) should not have to prove that.
-                async def body_iter(resp=resp, key=key):
+                async def body_iter(resp=resp, key=key, orig_idx=orig_idx):
                     try:
                         async for chunk in resp.aiter_raw():
                             if await request.is_disconnected():
                                 break
                             yield chunk
+                    except (httpx.ReadTimeout, httpx.StreamError, httpx.HTTPError) as e:
+                        state.log_cb(f"key[{orig_idx}] stream timeout/error: {e}")
                     finally:
                         state.end_in_flight(key)
                         await resp.aclose()
@@ -496,13 +570,46 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
             state.log_cb(f"key[{orig_idx}] HTTP {status}")
             last_status = status
 
+            # Gateway timeouts (502/503/504): upstream overload, not the
+            # key's fault. Short cooldown prevents hammering the same
+            # broken upstream instance while still letting the next key
+            # try — if the entire pool is hitting the same wall, all keys
+            # will briefly cooldown and the saturation gate will kick in.
+            if status in {502, 503, 504}:
+                state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
+                state.mark_key_failed(key, status=status, retry_after=10)
+                state.record_model_result(_model, status=status)
+                state.stats.rotations += 1
+                await resp.aclose()
+                continue
+
             if should_rotate(status):
                 retry_after = resp.headers.get("retry-after")
+                # Check if this 429 is a ResourceExhausted (worker concurrency
+                # limit) vs. a real RPM rate-limit. Concurrency errors are
+                # transient: the worker frees a slot as soon as any in-flight
+                # request finishes, so burning the key with a 45s+ cooldown
+                # just depletes the pool. Treat it as a brief skip instead.
+                _resp_body = None
+                try:
+                    _resp_body = await resp.aread()
+                except Exception:
+                    pass
+                await resp.aclose()
+                if status == 429 and is_resource_exhausted(_resp_body):
+                    _rotate_attempts -= 1  # Don't burn attempt budget on worker-level transient peak
+                    state.log_cb(
+                        f"key[{orig_idx}] ResourceExhausted (worker full) — "
+                        f"pausing 0.8s for worker slot to free"
+                    )
+                    state.stats.record_key_usage(key, ok=False, error="ResourceExhausted")
+                    state.stats.rotations += 1
+                    await asyncio.sleep(0.8)
+                    continue
                 state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
                 state.mark_key_failed(key, status=status, retry_after=retry_after)
                 state.stats.rotations += 1
                 persist_index(state, (orig_idx + 1) % total_keys)
-                await resp.aclose()
                 continue
 
             resp_bytes = await resp.aread()
@@ -513,17 +620,61 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 headers={"access-control-allow-origin": "*"},
             )
 
-        # NO model substitution. The model the user selected is the model the
-        # request runs on: silently answering from a different one makes the
-        # proxy lie about what produced the output. If every key failed for
-        # that model, say so.
+        # All rotation attempts exhausted. Check if model circuit should auto-open
+        # so the next request gets failover immediately instead of repeating all this.
         model_name = payload.get("model", "") if isinstance(payload, dict) else ""
+        if model_name:
+            state.record_model_result(model_name, status=last_status)
         msg = "all keys exhausted"
         if model_name:
             msg += f" for {model_name}"
+        if model_name and state.is_model_circuit_open(model_name):
+            msg += " (circuit open — will auto-failover on next request)"
         return JSONResponse(
             {"error": msg, "last_upstream_status": last_status},
             status_code=last_status,
         )
+
+    # ── /ops/health — live model & pool health dashboard ──────────────
+    @app.get("/ops/health")
+    async def _ops_health() -> JSONResponse:
+        """Structured health report: model circuit states, pool stats, recent logs."""
+        import time as _time
+        now = _time.time()
+        models_out = []
+        for model, h in state.model_health.items():
+            models_out.append({
+                "model": model,
+                "requests": h.requests,
+                "success": h.success,
+                "failure_rate": round(h.failure_rate, 2),
+                "too_slow": h.too_slow,
+                "gateway_timeouts": h.gateway_timeouts,
+                "rate_limited": h.rate_limited,
+                "median_ttft_s": round(h.median_ttft, 1),
+                "circuit_open": h.is_circuit_open,
+                "consecutive_failures": h.consecutive_failures,
+                "circuit_reset_in_s": max(0, round(h.CIRCUIT_RESET_AFTER - (now - h.circuit_opened_at), 1))
+                    if h.is_circuit_open else 0,
+            })
+        live_keys, valid_keys = state.count_live_candidates()
+        recent_logs = list(state.log_buffer)[-50:]
+        return JSONResponse({
+            "pool": {
+                "n_keys": len(state.keys),
+                "n_healthy": valid_keys,
+                "n_live_rpm": live_keys,
+                "n_on_cooldown": sum(1 for k in state.keys if state.is_key_on_cooldown(k)),
+                "aggregate_rpm": sum(state.key_rpm(k) for k in state.keys),
+                "rpm_ceiling": len(state.keys) * 28,
+            },
+            "models": models_out,
+            "presets": config.load_saved_presets(),
+            "active_model": state.active_model,
+            "total_requests": state.stats.requests,
+            "total_success": state.stats.success,
+            "total_rotations": state.stats.rotations,
+            "recent_logs": recent_logs,
+        })
 
     return app

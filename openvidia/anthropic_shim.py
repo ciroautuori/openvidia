@@ -29,6 +29,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from ._upstream_utils import get_upstream_sem, is_resource_exhausted
 from .proxy_state import ProxyState
 
 
@@ -454,66 +455,79 @@ async def _stream_anthropic(
     resp = None
     used_key = None
     used_idx = None
-    for idx, k in candidates:
-        if not state.key_can_send_rpm(k):
-            continue
-        hdrs = {
-            "Authorization": f"Bearer {k}",
-            "Content-Type": "application/json",
-            "User-Agent": "openvidia/2.0",
-        }
-        # Claim the key before sending — see _rotation_phase in
-        # responses_shim.py for why the load balancer needs this.
-        state.begin_in_flight(k)
-        try:
-            req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
-            resp = await client.send(req, stream=True)
-        except httpx.ReadTimeout:
-            # Slow model, not a bad key — see responses_shim._rotation_phase.
-            state.log_cb(
-                f"  anthropic shim: key[{idx}] no first byte — model too slow, not a key fault"
-            )
-            state.end_in_flight(k)
-            break
-        except httpx.HTTPError as e:
-            err_msg = str(e) or type(e).__name__
-            state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
-            state.end_in_flight(k)
-            state.mark_key_failed(k)
-            continue
+    for pass_num in range(3):
+        if pass_num > 0:
+            import asyncio
+            await asyncio.sleep(1.0)
+        for idx, k in candidates:
+            if not state.key_can_send_rpm(k):
+                continue
+            hdrs = {
+                "Authorization": f"Bearer {k}",
+                "Content-Type": "application/json",
+                "User-Agent": "openvidia/2.0",
+            }
+            state.begin_in_flight(k)
+            try:
+                req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
+                async with get_upstream_sem():
+                    resp = await client.send(req, stream=True)
+            except httpx.ReadTimeout:
+                state.log_cb(
+                    f"  anthropic shim: key[{idx}] no first byte — model too slow, not a key fault"
+                )
+                state.end_in_flight(k)
+                break
+            except httpx.HTTPError as e:
+                err_msg = str(e) or type(e).__name__
+                state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating)")
+                state.end_in_flight(k)
+                state.mark_key_failed(k)
+                continue
 
-        if resp.status_code == 200:
-            used_key = k  # claim held until the stream ends
-            used_idx = idx
-            break
+            if resp.status_code == 200:
+                used_key = k  # claim held until the stream ends
+                used_idx = idx
+                break
 
-        state.end_in_flight(k)
-        err_status = resp.status_code
-        err_raw = await resp.aread()
-        await resp.aclose()
-        resp = None
-        state.log_cb(f"  anthropic shim: key[{idx}] HTTP {err_status}")
-        if err_status in _CLIENT_ERR:
-            # Deterministic error: surface to client, do not rotate or cooldown.
-            yield _sse_event(
-                "error",
-                {
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": _extract_err(err_raw, err_status),
+            state.end_in_flight(k)
+            err_status = resp.status_code
+            err_raw = await resp.aread()
+            await resp.aclose()
+            resp = None
+            state.log_cb(f"  anthropic shim: key[{idx}] HTTP {err_status}")
+
+            if err_status == 429 and is_resource_exhausted(err_raw):
+                import asyncio
+                state.log_cb(
+                    f"  anthropic shim: key[{idx}] ResourceExhausted (worker full) — pausing 0.8s"
+                )
+                state.stats.record_key_usage(k, ok=False, error="ResourceExhausted")
+                await asyncio.sleep(0.8)
+                continue
+
+            if err_status in _CLIENT_ERR:
+                yield _sse_event(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": _extract_err(err_raw, err_status),
+                        },
                     },
-                },
-            )
-            return
-        if err_status in _GATEWAY_TIMEOUTS:
-            # Provider edge gave up on the model; not this key's fault.
-            state.log_cb(
-                f"  anthropic shim: HTTP {err_status} is an upstream gateway "
-                f"timeout — key[{idx}] left healthy"
-            )
-            continue
-        state.mark_key_failed(k, status=err_status)
+                )
+                return
+            if err_status in _GATEWAY_TIMEOUTS:
+                state.log_cb(
+                    f"  anthropic shim: HTTP {err_status} gateway timeout — "
+                    f"key[{idx}] 10s cooldown"
+                )
+                state.mark_key_failed(k, status=err_status, retry_after=10)
+                continue
+            state.mark_key_failed(k, status=err_status)
+        if used_key is not None:
+            break
 
     if resp is None or used_key is None:
         yield _sse_event(
@@ -801,49 +815,63 @@ async def handle_anthropic_messages(
     used_key = None
     used_idx = None
     resp = None
-    for idx, k in candidates:
-        if not state.key_can_send_rpm(k):
-            continue
-        hdrs = {
-            "Authorization": f"Bearer {k}",
-            "Content-Type": "application/json",
-            "User-Agent": "openvidia/2.0",
-        }
-        try:
-            req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
-            resp = await client.send(req)
-        except httpx.ReadTimeout:
-            # Slow model, not a bad key — see responses_shim._rotation_phase.
-            state.log_cb(
-                f"  anthropic shim: key[{idx}] no answer in time — model too slow, not a key fault"
-            )
-            break
-        except httpx.HTTPError as e:
-            err_msg = str(e) or type(e).__name__
-            state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating, cooldown 30s)")
-            state.mark_key_failed(k)
-            continue
-        if resp.status_code == 200:
-            used_key = k
-            used_idx = idx
-            break
-        err_status = resp.status_code
-        err_raw = await resp.aread()
-        await resp.aclose()
-        resp = None
-        if err_status in _CLIENT_ERR:
-            # Deterministic error: surface to client, do not rotate or cooldown.
-            return JSONResponse(
-                {
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": _extract_err(err_raw, err_status),
+    for pass_num in range(3):
+        if pass_num > 0:
+            import asyncio
+            await asyncio.sleep(1.0)
+        for idx, k in candidates:
+            if not state.key_can_send_rpm(k):
+                continue
+            hdrs = {
+                "Authorization": f"Bearer {k}",
+                "Content-Type": "application/json",
+                "User-Agent": "openvidia/2.0",
+            }
+            try:
+                req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
+                async with get_upstream_sem():
+                    resp = await client.send(req)
+            except httpx.ReadTimeout:
+                state.log_cb(
+                    f"  anthropic shim: key[{idx}] no answer in time — model too slow, not a key fault"
+                )
+                break
+            except httpx.HTTPError as e:
+                err_msg = str(e) or type(e).__name__
+                state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating)")
+                state.mark_key_failed(k)
+                continue
+            if resp.status_code == 200:
+                used_key = k
+                used_idx = idx
+                break
+            err_status = resp.status_code
+            err_raw = await resp.aread()
+            await resp.aclose()
+            resp = None
+            if err_status == 429 and is_resource_exhausted(err_raw):
+                import asyncio
+                state.log_cb(
+                    f"  anthropic shim: key[{idx}] ResourceExhausted (worker full) — pausing 0.8s"
+                )
+                state.stats.record_key_usage(k, ok=False, error="ResourceExhausted")
+                await asyncio.sleep(0.8)
+                continue
+            if err_status in _CLIENT_ERR:
+                return JSONResponse(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": _extract_err(err_raw, err_status),
+                        },
                     },
-                },
-                status_code=err_status,
-            )
-        state.log_cb(f"  anthropic shim: key[{idx}] HTTP {err_status}")
+                    status_code=err_status,
+                )
+            state.log_cb(f"  anthropic shim: key[{idx}] HTTP {err_status}")
+            state.mark_key_failed(k, status=err_status)
+        if used_key is not None:
+            break
         state.mark_key_failed(k, status=err_status)
         continue
 

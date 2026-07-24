@@ -32,6 +32,7 @@ from collections.abc import Callable
 import httpx
 
 from . import config
+from ._upstream_utils import get_upstream_sem, is_resource_exhausted
 
 UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
 
@@ -58,8 +59,8 @@ _DEFAULTS = {
     # request competes for keys on a DIFFERENT traffic stream, never the same.
     # Set to "" to fall back to the user's selected model.
     # Strongly recommended: point this at a FAST model — a reasoning-heavy
-    # model needs 25s+ to compress 70k tokens.
-    "summary_model": "",
+    # model needs 25s+ to compress 70k tokens. Default to ultra-fast Llama-3.1 8B.
+    "summary_model": "meta/llama-3.1-8b-instruct",
     # Hard cap on summarize attempts: if the pool is saturated we must NOT
     # serially try all 25 keys, so we bail to deterministic trim after this
     # many rotate-attempts.
@@ -424,6 +425,7 @@ async def _summarize(
         "temperature": 0.2,
         "stream": False,
     }
+    config.apply_model_options(payload)
     last_err = ""
     attempts = 0
     seen_429 = False
@@ -451,12 +453,22 @@ async def _summarize(
                     }
                 },
             )
-            resp = await client.send(req)
+            async with get_upstream_sem():
+                resp = await client.send(req)
         except httpx.HTTPError as e:
             last_err = str(e) or type(e).__name__
             continue
         try:
             if resp.status_code != 200:
+                resp_bytes = None
+                try:
+                    resp_bytes = await resp.aread()
+                except Exception:
+                    pass
+                if resp.status_code == 429 and is_resource_exhausted(resp_bytes):
+                    attempts -= 1  # Don't burn attempt on transient worker limit
+                    await asyncio.sleep(0.5)
+                    continue
                 last_err = f"summarize HTTP {resp.status_code}"
                 if resp.status_code == 429:
                     seen_429 = True

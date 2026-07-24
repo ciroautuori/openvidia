@@ -394,3 +394,5 @@ header{display:flex;align-items:center;justify-content:space-between;padding:2px
 .btn-xs{padding:2px 7px;font-size:.6rem;border-radius:5px}
 .think-row{display:inline-flex;align-items:center;gap:4px;margin-top:3px}
 .think-btn.active{background:var(--accent);color:#0a0b0a;border-color:var(--accent);font-weight:700}
+.effort-row{display:inline-flex;align-items:center;gap:4px;margin-top:3px}
+.effort-btn.active{background:var(--accent);color:#0a0b0a;border-color:var(--accent);font-weight:700}

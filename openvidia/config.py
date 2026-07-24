@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -32,12 +33,28 @@ def config_dir() -> Path:
 # completions, /v1/responses, /v1/messages) import this.
 _TIMEOUT_DEFAULTS = {
     "connect": 5.0,
-    "read": 240.0,
+    "read": 180.0,
     "write": 30.0,
     "pool": 240.0,
 }
 
 _HTTPX_TIMEOUT_KEYS = ("connect", "read", "write", "pool")
+
+
+def httpx_timeout_kwargs() -> dict[str, float]:
+    """Return configured upstream timeouts as kwargs for `httpx.Timeout`."""
+    out = dict(_TIMEOUT_DEFAULTS)
+    try:
+        p = config_dir() / "timeouts.json"
+        if p.exists():
+            user = json.loads(p.read_text())
+            if isinstance(user, dict):
+                for k in _HTTPX_TIMEOUT_KEYS:
+                    if k in user and isinstance(user[k], int | float):
+                        out[k] = float(user[k])
+    except (json.JSONDecodeError, OSError):
+        pass
+    return out
 
 
 def upstream_timeouts() -> dict:
@@ -55,10 +72,30 @@ def upstream_timeouts() -> dict:
     return dict(_TIMEOUT_DEFAULTS)
 
 
-def httpx_timeout_kwargs() -> dict:
-    """Just the keys ``httpx.Timeout`` accepts."""
-    t = upstream_timeouts()
-    return {k: t[k] for k in _HTTPX_TIMEOUT_KEYS}
+def outbound_proxy() -> str | None:
+    """Return outbound HTTP/SOCKS5 proxy URL for upstream requests.
+
+    Overridable via OPENVIDIA_OUTBOUND_PROXY or proxy_config.json.
+    """
+    env_proxy = (
+        os.environ.get("OPENVIDIA_OUTBOUND_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("http_proxy")
+    )
+    if env_proxy:
+        return env_proxy
+    try:
+        p = config_dir() / "proxy_config.json"
+        if p.exists():
+            data = json.loads(p.read_text())
+            if isinstance(data, dict) and data.get("outbound_proxy"):
+                return str(data["outbound_proxy"])
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
 
 
 # ── Thinking / reasoning toggle ────────────────────────────────────────
@@ -69,10 +106,58 @@ def httpx_timeout_kwargs() -> dict:
 # different flag, edit model_options.json instead of shipping a release.
 _MODEL_OPTIONS_DEFAULTS = {
     "thinking": "auto",  # "auto" (send nothing) | "on" | "off"
-    "thinking_off_payload": {"chat_template_kwargs": {"thinking": False}},
-    "thinking_on_payload": {"chat_template_kwargs": {"thinking": True}},
-    # Per-model overrides, e.g. {"vendor/model": {"thinking": "off"}}
-    "per_model": {},
+    # NVIDIA NIM 2026: new models use enable_thinking, older use chat_template_kwargs.thinking
+    "thinking_off_payload": {"chat_template_kwargs": {"enable_thinking": False}},
+    "thinking_on_payload": {"chat_template_kwargs": {"enable_thinking": True}},
+    # ── Reasoning effort: granularità oltre on/off ──
+    # low   → thinking off + temperature alta (fast, zero reasoning)
+    # medium → thinking on  + temperature media (balanced)
+    # high  → thinking on  + temperature bassa (focused, deep reasoning)
+    "reasoning_effort": "auto",  # "auto" | "low" | "medium" | "high"
+    "effort_payloads": {
+        "low": {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0.7},
+        "medium": {"chat_template_kwargs": {"enable_thinking": True}, "temperature": 0.5},
+        "high": {"chat_template_kwargs": {"enable_thinking": True}, "temperature": 0.2},
+    },
+    # ── Per-model hardcoded optimizations ─────────────────────────────────
+    # These are defaults from NVIDIA docs — the dashboard can still override.
+    # Key insight:
+    #   DeepSeek V4 Pro: enable_thinking=False → TTFT 60s→3s for coding
+    #   Nemotron Ultra:  enable_thinking=False mandatory for tool calling;
+    #                    temperature=1.0, top_p=0.95 per NVIDIA best practice
+    #   GLM 5.2:         thinking=False → stops the 180s block
+    "per_model": {
+        "deepseek-ai/deepseek-v4-pro": {
+            "thinking": "off",
+            # temperature 0.0 = deterministic, best for coding accuracy
+            "extra_payload": {
+                "chat_template_kwargs": {"enable_thinking": False},
+                "temperature": 0.0,
+            },
+        },
+        "nvidia/nemotron-3-ultra-550b-a55b": {
+            "thinking": "off",
+            # temperature=1.0, top_p=0.95: NVIDIA recommended for Nemotron reasoning modes
+            # enable_thinking MUST be False for tool calling (otherwise hangs)
+            "extra_payload": {
+                "chat_template_kwargs": {"enable_thinking": False},
+                "temperature": 1.0,
+                "top_p": 0.95,
+            },
+        },
+        "z-ai/glm-5.2": {
+            "thinking": "off",
+            "extra_payload": {
+                "chat_template_kwargs": {"thinking": False},
+            },
+        },
+        "poolside/laguna-xs-2.1": {
+            "thinking": "off",
+            "extra_payload": {
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        },
+    },
 }
 
 
@@ -81,13 +166,17 @@ def model_options_path() -> Path:
 
 
 def model_options() -> dict:
+    opts = copy.deepcopy(_MODEL_OPTIONS_DEFAULTS)
     try:
         p = model_options_path()
         if p.exists():
-            return {**_MODEL_OPTIONS_DEFAULTS, **json.loads(p.read_text())}
+            saved = json.loads(p.read_text())
+            if isinstance(saved, dict):
+                _fill_missing(saved, opts)
+                return saved
     except (json.JSONDecodeError, OSError):
         pass
-    return dict(_MODEL_OPTIONS_DEFAULTS)
+    return opts
 
 
 def save_model_options(opts: dict) -> None:
@@ -105,32 +194,48 @@ def _fill_missing(dst: dict, src: dict) -> dict:
         if isinstance(v, dict) and isinstance(dst.get(k), dict):
             _fill_missing(dst[k], v)
         elif k not in dst:
-            dst[k] = v
+            dst[k] = copy.deepcopy(v)
     return dst
 
 
 def apply_model_options(payload: dict) -> dict:
-    """Merge the configured thinking payload into an outgoing chat request.
+    """Merge the configured thinking/reasoning payload into an outgoing chat request.
 
-    Never overwrites something the client already set: an explicit request
-    from the CLI wins over a dashboard default.
+    Priority (high → low):
+    1. per_model.extra_payload  — model-specific optimal params (enable_thinking, temperature…)
+    2. reasoning_effort         — low/medium/high slider
+    3. thinking on/off          — simple binary toggle
+    Never overwrites something the client already set explicitly.
     """
     if not isinstance(payload, dict):
         return payload
     opts = model_options()
     model = payload.get("model") or ""
-    mode = (opts.get("per_model") or {}).get(model, {}).get("thinking") or opts.get(
-        "thinking", "auto"
-    )
+    per = (opts.get("per_model") or {}).get(model, {})
+
+    # 1. Per-model extra_payload (model-specific optimal params like enable_thinking: False, temp, etc.)
+    extra_payload = per.get("extra_payload")
+    if isinstance(extra_payload, dict):
+        _fill_missing(payload, extra_payload)
+
+    # 2. Reasoning effort override (if specified for model or globally and not auto)
+    effort = per.get("reasoning_effort") or opts.get("reasoning_effort", "auto")
+    if effort != "auto":
+        extra = (opts.get("effort_payloads") or {}).get(effort)
+        if isinstance(extra, dict):
+            _fill_missing(payload, extra)
+            return payload
+
+    # 3. Fallback: toggle thinking binario auto/on/off
+    mode = per.get("thinking") or opts.get("thinking", "auto")
     if mode == "off":
         extra = opts.get("thinking_off_payload") or {}
+        if isinstance(extra, dict):
+            _fill_missing(payload, extra)
     elif mode == "on":
         extra = opts.get("thinking_on_payload") or {}
-    else:
-        return payload
-    if not isinstance(extra, dict):
-        return payload
-    _fill_missing(payload, extra)
+        if isinstance(extra, dict):
+            _fill_missing(payload, extra)
     return payload
 
 

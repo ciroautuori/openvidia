@@ -255,11 +255,13 @@ def _setup_codex():
     needs_model = not re.search(r'^model\s*=\s*"openvidia"', content, re.MULTILINE)
     needs_provider = not re.search(r'^model_provider\s*=\s*"openvidia"', content, re.MULTILINE)
     needs_block = "[model_providers.openvidia]" not in content
+    needs_openai_block = "[model_providers.openai-direct]" not in content
 
-    if needs_model or needs_provider or needs_block:
+    if needs_model or needs_provider or needs_block or needs_openai_block:
         lines = content.splitlines()
         new_lines = []
         in_openvidia_block = False
+        in_openai_block = False
         model_set = False
         provider_set = False
 
@@ -295,6 +297,19 @@ def _setup_codex():
             if in_openvidia_block:
                 continue
 
+            # Skip the old [model_providers.openai] or [model_providers.openai-direct] block
+            if stripped in ("[model_providers.openai]", "[model_providers.openai-direct]"):
+                in_openai_block = True
+                continue
+            if (
+                in_openai_block
+                and stripped.startswith("[")
+                and stripped not in ("[model_providers.openai]", "[model_providers.openai-direct]")
+            ):
+                in_openai_block = False
+            if in_openai_block:
+                continue
+
             new_lines.append(line)
 
         # Prepend model/model_provider if not yet set
@@ -310,6 +325,17 @@ def _setup_codex():
         new_lines.append('name = "OpenVidia"')
         new_lines.append(f'base_url = "http://localhost:{PORT}/v1"')
         new_lines.append(f'env_key = "{ENV_VAR}"')
+        new_lines.append('wire_api = "responses"')
+        new_lines.append("")
+
+        # Provider custom: openai-direct per modelli GPT/Codex (gpt-5-codex, gpt-5.5)
+        # Non possiamo usare "openai" perché Codex lo riserva come built-in.
+        # Richiede una vera OPENAI_API_KEY (sk-...) nell'env.
+        new_lines.append("# Provider custom: openai-direct (GPT/Codex — richiede OPENAI_API_KEY sk-...)")
+        new_lines.append("[model_providers.openai-direct]")
+        new_lines.append('name = "OpenAI Direct"')
+        new_lines.append('base_url = "https://api.openai.com/v1"')
+        new_lines.append('env_key = "OPENAI_API_KEY"')
         new_lines.append('wire_api = "responses"')
         new_lines.append("")
         changed = True
@@ -413,6 +439,21 @@ context_window = 128000
     return True
 
 
+def _setup_proxy_config():
+    """Ensure ~/.config/openvidia/proxy_config.json exists with default settings."""
+    cfg_dir = config.config_dir()
+    p = cfg_dir / "proxy_config.json"
+    if not p.exists():
+        default_cfg = {
+            "outbound_proxy": "",
+            "comment": "Set outbound_proxy (e.g. http://user:pass@proxy.example.com:8080) for IP rotation across large key pools"
+        }
+        config.atomic_write(p, json.dumps(default_cfg, indent=2))
+        print(f"✓ Created proxy config template → {p}")
+    else:
+        print(f"✓ Proxy config ready → {p}")
+
+
 def _setup_cmd():
     """Full setup: configure every detected CLI (opencode, Codex, Grok)."""
     print("╔════════════════════════════════════════════╗")
@@ -421,6 +462,9 @@ def _setup_cmd():
     print()
 
     _ensure_env_var()
+    print()
+
+    _setup_proxy_config()
     print()
 
     _setup_opencode()
