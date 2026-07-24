@@ -472,11 +472,17 @@ function renderUsage() {
     opencode: {
       title: 'opencode',
       steps: [
-        { label: 'Config', code: `# ~/.config/opencode/opencode.json
-{
-  "provider": "openvidia",
-  "model": "${m}",
-  "api_base": "http://localhost:1919/v1"
+        { label: 'Auto-setup (recommended)', code: `openvidia setup` },
+        { label: 'Manual — ~/.config/opencode/opencode.json', code: `{
+  "provider": {
+    "openvidia": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "apiKey": "ignored", "baseURL": "http://localhost:1919/v1" },
+      "models": { "${m}": { "name": "OpenVidia", "tools": true } }
+    }
+  },
+  "model": "openvidia/${m}",
+  "compaction": { "auto": true, "prune": true, "reserved": 8000 }
 }` },
         { label: 'Run', code: `opencode` },
       ],
@@ -484,18 +490,33 @@ function renderUsage() {
     codex: {
       title: 'Codex CLI',
       steps: [
-        { label: 'Env', code: `export OPENAI_API_KEY=ignored
-export OPENAI_BASE_URL=http://localhost:1919/v1` },
-        { label: 'Config', code: `# ~/.codex/config.toml
-model = "${m}"
-api_base_url = "http://localhost:1919/v1"` },
-        { label: 'Run', code: `codex exec "explain this codebase"` },
+        { label: 'Auto-setup (recommended)', code: `openvidia setup` },
+        { label: 'Manual — ~/.codex/config.toml', code: `model = "${m}"
+model_provider = "openvidia"
+
+[model_providers.openvidia]
+name = "OpenVidia"
+base_url = "http://localhost:1919/v1"
+env_key = "OPENVIDIA_API_KEY"
+wire_api = "responses"
+
+[model_providers.openvidia.models.${m}]
+name = "OpenVidia (NVIDIA NIM via proxy)"
+context_window = 128000
+supports_tool_use = true
+supports_parallel_tool_use = true
+cost_input_tokens = 0
+cost_output_tokens = 0` },
+        { label: 'Env', code: `export OPENVIDIA_API_KEY=ignored` },
+        { label: 'Run', code: `codex --model ${m}` },
       ],
     },
     claude: {
       title: 'Claude Code',
       steps: [
-        { label: 'Env (temporary, this shell only)', code: `export ANTHROPIC_BASE_URL=http://localhost:1919
+        { label: 'Auto-setup (recommended)', code: `openvidia setup` },
+        { label: 'Reload shell after setup', code: `source ~/.zshrc  # or ~/.bashrc` },
+        { label: 'Manual — add to ~/.zshrc or ~/.bashrc', code: `export ANTHROPIC_BASE_URL=http://localhost:1919
 export ANTHROPIC_API_KEY=ignored` },
         { label: 'Run', code: `claude --model ${m}` },
         { label: 'Or one-shot', code: `ANTHROPIC_BASE_URL=http://localhost:1919 \\
@@ -506,13 +527,15 @@ export ANTHROPIC_API_KEY=ignored` },
     grok: {
       title: 'Grok (xAI)',
       steps: [
-        { label: 'config.toml', code: `# ~/.grok/config.toml
-[provider.openvidia]
-base_url = "http://localhost:1919/v1"
-api_key = "ignored"
+        { label: 'Auto-setup (recommended)', code: `openvidia setup` },
+        { label: 'Manual — ~/.grok/config.toml', code: `[models]
+default = "${m}"
 
-[model."${m}"]
-provider = "openvidia"` },
+[model.${m}]
+api_key = "ignored"
+base_url = "http://localhost:1919/v1"
+api_backend = "chat_completions"
+context_window = 128000` },
         { label: 'Run', code: `grok -m ${m} "explain this codebase"` },
       ],
     },

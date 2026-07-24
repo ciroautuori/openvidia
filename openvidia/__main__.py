@@ -327,6 +327,15 @@ def _setup_codex():
         new_lines.append(f'env_key = "{ENV_VAR}"')
         new_lines.append('wire_api = "responses"')
         new_lines.append("")
+        # Model metadata — without this Codex shows "Model metadata not found"
+        new_lines.append("[model_providers.openvidia.models.openvidia]")
+        new_lines.append('name = "OpenVidia (NVIDIA NIM via proxy)"')
+        new_lines.append("context_window = 128000")
+        new_lines.append("supports_tool_use = true")
+        new_lines.append("supports_parallel_tool_use = true")
+        new_lines.append("cost_input_tokens = 0")
+        new_lines.append("cost_output_tokens = 0")
+        new_lines.append("")
 
         # Provider custom: openai-direct per modelli GPT/Codex (gpt-5-codex, gpt-5.5)
         # Non possiamo usare "openai" perché Codex lo riserva come built-in.
@@ -400,6 +409,7 @@ def _setup_claude_code():
     print(f"✓ Configured Claude Code → {rc}")
     print(f"  ANTHROPIC_BASE_URL=http://localhost:{PORT}")
     print("  ANTHROPIC_API_KEY=ignored")
+    print(f"⚠ Run: source {rc}  (or open a new terminal)")
     print("✓ Claude Code ready — run: claude --model openvidia")
     return True
 
