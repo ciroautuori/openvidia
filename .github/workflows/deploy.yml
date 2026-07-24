@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install / update package
-        run: pip install -e . --quiet
+        run: python3 -m pip install -e . --quiet
 
       - name: Restart service
         run: sudo systemctl restart openvidia
