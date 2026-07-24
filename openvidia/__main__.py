@@ -364,55 +364,8 @@ def _setup_codex():
 
 
 def _setup_claude_code():
-    """Write ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY to the shell rc file.
-
-    Claude Code picks up ANTHROPIC_BASE_URL automatically at startup; no
-    config file is needed. The shim at /v1/messages translates Anthropic
-    Messages format to NVIDIA chat/completions bidirectionally.
-    """
-    import shutil
-
-    if not shutil.which("claude"):
-        print("ℹ Claude Code not found — skipping")
-        return False
-
-    shell = os.environ.get("SHELL", "")
-    home = Path.home()
-    if "bash" in shell:
-        rc = home / ".bashrc"
-    elif "fish" in shell:
-        rc = home / ".config" / "fish" / "config.fish"
-    else:
-        rc = home / ".zshrc"
-
-    rc.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        content = rc.read_text() if rc.exists() else ""
-    except OSError:
-        content = ""
-
-    lines_to_add = []
-    if "ANTHROPIC_BASE_URL" not in content:
-        lines_to_add.append(f"export ANTHROPIC_BASE_URL=http://localhost:{PORT}")
-    if "ANTHROPIC_API_KEY" not in content:
-        lines_to_add.append("export ANTHROPIC_API_KEY=ignored")
-
-    if not lines_to_add:
-        print("✓ Claude Code already configured")
-        return False
-
-    with open(rc, "a") as f:
-        if content and not content.endswith("\n"):
-            f.write("\n")
-        f.write("\n# Claude Code → OpenVidia Anthropic shim\n")
-        for line in lines_to_add:
-            f.write(line + "\n")
-
-    print(f"✓ Configured Claude Code → {rc}")
-    print(f"  ANTHROPIC_BASE_URL=http://localhost:{PORT}")
-    print("  ANTHROPIC_API_KEY=ignored")
-    print(f"⚠ Run: source {rc}  (or open a new terminal)")
-    print("✓ Claude Code ready — run: claude --model openvidia")
+    """Skip mutating shell rc files for Claude Code to ensure standard native operation is never affected."""
+    print("ℹ Claude Code auto-config disabled (use native Claude Code).")
     return True
 
 
