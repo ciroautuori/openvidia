@@ -21,10 +21,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from . import config
+from .config import UPSTREAM_BASE
 from .proxy_state import ProxyState
-
-UPSTREAM_BASE = "https://integrate.api.nvidia.com/v1/"
-
 
 # --------------------------------------------------------------------------- #
 # Static dashboard bundle
@@ -126,33 +124,6 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
             "in_flight": in_flight,
             "aggregate_rpm_ceiling": agg_ceiling,
         }
-
-    # ----------------------------------------------------------------------- #
-    # Accounts (legacy single-bucket surface kept for UI compat)
-    # ----------------------------------------------------------------------- #
-
-    @app.get("/api/accounts")
-    async def api_get_accounts() -> dict:
-        keys = list(state.keys)
-        accounts = [{"name": "Default", "keys": keys}]
-        return {"accounts": accounts, "active_account": ""}
-
-    @app.post("/api/accounts")
-    async def api_save_accounts(request: Request) -> dict:
-        body = await request.json()
-        accounts = body.get("accounts", [])
-        keys: list[str] = []
-        for acct in accounts:
-            keys.extend(acct.get("keys", []))
-        async with state.lock:
-            state.keys = list(keys)
-        config.save_keys_file(keys)
-        return {"ok": True}
-
-    @app.post("/api/accounts/active")
-    async def api_set_active_account(request: Request) -> dict:
-        await request.json()
-        return {"ok": True}
 
     # ----------------------------------------------------------------------- #
     # Keys CRUD
@@ -491,7 +462,7 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def auto_open(port: int = 3940) -> None:
+def auto_open(port: int = 1919) -> None:
     """Best-effort browser launch 1.5 s after call.
 
     The delay gives the proxy a head start so the browser doesn't race

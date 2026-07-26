@@ -1,6 +1,6 @@
 [project]
 name = "openvidia"
-version = "1.0.0"
+version = "2.0.0"
 description = "NVIDIA NIM multi-key proxy with smart rate limiting, cooldown management, and desktop dashboard"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -15,7 +15,7 @@ dependencies = [
     "PyQt6>=6.5; platform_system=='Linux'",
     "PyQt6-WebEngine>=6.5; platform_system=='Linux'",
     "qtpy>=2.4; platform_system=='Linux'",
-    "pyqt6-webengine>=6.11.0",
+    "tomlkit>=0.13",
 ]
 license = "MIT"
 authors = [{ name = "Ciro Autuori" }]
@@ -25,9 +25,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries",
 ]
-
-[project.optional-dependencies]
-auto-regen = ["playwright>=1.40", "websockets>=12.0"]
 
 # Contributor tooling: `uv sync` installs these automatically, so a fresh
 # clone can run `uv run pytest` without hunting for the right packages.

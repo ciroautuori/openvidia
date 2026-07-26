@@ -3,15 +3,16 @@ Thread-safe shared state for the running proxy.
 
 Single source of truth for keys, cooldowns, RPM tracking and usage stats.
 ``ProxyState`` is accessed concurrently by the asyncio event loop and by OS
-threads spawned by ``account_manager`` (key regeneration), so a plain
-``asyncio.Lock`` is not enough. Critical sections that touch the key list are
-guarded by a real ``threading.Lock``; everything else relies on the async lock
-and is safe within a single-threaded event loop.
+threads (health checks), so a plain ``asyncio.Lock`` is not enough. Critical
+sections that touch the key list are guarded by a real ``threading.Lock``;
+everything else relies on the async lock and is safe within a single-threaded
+event loop.
 """
 
 from __future__ import annotations
 
 import asyncio
+import random
 import threading
 import time
 from collections import deque
@@ -40,11 +41,10 @@ COOLDOWN_DURATIONS: dict[int, float] = {
 }
 DEFAULT_COOLDOWN = 30.0
 
-# Adaptive cooldown multiplier: increases cooldown for repeated failures
-ADAPTIVE_COOLDOWN_MULTIPLIER = 1.5  # Each consecutive failure multiplies cooldown by this
-ADAPTIVE_COOLDOWN_MAX = (
-    1.5  # Capped at 1.5x base cooldown (~65s max) to prevent indefinite lockouts
-)
+# Adaptive cooldown: repeated failures get up to ADAPTIVE_COOLDOWN_MAX
+# times the base duration. The exponent is capped at MAX so a key that
+# fails many times in a row is not locked out indefinitely.
+ADAPTIVE_COOLDOWN_MAX = 1.5
 
 # Adaptive RPM: per-key ceiling is halved on a 429 (jittered backoff) and
 # restored to MAX_RPM on the next success.
@@ -284,7 +284,7 @@ class ProxyState:
         stats: ProxyStats,
         index_path: Path,
         log_cb: Callable[[str], None],
-        port: int = 3940,
+        port: int = 1919,
     ):
         self._keys: list[str] = list(keys)
         self._key_states: dict[str, KeyState] = {k: KeyState(k) for k in keys}
@@ -296,7 +296,7 @@ class ProxyState:
         self.save_lock = asyncio.Lock()
         self.log_buffer: deque = deque(maxlen=500)
         self._log_cb = log_cb
-        self.on_key_failed: Callable[[str], None] | None = None
+
         self.active_model: str | None = None
         self.running: bool = True
         self.health_task: asyncio.Task | None = None
@@ -418,18 +418,15 @@ class ProxyState:
             # Jitter up to 10s (was 30s): smaller spread reduces thundering
             # herd while still staggering simultaneous 429s.
             if multiplier is None:
-                import random
-
                 _r = random.Random(int(time.time()) ^ (hash(key) & 0xFFFFFFFF))
                 base_duration = COOLDOWN_DURATIONS[429] + _r.uniform(0.0, 10.0)
             # Apply adaptive multiplier only when we chose the base (no
-            # Retry-After was provided).
+            # Retry-After was provided). With MULTIPLIER=1.5 and MAX=1.5
+            # the exponent never exceeds the cap, so a simple threshold
+            # is equivalent and clearer than min(pow(...), cap).
             failures = ks.consecutive_failures if ks is not None else 1
             if multiplier is None:
-                multiplier = min(
-                    ADAPTIVE_COOLDOWN_MULTIPLIER ** (failures - 1),
-                    ADAPTIVE_COOLDOWN_MAX,
-                )
+                multiplier = 1.0 if failures <= 1 else ADAPTIVE_COOLDOWN_MAX
             duration = base_duration * multiplier
 
             reason = f"429 rate-limited (cooldown {duration:.0f}s, attempt {failures})"
@@ -454,10 +451,7 @@ class ProxyState:
             base_duration = COOLDOWN_DURATIONS[status]
             # Apply adaptive multiplier for repeated failures (except auth errors)
             if status not in (401, 403) and ks is not None and ks.consecutive_failures > 1:
-                multiplier = min(
-                    ADAPTIVE_COOLDOWN_MULTIPLIER ** (ks.consecutive_failures - 1),
-                    ADAPTIVE_COOLDOWN_MAX,
-                )
+                multiplier = ADAPTIVE_COOLDOWN_MAX
                 duration = base_duration * multiplier
                 reason = (
                     f"{error_details} (cooldown {duration:.0f}s, attempt {ks.consecutive_failures})"
@@ -492,9 +486,6 @@ class ProxyState:
             if ks is not None:
                 ks.cooldown_until = time.time() + duration
                 ks.last_error = reason
-
-        if self.on_key_failed is not None:
-            self.on_key_failed(key)
 
     def restore_key(self, key: str) -> None:
         self.clear_cooldown(key)
@@ -686,9 +677,6 @@ class ProxyState:
         self.stats.active_key_index = next_candidate_idx
 
         return available
-
-    def clear_cooldown_and_restore(self, key: str) -> None:
-        self.restore_key(key)
 
     # ── Stats for UI ────────────────────────────────────────────────
 

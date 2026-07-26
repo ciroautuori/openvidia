@@ -33,8 +33,7 @@ import httpx
 
 from . import config
 from ._upstream_utils import get_upstream_sem, is_resource_exhausted
-
-UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
+from .config import UPSTREAM_CHAT as UPSTREAM
 
 _DEFAULTS = {
     "enabled": True,
@@ -93,16 +92,9 @@ _DEFAULTS = {
 #     {"model_budgets": {"z-ai/glm-5.2": 120000, "qwen/...": 32000}}
 # This is the only place where per-model knowledge lives — runtime code
 # never hardcodes a provider/model name. The proxy is provider-agnostic.
-_model_budget_cache: dict[str, int] = {}
-
-
 def _model_budgets(cfg: dict) -> dict[str, int]:
-    """User-supplied per-model budget overrides from compaction.json (dynamic)."""
-    overrides = cfg.get("model_budgets") or {}
-    if overrides != _model_budget_cache:
-        _model_budget_cache.clear()
-        _model_budget_cache.update(overrides)
-    return _model_budget_cache
+    """User-supplied per-model budget overrides from compaction.json."""
+    return cfg.get("model_budgets") or {}
 
 
 # ── Learned context windows ────────────────────────────────────────────

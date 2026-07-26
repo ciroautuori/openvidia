@@ -57,19 +57,11 @@ def httpx_timeout_kwargs() -> dict[str, float]:
     return out
 
 
-def upstream_timeouts() -> dict:
-    """All upstream timeout settings, overridable via ``timeouts.json``.
-
-    Read once at import time — this is startup configuration, not a hot path.
-    """
-    try:
-        p = config_dir() / "timeouts.json"
-        if p.exists():
-            loaded = json.loads(p.read_text())
-            return {**_TIMEOUT_DEFAULTS, **{k: float(v) for k, v in loaded.items()}}
-    except (json.JSONDecodeError, OSError, TypeError, ValueError):
-        pass
-    return dict(_TIMEOUT_DEFAULTS)
+# ── Upstream endpoints (single source of truth) ────────────────────────
+# Base URL per NVIDIA NIM; la variante /chat/completions è usata da
+# responses_shim, anthropic_shim e compaction.
+UPSTREAM_BASE = "https://integrate.api.nvidia.com/v1/"
+UPSTREAM_CHAT = UPSTREAM_BASE + "chat/completions"
 
 
 def outbound_proxy() -> str | None:
@@ -240,10 +232,6 @@ def apply_model_options(payload: dict) -> dict:
 
 def config_path() -> Path:
     return config_dir() / "keys.json"
-
-
-def accounts_path() -> Path:
-    return config_dir() / "accounts.json"
 
 
 def index_path() -> Path:

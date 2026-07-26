@@ -9,24 +9,30 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
 from . import config
 from .anthropic_shim import handle_anthropic_messages
-from .proxy_state import ProxyState, persist_index
-from .responses_shim import handle_responses
+from .config import UPSTREAM_BASE
+from .proxy_state import ProxyState
+from .responses_shim import (
+    _MAX_ROTATE_ATTEMPTS,
+    _MIN_LIVE_FRACTION,
+    _MODEL_PROBE_TIMEOUT,
+    _ROTATE_SEND_TIMEOUT,
+    _live_pool_snapshot,
+    _rotation_phase,
+    handle_responses,
+)
 
-UPSTREAM_BASE = "https://integrate.api.nvidia.com/v1/"
 MAX_BODY_BYTES = 64 * 1024 * 1024
 
 # 400/404 are deterministic content errors — rotating keys won't help and
 # just burns cooldown budget. 401/403/429 are key-specific → rotate + cooldown.
 ROTATE_STATUSES = {401, 403, 429}
-
-from ._upstream_utils import get_upstream_sem, is_resource_exhausted  # noqa: E402
 
 
 def default_model(state: ProxyState | None = None) -> str:
@@ -47,28 +53,12 @@ def default_model(state: ProxyState | None = None) -> str:
     return presets[0] if presets else ""
 
 
-# Bounded rotation: cap the number of upstream sends per rotation phase and
-# give each send a bounded connect+read+write+pool timeout. The catch-all
-# historically iterated ALL candidates with the client default read=120s, so
-# 25 saturated keys could block a Codex request for up to 25×120s = 50min.
-_MAX_ROTATE_ATTEMPTS = 5
-_ROTATE_SEND_TIMEOUT = httpx.Timeout(**config.httpx_timeout_kwargs())
-# Fast probe timeout: used only to detect dead/overloaded models quickly.
-# If NVIDIA doesn't reply in 30s on ANY key → model is down → circuit opens.
-# Full streaming answers still use _ROTATE_SEND_TIMEOUT (180s).
-_MODEL_PROBE_TIMEOUT = httpx.Timeout(connect=5.0, read=90.0, write=10.0, pool=95.0)
-_MIN_LIVE_FRACTION = 0.05  # <5% live keys → skip rotation, go to fallback/503
-
 STRIPPED_RESPONSE_HEADERS = {
     "content-encoding",
     "transfer-encoding",
     "content-length",
     "connection",
 }
-
-
-def should_rotate(status: int) -> bool:
-    return status in ROTATE_STATUSES or status >= 500
 
 
 async def _check_key_health(
@@ -122,7 +112,7 @@ async def _health_check_all(
         if isinstance(healthy, Exception):
             healthy = False
         if healthy:
-            state.clear_cooldown_and_restore(key)
+            state.restore_key(key)
             revived += 1
         elif force:
             state.mark_key_failed(key)
@@ -429,8 +419,6 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         nv_path = full_path[3:] if full_path.startswith("v1/") else full_path
         url = UPSTREAM_BASE + nv_path
 
-        total_keys = len(state.keys)
-        last_status = 503
         CLIENT_FWD_HEADERS = {"content-type", "accept", "x-request-id", "x-trace-id"}
 
         # Saturation gate: weigh live (cooldown-free, RPM-eligible) candidates
@@ -439,184 +427,85 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         # tail, so len(candidates) can be small even when the pool is healthy.
         # Using the full pool as the denominator makes the gate fire correctly
         # when most of the 25 keys are on cooldown (the historical Codex block).
-        _live_candidates = sum(
-            1
-            for _, k in candidates
-            if state.key_can_send_rpm(k) and not state.is_key_on_cooldown(k)
-        )
-        _total_pool = len(state.keys)
-        _pool_saturated = _total_pool > 0 and _live_candidates < max(
+        _live, _total_pool = _live_pool_snapshot(state, candidates)
+        _pool_saturated = _total_pool > 0 and _live < max(
             1, int(_total_pool * _MIN_LIVE_FRACTION)
         )
+        last_status = 429 if _pool_saturated else 503
         if _pool_saturated:
             state.log_cb(
-                f"⚠ pool saturated ({_live_candidates}/{_total_pool} live) → "
+                f"⚠ pool saturated ({_live}/{_total_pool} live) → "
                 f"skip rotation, try model fallback"
             )
-            last_status = 429
 
-        _rotate_attempts = 0
-        for _pass in range(3):
-            if _pass > 0:
-                await asyncio.sleep(1.0)
-            for orig_idx, key in candidates:
-                if _rotate_attempts >= _MAX_ROTATE_ATTEMPTS:
-                    state.log_cb(
-                        f"  rotation cap reached ({_MAX_ROTATE_ATTEMPTS} attempts) → stop "
-                        f"(fallback/503)"
-                    )
-                    break
-                if not state.key_can_send_rpm(key) or state.is_key_on_cooldown(key):
-                    continue
+        # Bounded rotation via shared _rotation_phase (same logic as shims).
+        # The catch-all passes method + raw content so it supports GET, POST,
+        # PUT, etc. — the shims use the default POST + json=payload.
+        _payload_for_rotation = payload if isinstance(payload, dict) else {"model": ""}
 
-                headers = {
-                    "Authorization": f"Bearer {key}",
-                    "User-Agent": "openvidia/2.0",
-                }
-                for k, v in request.headers.items():
-                    if k.lower() in CLIENT_FWD_HEADERS:
-                        headers[k] = v
-                if isinstance(payload, dict) and "content-type" not in {k.lower() for k in headers}:
-                    headers["Content-Type"] = "application/json"
+        def _hdr(k, idx):
+            h = {
+                "Authorization": f"Bearer {k}",
+                "User-Agent": "openvidia/2.0",
+            }
+            for hk, hv in request.headers.items():
+                if hk.lower() in CLIENT_FWD_HEADERS:
+                    h[hk] = hv
+            if "content-type" not in {hk.lower() for hk in h}:
+                h["Content-Type"] = "application/json"
+            return h
 
-                state.begin_in_flight(key)
-                _rotate_attempts += 1
-                _model = payload.get("model", "") if isinstance(payload, dict) else ""
-                _t0 = time.monotonic()
-                # First attempt uses the fast probe timeout to detect dead models
-                # immediately. Subsequent attempts (the model is probably just slow)
-                # use the full streaming timeout.
-                _timeout = _MODEL_PROBE_TIMEOUT if _rotate_attempts == 1 else _ROTATE_SEND_TIMEOUT
+        resp, used_key, used_idx = await _rotation_phase(
+            client,
+            url,
+            _payload_for_rotation,
+            _hdr,
+            state,
+            candidates,
+            max_attempts=_MAX_ROTATE_ATTEMPTS,
+            timeout=_ROTATE_SEND_TIMEOUT,
+            stream=True,
+            log_tag="catch-all",
+            seen_429_box=[False],
+            method=request.method,
+            content=body if body else None,
+            probe_timeout=_MODEL_PROBE_TIMEOUT,
+        )
+
+        if resp is not None and resp.status_code == 200:
+            out_headers = {
+                k: v
+                for k, v in resp.headers.items()
+                if k.lower() not in STRIPPED_RESPONSE_HEADERS
+            }
+            out_headers["access-control-allow-origin"] = "*"
+            out_headers["access-control-allow-headers"] = "Content-Type, Authorization"
+            out_headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
+
+            async def body_iter(resp=resp, key=used_key, orig_idx=used_idx):
                 try:
-                    req = client.build_request(
-                        request.method,
-                        url,
-                        content=body,
-                        headers=headers,
-                        timeout=_timeout,
-                    )
-                    # Global concurrency semaphore: never exceed 28 concurrent
-                    # upstream sends (NVIDIA worker limit is 32/32).
-                    async with get_upstream_sem():
-                        resp = await client.send(req, stream=True)
-                except httpx.ReadTimeout:
-                    # Slow model or dead model.
+                    async for chunk in resp.aiter_raw():
+                        if await request.is_disconnected():
+                            break
+                        yield chunk
+                except (httpx.ReadTimeout, httpx.StreamError, httpx.HTTPError) as e:
+                    state.log_cb(f"key[{orig_idx}] stream timeout/error: {e}")
+                finally:
                     state.end_in_flight(key)
-                    _ttft_wait = _timeout.read
-                    state.log_cb(
-                        f"key[{orig_idx}] no first byte in {_ttft_wait:.0f}s — model too slow/down"
-                    )
-                    state.stats.record_key_usage(key, ok=False, error="ReadTimeout")
-                    state.record_model_result(_model, too_slow=True)
-                    # On first attempt with probe timeout: continue rotating to confirm
-                    # it's a model issue not a single-key fluke.
-                    if _rotate_attempts == 1:
-                        continue
-                    # After 2nd timeout: model is confirmed dead, break immediately.
-                    break
-                except httpx.HTTPError as e:
-                    state.end_in_flight(key)
-                    err_msg = str(e) or type(e).__name__
-                    state.log_cb(f"key[{orig_idx}] {err_msg}")
-                    state.stats.record_key_usage(key, ok=False, error=err_msg)
-                    state.mark_key_failed(key)
-                    state.stats.rotations += 1
-                    persist_index(state, (orig_idx + 1) % total_keys)
-                    continue
-
-                status = resp.status_code
-
-                if 200 <= status < 300:
-                    state.stats.success += 1
-                    state.stats.record_key_usage(key, ok=True)
-                    state.record_request(key)
-                    state.restore_key(key)
-                    _ttft = time.monotonic() - _t0
-                    state.record_model_result(_model, ok=True, ttft=_ttft)
-                    if nv_path != "models":
-                        state.log_cb(f"✔ key[{orig_idx}] OK ({_ttft:.1f}s TTFT)")
-
-                    out_headers = {
-                        k: v
-                        for k, v in resp.headers.items()
-                        if k.lower() not in STRIPPED_RESPONSE_HEADERS
-                    }
-                    out_headers["access-control-allow-origin"] = "*"
-                    out_headers["access-control-allow-headers"] = "Content-Type, Authorization"
-                    out_headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
-
-                    # Bind the loop variables explicitly. The return below leaves
-                    # the loop immediately, so late binding could not bite here —
-                    # but a reader (and the linter) should not have to prove that.
-                    async def body_iter(resp=resp, key=key, orig_idx=orig_idx):
-                        try:
-                            async for chunk in resp.aiter_raw():
-                                if await request.is_disconnected():
-                                    break
-                                yield chunk
-                        except (httpx.ReadTimeout, httpx.StreamError, httpx.HTTPError) as e:
-                            state.log_cb(f"key[{orig_idx}] stream timeout/error: {e}")
-                        finally:
-                            state.end_in_flight(key)
-                            await resp.aclose()
-
-                    return StreamingResponse(body_iter(), status_code=status, headers=out_headers)
-
-                state.end_in_flight(key)
-                state.log_cb(f"key[{orig_idx}] HTTP {status}")
-                last_status = status
-
-                # Gateway timeouts (502/503/504): upstream overload, not the
-                # key's fault. Short cooldown prevents hammering the same
-                # broken upstream instance while still letting the next key
-                # try — if the entire pool is hitting the same wall, all keys
-                # will briefly cooldown and the saturation gate will kick in.
-                if status in {502, 503, 504}:
-                    state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
-                    state.mark_key_failed(key, status=status, retry_after=10)
-                    state.record_model_result(_model, status=status)
-                    state.stats.rotations += 1
                     await resp.aclose()
-                    continue
 
-                if should_rotate(status):
-                    retry_after = resp.headers.get("retry-after")
-                    # Check if this 429 is a ResourceExhausted (worker concurrency
-                    # limit) vs. a real RPM rate-limit. Concurrency errors are
-                    # transient: the worker frees a slot as soon as any in-flight
-                    # request finishes, so burning the key with a 45s+ cooldown
-                    # just depletes the pool. Treat it as a brief skip instead.
-                    _resp_body = None
-                    try:
-                        _resp_body = await resp.aread()
-                    except Exception:
-                        pass
-                    await resp.aclose()
-                    if status == 429 and is_resource_exhausted(_resp_body):
-                        _rotate_attempts -= (
-                            1  # Don't burn attempt budget on worker-level transient peak
-                        )
-                        state.log_cb(
-                            f"key[{orig_idx}] ResourceExhausted (worker full) — "
-                            f"pausing 0.8s for worker slot to free"
-                        )
-                        state.stats.record_key_usage(key, ok=False, error="ResourceExhausted")
-                        state.stats.rotations += 1
-                        await asyncio.sleep(0.8)
-                        continue
-                    state.stats.record_key_usage(key, ok=False, error=f"HTTP {status}")
-                    state.mark_key_failed(key, status=status, retry_after=retry_after)
-                    state.stats.rotations += 1
-                    persist_index(state, (orig_idx + 1) % total_keys)
-                    continue
+            return StreamingResponse(body_iter(), status_code=resp.status_code, headers=out_headers)
 
-            resp_bytes = await resp.aread()
+        # Rotation failed: read body for error response, record model result.
+        if resp is not None:
+            last_status = resp.status_code
+            try:
+                await resp.aread()
+            except Exception:
+                pass
             await resp.aclose()
-            return Response(
-                content=resp_bytes,
-                status_code=status,
-                headers={"access-control-allow-origin": "*"},
-            )
+        else:
+            pass
 
         # All rotation attempts exhausted. Check if model circuit should auto-open
         # so the next request gets failover immediately instead of repeating all this.

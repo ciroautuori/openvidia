@@ -17,7 +17,6 @@ Keys auto-extracted from accounts.json if keys.json is empty.
 import asyncio
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -111,23 +110,6 @@ def _kill_stale_port(port: int, *, grace: float = 6.0, hard: float = 4.0) -> boo
         flush=True,
     )
     return False
-
-
-def _extract_keys_from_accounts() -> list:
-    try:
-        p = config.accounts_path()
-        if not p.exists():
-            return []
-        accounts = json.loads(p.read_text())
-        keys = []
-        for acct in accounts:
-            keys.extend(acct.get("keys", []))
-        if keys:
-            config.save_keys_file(keys)
-            print(f"● Extracted {len(keys)} keys from accounts.json")
-        return keys
-    except Exception:
-        return []
 
 
 def _setup_opencode():
@@ -242,122 +224,99 @@ def _ensure_env_var():
 
 
 def _setup_codex():
-    """Configure the Codex CLI (~/.codex/config.toml) to use OpenVidia."""
+    """Configure the Codex CLI (~/.codex/config.toml) to use OpenVidia.
+
+    Usa tomlkit per parse→modify→serialize: preserva commenti e sezioni
+    esistenti, elimina il rischio di duplicati TOML che rompevano il parse.
+    """
+    import tomlkit
+
     codex_dir = Path.home() / ".codex"
     if not codex_dir.exists():
         print("ℹ Codex CLI not found — skipping")
         return False
 
     cfg_path = codex_dir / "config.toml"
-    content = cfg_path.read_text() if cfg_path.exists() else ""
+    try:
+        doc = tomlkit.parse(cfg_path.read_text()) if cfg_path.exists() else tomlkit.document()
+    except Exception as e:
+        print(f"✗ Cannot parse {cfg_path}: {e}")
+        print("  Backing up and starting fresh")
+        if cfg_path.exists():
+            cfg_path.rename(cfg_path.with_suffix(".toml.bak-eros"))
+        doc = tomlkit.document()
 
     changed = False
-    needs_model = not re.search(r'^model\s*=\s*"openvidia"', content, re.MULTILINE)
-    needs_provider = not re.search(r'^model_provider\s*=\s*"openvidia"', content, re.MULTILINE)
-    needs_block = "[model_providers.openvidia]" not in content
-    needs_openai_block = "[model_providers.openai-direct]" not in content
 
-    if needs_model or needs_provider or needs_block or needs_openai_block:
-        lines = content.splitlines()
-        new_lines = []
-        in_openvidia_block = False
-        in_openai_block = False
-        model_set = False
-        provider_set = False
-
-        for line in lines:
-            stripped = line.strip()
-
-            # Skip old model= / model_provider= lines so they get overwritten
-            if (stripped.startswith("model ") or stripped.startswith("model=")) and not model_set:
-                new_lines.append('model = "openvidia"')
-                model_set = True
-                if needs_model:
-                    changed = True
-                continue
-            if (
-                stripped.startswith("model_provider ") or stripped.startswith("model_provider=")
-            ) and not provider_set:
-                new_lines.append('model_provider = "openvidia"')
-                provider_set = True
-                if needs_provider:
-                    changed = True
-                continue
-
-            # Skip the old [model_providers.openvidia] block if present
-            if stripped == "[model_providers.openvidia]":
-                in_openvidia_block = True
-                continue
-            if (
-                in_openvidia_block
-                and stripped.startswith("[")
-                and stripped != "[model_providers.openvidia]"
-            ):
-                in_openvidia_block = False
-            if in_openvidia_block:
-                continue
-
-            # Skip the old [model_providers.openai] or [model_providers.openai-direct] block
-            if stripped in ("[model_providers.openai]", "[model_providers.openai-direct]"):
-                in_openai_block = True
-                continue
-            if (
-                in_openai_block
-                and stripped.startswith("[")
-                and stripped not in ("[model_providers.openai]", "[model_providers.openai-direct]")
-            ):
-                in_openai_block = False
-            if in_openai_block:
-                continue
-
-            new_lines.append(line)
-
-        # Prepend model/model_provider if not yet set
-        if not model_set:
-            new_lines.insert(0, 'model = "openvidia"')
-        if not provider_set:
-            new_lines.insert(1, 'model_provider = "openvidia"')
-
-        # Append provider block at the end
-        new_lines.append("")
-        new_lines.append("# Provider custom: openvidia (NVIDIA NIM multi-key proxy)")
-        new_lines.append("[model_providers.openvidia]")
-        new_lines.append('name = "OpenVidia"')
-        new_lines.append(f'base_url = "http://localhost:{PORT}/v1"')
-        new_lines.append(f'env_key = "{ENV_VAR}"')
-        new_lines.append('wire_api = "responses"')
-        new_lines.append("")
-        # Model metadata — without this Codex shows "Model metadata not found"
-        new_lines.append("[model_providers.openvidia.models.openvidia]")
-        new_lines.append('name = "OpenVidia (NVIDIA NIM via proxy)"')
-        new_lines.append("context_window = 128000")
-        new_lines.append("supports_tool_use = true")
-        new_lines.append("supports_parallel_tool_use = true")
-        new_lines.append("cost_input_tokens = 0")
-        new_lines.append("cost_output_tokens = 0")
-        new_lines.append("")
-
-        # Provider custom: openai-direct per modelli GPT/Codex (gpt-5-codex, gpt-5.5)
-        # Non possiamo usare "openai" perché Codex lo riserva come built-in.
-        # Richiede una vera OPENAI_API_KEY (sk-...) nell'env.
-        new_lines.append(
-            "# Provider custom: openai-direct (GPT/Codex — richiede OPENAI_API_KEY sk-...)"
-        )
-        new_lines.append("[model_providers.openai-direct]")
-        new_lines.append('name = "OpenAI Direct"')
-        new_lines.append('base_url = "https://api.openai.com/v1"')
-        new_lines.append('env_key = "OPENAI_API_KEY"')
-        new_lines.append('wire_api = "responses"')
-        new_lines.append("")
+    # Top-level model + model_provider
+    if doc.get("model") != "openvidia":
+        doc["model"] = "openvidia"
+        changed = True
+    if doc.get("model_provider") != "openvidia":
+        doc["model_provider"] = "openvidia"
         changed = True
 
-        if changed:
-            cfg_path.write_text("\n".join(new_lines))
-            print("✓ Configured Codex CLI → ~/.codex/config.toml")
+    # Provider block: openvidia
+    providers = doc.setdefault("model_providers", {})
+    if "openvidia" not in providers:
+        providers["openvidia"] = {
+            "name": "OpenVidia",
+            "base_url": f"http://localhost:{PORT}/v1",
+            "env_key": ENV_VAR,
+            "wire_api": "responses",
+        }
+        # Model metadata — senza questo Codex mostra "Model metadata not found"
+        providers["openvidia"]["models"] = {
+            "openvidia": {
+                "name": "OpenVidia (NVIDIA NIM via proxy)",
+                "context_window": 128000,
+                "supports_tool_use": True,
+                "supports_parallel_tool_use": True,
+                "cost_input_tokens": 0,
+                "cost_output_tokens": 0,
+            }
+        }
+        changed = True
+    else:
+        # Assicurati che i campi critici siano corretti anche se il blocco esiste
+        ov = providers["openvidia"]
+        if ov.get("base_url") != f"http://localhost:{PORT}/v1":
+            ov["base_url"] = f"http://localhost:{PORT}/v1"
+            changed = True
+        if ov.get("wire_api") != "responses":
+            ov["wire_api"] = "responses"
+            changed = True
+        # Assicurati che il sub-blocco models.openvidia esista
+        models = ov.get("models", {})
+        if "openvidia" not in models:
+            models["openvidia"] = {
+                "name": "OpenVidia (NVIDIA NIM via proxy)",
+                "context_window": 128000,
+                "supports_tool_use": True,
+                "supports_parallel_tool_use": True,
+                "cost_input_tokens": 0,
+                "cost_output_tokens": 0,
+            }
+            ov["models"] = models
+            changed = True
+
+    # Provider block: openai-direct (GPT/Codex — richiede OPENAI_API_KEY sk-...)
+    # Non possiamo usare "openai" perché Codex lo riserva come built-in.
+    if "openai-direct" not in providers:
+        providers["openai-direct"] = {
+            "name": "OpenAI Direct",
+            "base_url": "https://api.openai.com/v1",
+            "env_key": "OPENAI_API_KEY",
+            "wire_api": "responses",
+        }
+        changed = True
+
+    if changed:
+        cfg_path.write_text(tomlkit.dumps(doc))
+        print("✓ Configured Codex CLI → ~/.codex/config.toml")
     else:
         print("✓ Codex CLI already configured")
 
-    # Also set env var in auth.json if Codex needs it
     _ensure_env_var()
     print("✓ Codex CLI ready — run: codex --model openvidia")
     return True
@@ -376,80 +335,35 @@ def _setup_grok():
         print("ℹ Grok CLI not found — skipping")
         return False
 
+    import tomlkit
+
     cfg_path = grok_dir / "config.toml"
-    content = cfg_path.read_text() if cfg_path.exists() else ""
+    try:
+        doc = tomlkit.parse(cfg_path.read_text()) if cfg_path.exists() else tomlkit.document()
+    except Exception:
+        backup = cfg_path.with_suffix(".toml.bak-eros")
+        cfg_path.rename(backup)
+        print(f"⚠ Grok config parse error — backed up to {backup.name}, starting fresh")
+        doc = tomlkit.document()
 
-    has_model = re.search(r"^\[model\.openvidia\]", content, re.MULTILINE)
-    has_default = re.search(r'^default\s*=\s*"openvidia"', content, re.MULTILINE)
+    # Model provider block
+    if "model" not in doc:
+        doc["model"] = tomlkit.table()
+    model_tbl = doc["model"]
+    if "openvidia" not in model_tbl:
+        model_tbl["openvidia"] = tomlkit.table()
+    ov = model_tbl["openvidia"]
+    ov["api_key"] = "ignored"
+    ov["base_url"] = f"http://localhost:{PORT}/v1"
+    ov["api_backend"] = "chat_completions"
+    ov["context_window"] = 128000
 
-    if has_model and has_default:
-        print("✓ Grok CLI already configured")
-        return True
+    # Default model selection
+    if "models" not in doc:
+        doc["models"] = tomlkit.table()
+    doc["models"]["default"] = "openvidia"
 
-    block = f"""
-# Provider custom: openvidia (NVIDIA NIM multi-key proxy)
-[model.openvidia]
-api_key = "ignored"
-base_url = "http://localhost:{PORT}/v1"
-api_backend = "chat_completions"
-context_window = 128000
-"""
-
-    lines = content.splitlines()
-    new_lines = []
-    default_set = False
-    in_models_section = False
-    skip_old_openvidia = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        # Track the [models] section
-        if stripped == "[models]":
-            in_models_section = True
-            new_lines.append(line)
-            continue
-        elif stripped.startswith("[") and stripped != "[models]":
-            in_models_section = False
-
-        # Replace the default model inside the [models] section
-        if (
-            in_models_section
-            and (stripped.startswith("default ") or stripped.startswith("default="))
-            and not default_set
-        ):
-            new_lines.append('default = "openvidia"')
-            default_set = True
-            continue
-
-        # Skip the old [model.openvidia] block
-        if stripped == "[model.openvidia]":
-            skip_old_openvidia = True
-            continue
-        if skip_old_openvidia and stripped.startswith("[") and stripped != "[model.openvidia]":
-            skip_old_openvidia = False
-        if skip_old_openvidia:
-            continue
-
-        new_lines.append(line)
-
-    if not default_set:
-        # Ensure a [models] section exists with the default
-        if "[models]" not in "\n".join(new_lines):
-            new_lines.insert(0, "[models]")
-            new_lines.insert(1, 'default = "openvidia"')
-            new_lines.insert(2, "")
-        else:
-            # Insert right after the [models] header
-            for i, line in enumerate(new_lines):
-                if line.strip() == "[models]":
-                    new_lines.insert(i + 1, 'default = "openvidia"')
-                    break
-        default_set = True
-
-    new_lines.append(block)
-
-    cfg_path.write_text("\n".join(new_lines))
+    cfg_path.write_text(tomlkit.dumps(doc))
     print("✓ Configured Grok CLI → ~/.grok/config.toml")
     _ensure_env_var()
     print("✓ Grok CLI ready — run: grok -m openvidia")
@@ -525,8 +439,6 @@ async def main_async():
     _setup_grok()
     keys = config.load_saved_keys_file()
     if not keys:
-        keys = _extract_keys_from_accounts()
-    if not keys:
         print("✗ No keys found. Add keys to ~/.config/openvidia/keys.json")
         print("  Or run: openvidia setup")
         sys.exit(1)
@@ -548,21 +460,6 @@ async def main_async():
         initial_model=saved_model,
     )
     srv.state.log_cb(f"● OpenVidia running on :{PORT} ({len(keys)} keys)")
-
-    # AccountManager: auto-regenerate keys when they die
-    try:
-        from .account_manager import AccountManager
-
-        am = AccountManager(srv.state, config.accounts_path())
-        am.set_log_cb(log)
-        am.load()
-        srv.state.on_key_failed = am.on_key_failed
-        asyncio.create_task(am.health_check_loop())
-        srv.state.log_cb(f"● AccountManager loaded ({len(am.accounts)} accounts)")
-    except ImportError:
-        pass  # playwright/websockets not installed — auto-regen disabled
-    except Exception as e:
-        srv.state.log_cb(f"⚠ AccountManager init failed: {e}")
 
     # foreground = logs only, no UI
     try:

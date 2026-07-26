@@ -7,7 +7,7 @@ Thank you for considering contributing to OpenVidia! This guide will help you ge
 1. **Fork** the repository
 2. **Clone** your fork: `git clone https://github.com/YOUR_USERNAME/openvidia.git`
 3. **Create a branch**: `git checkout -b feature/your-feature-name`
-4. **Install dependencies**: `pip install -e ".[auto-regen]"`
+4. **Install dependencies**: `pip install -e .`
 5. **Make your changes**
 6. **Run tests**: `pytest tests/`
 7. **Commit and push**: `git push origin feature/your-feature-name`

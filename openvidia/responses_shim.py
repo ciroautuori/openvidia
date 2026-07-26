@@ -90,8 +90,18 @@ async def _rotation_phase(
     stream,
     log_tag,
     seen_429_box,
+    method="POST",
+    content=None,
+    probe_timeout=None,
 ):
-    """Single bounded rotation phase. Returns (resp_or_None, used_key, used_idx)."""
+    """Single bounded rotation phase. Returns (resp_or_None, used_key, used_idx).
+
+    Parameters:
+        method: HTTP method (default POST, used by shims; catch-all passes request.method).
+        content: raw body bytes (used by catch-all; when None, json=payload is used).
+        probe_timeout: se fornito, il primo tentativo usa questo timeout per
+            rilevare modelli morti; i successivi usano ``timeout``.
+    """
     attempts = 0
     for pass_num in range(3):
         if pass_num > 0:
@@ -111,12 +121,21 @@ async def _rotation_phase(
             state.begin_in_flight(k)
             released = False
             resp = None
-            _model = payload.get("model", "")
+            _model = payload.get("model", "") if isinstance(payload, dict) else ""
             _t0 = time.monotonic()
+            # Primo tentativo: probe timeout per rilevare modelli morti in fretta.
+            _send_timeout = timeout
+            if probe_timeout is not None and attempts == 1:
+                _send_timeout = probe_timeout
             try:
-                req = client.build_request(
-                    "POST", upstream, json=payload, headers=hdrs, timeout=timeout
-                )
+                if content is not None:
+                    req = client.build_request(
+                        method, upstream, content=content, headers=hdrs, timeout=_send_timeout
+                    )
+                else:
+                    req = client.build_request(
+                        method, upstream, json=payload, headers=hdrs, timeout=_send_timeout
+                    )
                 # Global concurrency semaphore (shared with proxy_app): never
                 # exceed 28 concurrent upstream sends (NVIDIA worker cap is 32).
                 async with get_upstream_sem():
@@ -131,7 +150,7 @@ async def _rotation_phase(
                 # Stop the phase instead and let the caller fall back to a
                 # different (faster) model, which is the real escalation.
                 state.log_cb(
-                    f"  {log_tag}: key[{idx}] no first byte in {timeout.read:.0f}s "
+                    f"  {log_tag}: key[{idx}] no first byte in {_send_timeout.read:.0f}s "
                     f"— model too slow, not a key fault"
                 )
                 state.record_model_result(_model, too_slow=True)
@@ -738,6 +757,69 @@ async def _stream_responses(
     next_output_index = 0
     items_done_emitted = False
 
+    def _emit_items_done() -> list[bytes]:
+        """Emit output_text.done + output_item.done for text and all tool calls.
+        Returns the list of SSE events to yield."""
+        events: list[bytes] = []
+        if text_started:
+            events.append(
+                _sse_event(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": text_item_id,
+                        "output_index": text_output_index,
+                        "text": text_full,
+                    },
+                )
+            )
+            events.append(
+                _sse_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": text_output_index,
+                        "item": {
+                            "type": "message",
+                            "id": text_item_id,
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": text_full}],
+                        },
+                    },
+                )
+            )
+        for tcm in tool_calls_map.values():
+            events.append(
+                _sse_event(
+                    "response.function_call_arguments.done",
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": tcm["fc_id"],
+                        "output_index": tcm["output_index"],
+                        "arguments": tcm["arguments"],
+                    },
+                )
+            )
+            events.append(
+                _sse_event(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": tcm["output_index"],
+                        "item": {
+                            "type": "function_call",
+                            "id": tcm["fc_id"],
+                            "call_id": tcm["call_id"],
+                            "name": tcm["name"],
+                            "arguments": tcm["arguments"],
+                            "status": "completed",
+                        },
+                    },
+                )
+            )
+        return events
+
     async for line in resp.aiter_lines():
         if await request.is_disconnected():
             break
@@ -836,109 +918,15 @@ async def _stream_responses(
         finish = choice.get("finish_reason")
         if finish and not items_done_emitted:
             items_done_emitted = True
-            if text_started:
-                yield _sse_event(
-                    "response.output_text.done",
-                    {
-                        "type": "response.output_text.done",
-                        "item_id": text_item_id,
-                        "output_index": text_output_index,
-                        "text": text_full,
-                    },
-                )
-                yield _sse_event(
-                    "response.output_item.done",
-                    {
-                        "type": "response.output_item.done",
-                        "output_index": text_output_index,
-                        "item": {
-                            "type": "message",
-                            "id": text_item_id,
-                            "role": "assistant",
-                            "status": "completed",
-                            "content": [{"type": "output_text", "text": text_full}],
-                        },
-                    },
-                )
-            for tcm in tool_calls_map.values():
-                yield _sse_event(
-                    "response.function_call_arguments.done",
-                    {
-                        "type": "response.function_call_arguments.done",
-                        "item_id": tcm["fc_id"],
-                        "output_index": tcm["output_index"],
-                        "arguments": tcm["arguments"],
-                    },
-                )
-                yield _sse_event(
-                    "response.output_item.done",
-                    {
-                        "type": "response.output_item.done",
-                        "output_index": tcm["output_index"],
-                        "item": {
-                            "type": "function_call",
-                            "id": tcm["fc_id"],
-                            "call_id": tcm["call_id"],
-                            "name": tcm["name"],
-                            "arguments": tcm["arguments"],
-                            "status": "completed",
-                        },
-                    },
-                )
+            for ev in _emit_items_done():
+                yield ev
             break
 
     # Safety catch: ensure items are closed even if finish_reason was omitted or [DONE] arrived early
     if not items_done_emitted:
         items_done_emitted = True
-        if text_started:
-            yield _sse_event(
-                "response.output_text.done",
-                {
-                    "type": "response.output_text.done",
-                    "item_id": text_item_id,
-                    "output_index": text_output_index,
-                    "text": text_full,
-                },
-            )
-            yield _sse_event(
-                "response.output_item.done",
-                {
-                    "type": "response.output_item.done",
-                    "output_index": text_output_index,
-                    "item": {
-                        "type": "message",
-                        "id": text_item_id,
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{"type": "output_text", "text": text_full}],
-                    },
-                },
-            )
-        for tcm in tool_calls_map.values():
-            yield _sse_event(
-                "response.function_call_arguments.done",
-                {
-                    "type": "response.function_call_arguments.done",
-                    "item_id": tcm["fc_id"],
-                    "output_index": tcm["output_index"],
-                    "arguments": tcm["arguments"],
-                },
-            )
-            yield _sse_event(
-                "response.output_item.done",
-                {
-                    "type": "response.output_item.done",
-                    "output_index": tcm["output_index"],
-                    "item": {
-                        "type": "function_call",
-                        "id": tcm["fc_id"],
-                        "call_id": tcm["call_id"],
-                        "name": tcm["name"],
-                        "arguments": tcm["arguments"],
-                        "status": "completed",
-                    },
-                },
-            )
+        for ev in _emit_items_done():
+            yield ev
 
     # Capture usage from the terminal chunk (NVIDIA streams usage only when
     # stream_options.include_usage=true). If absent we report zeros — Codex

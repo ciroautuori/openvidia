@@ -20,8 +20,6 @@ depends=(
     'gobject-introspection'
 )
 optdepends=(
-    'python-playwright: auto key regeneration'
-    'python-websockets: CDP-based key regeneration'
     'uv: faster dependency resolution'
 )
 makedepends=('python-setuptools' 'git')

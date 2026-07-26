@@ -6,7 +6,7 @@
 ![Ruff](https://img.shields.io/badge/Ruff-passed-261230?logo=ruff&logoColor=white)
 ![Stars](https://img.shields.io/github/stars/ciroautuori/openvidia?style=social)
 ![Last Commit](https://img.shields.io/github/last-commit/ciroautuori/openvidia)
-![Version](https://img.shields.io/badge/version-1.0.0-green)
+![Version](https://img.shields.io/badge/version-2.0.0-green)
 
 **Multi-key proxy for NVIDIA NIM with a native desktop dashboard.**
 
@@ -75,17 +75,6 @@ openvidia
 
 > pywebview on Windows uses EdgeChromium (WebView2, pre-installed on Windows 10/11).
 > If WebView2 is missing, install it from [Microsoft](https://developer.microsoft.com/en-us/microsoft-edge/webview2/).
-
-### Optional: Auto key regeneration
-
-If you want keys to auto-regenerate when they die (requires a headless browser):
-
-```bash
-pip install -e ".[auto-regen]"
-playwright install chromium
-```
-
-Without this, dead keys stay parked until you manually replace them.
 
 ---
 
@@ -295,7 +284,7 @@ Streaming (SSE) is fully supported — tokens flow through unbuffered.
 
 > **Retry-After is used as-is.** When NVIDIA provides a `Retry-After` header (e.g. 60s), the cooldown is exactly that value. Earlier versions multiplied it by an adaptive factor (`1.5^N`), which caused a doom loop: at 3 failures a 60s backoff became 135s and all 26 keys locked out longer than the real rate-limit window required.
 >
-> When no `Retry-After` is provided the proxy uses 45s + random jitter (≤10s), scaled at most 1.5× for repeated failures — capped at ~65s max.
+> When no `Retry-After` is provided the proxy uses 45s + random jitter (≤10s). Repeated failures get a flat 1.5× multiplier from the second failure onward (no exponential scaling — capped at ~65s max).
 
 ### Sliding-Window RPM
 
@@ -473,7 +462,6 @@ update-desktop-database ~/.local/share/applications/
 | `timeouts.json` | Upstream timeouts (optional — see [Slow models](#slow-models)) |
 | `model_limits.json` | Context windows the proxy learned by itself — never edit by hand |
 | `model_options.json` | Reasoning toggle + the payload used to express it (see [Thinking](#thinking-reasoning-toggle)) |
-| `accounts.json` | Legacy accounts (auto-extracted to keys.json) |
 
 Add keys via the dashboard (**Keys** section) or edit `keys.json`:
 
@@ -584,9 +572,11 @@ MAX_RPM = 28              # Safe margin below NVIDIA's 40 RPM limit
 RPM_WINDOW = 60.0         # Sliding window in seconds
 
 COOLDOWN_DURATIONS = {
+    400: 60.0,            # Deterministic client error — key untouched
     401: 3600.0,          # Unauthorized — dead key
     403: 3600.0,          # Forbidden — dead key
-    429: 180.0,           # Rate limited (Retry-After overrides)
+    404: 60.0,            # Endpoint issue — short cooldown
+    429: 45.0,            # Rate limited (Retry-After overrides when provided)
 }
 # 400/404 are deterministic content errors: the key is left untouched,
 # so rotating on them would only burn cooldown budget.
@@ -627,8 +617,6 @@ DEFAULT_COOLDOWN = 30.0   # Network errors, unknown 5xx
 | `POST` | `/api/start` | Resume proxy |
 | `POST` | `/api/restart` | Zero-downtime restart (spawn new, kill old) |
 | `GET` | `/api/logs/stream` | SSE log stream (real-time) |
-| `GET/POST` | `/api/accounts` | Manage legacy accounts (auto-regen) |
-| `POST` | `/api/accounts/active` | Set active account |
 
 ---
 
@@ -639,6 +627,7 @@ DEFAULT_COOLDOWN = 30.0   # Network errors, unknown 5xx
 - **[uvicorn](https://www.uvicorn.org/)** — ASGI server
 - **[pywebview](https://pywebview.flowrl.com/)** — native desktop window (Qt/GTK/WebKit/EdgeChromium)
 - **[psutil](https://github.com/giampaolo/psutil)** — cross-platform process management
+- **[tomlkit](https://github.com/sdispater/tomlkit)** — TOML config editing (preserves comments)
 - **Vanilla HTML/CSS/JS** — zero frontend build, no node_modules
 - **Python 3.12+** — single process, no external services
 

@@ -29,125 +29,17 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from ._upstream_utils import get_upstream_sem, is_resource_exhausted
+from .config import UPSTREAM_CHAT as UPSTREAM
 from .proxy_state import ProxyState
-
-
-# ── Defensive sanitization of chat/completions messages ────────────────
-def _sanitize_chat_messages(messages: list[dict]) -> list[dict]:
-    """
-    Guarantee every message is a valid OpenAI chat/completions message so
-    upstream never rejects a request with::
-
-        data did not match any variant of untagged enum
-        ChatCompletionRequestToolMessageContent
-
-    Coercion rules:
-      - content is forced to str. Lists are flattened to text; dicts are
-        JSON-encoded; None becomes "" (or " " for tool/user fallbacks).
-      - tool messages require a non-null string content and a tool_call_id;
-        if the caller forgot the id we synthesize one (NVIDIA enforces the
-        match against a prior assistant tool_calls entry).
-      - assistant messages carrying tool_calls get content coerced to ""
-        (never None) — NVIDIA NIM rejects content:null on non-tool messages.
-      - Unknown roles are dropped silently.
-    """
-    out: list[dict] = []
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role")
-        if role not in ("system", "user", "assistant", "tool"):
-            continue
-        content = m.get("content")
-        tool_calls = m.get("tool_calls")
-
-        if isinstance(content, list):
-            parts: list[str] = []
-            for part in content:
-                if isinstance(part, str):
-                    parts.append(part)
-                elif isinstance(part, dict):
-                    if part.get("type") in ("text", "input_text", "output_text"):
-                        parts.append(str(part.get("text", "")))
-                    else:
-                        parts.append(json.dumps(part, ensure_ascii=False))
-            content = chr(10).join(p for p in parts if p)
-        elif isinstance(content, dict):
-            content = json.dumps(content, ensure_ascii=False)
-        elif content is None:
-            content = ""
-        elif not isinstance(content, str):
-            content = str(content)
-
-        if role == "tool":
-            tcid = m.get("tool_call_id") or ""
-            if not tcid:
-                tcid = f"call_{uuid.uuid4().hex[:24]}"
-            if not content:
-                content = " "
-            out.append({"role": "tool", "tool_call_id": tcid, "content": content})
-            continue
-
-        if role == "assistant" and tool_calls:
-            clean_calls = []
-            for tc in tool_calls:
-                if not isinstance(tc, dict):
-                    continue
-                fn = tc.get("function") or {}
-                args = fn.get("arguments", "")
-                if not isinstance(args, str):
-                    args = json.dumps(args, ensure_ascii=False)
-                if not args:
-                    args = "{}"
-                clean_calls.append(
-                    {
-                        "id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
-                        "type": "function",
-                        "function": {
-                            "name": fn.get("name", ""),
-                            "arguments": args,
-                        },
-                    }
-                )
-            if not clean_calls:
-                out.append({"role": "assistant", "content": content or " "})
-                continue
-            out.append(
-                {
-                    "role": "assistant",
-                    "content": content or "",
-                    "tool_calls": clean_calls,
-                }
-            )
-            continue
-
-        out.append({"role": role, "content": content or " "})
-    return out
-
-
-UPSTREAM = "https://integrate.api.nvidia.com/v1/chat/completions"
-
-# 400/404 are deterministic on content (bad payload / nonexistent model):
-# rotating keys cannot fix them and would only waste quota. Surface them
-# directly to the client.
-_CLIENT_ERR = {400, 404}
-# Provider edge gave up waiting for the model — every key hits the same wall,
-# so these must not be charged to the key that carried the request.
-_GATEWAY_TIMEOUTS = {502, 503, 504}
-
-
-def _extract_err(raw: bytes, status: int) -> str:
-    """Best-effort extraction of a human-readable error message from an upstream error body."""
-    try:
-        d = json.loads(raw)
-        m = d.get("error", {})
-        if isinstance(m, dict):
-            m = m.get("message")
-        return str(m or d.get("detail") or raw.decode("utf-8", "replace"))
-    except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
-        return raw.decode("utf-8", "replace") if raw else f"HTTP {status}"
-
+from .responses_shim import (
+    _MAX_ROTATE_ATTEMPTS,
+    _MIN_LIVE_FRACTION,
+    _ROTATE_SEND_TIMEOUT,
+    _live_pool_snapshot,
+    _rotation_phase,
+    _sanitize_chat_messages,
+    _sse_event,
+)
 
 # ── Request: Anthropic Messages → chat/completions ──────────────────
 
@@ -413,11 +305,6 @@ def _chat_to_anthropic_response(chat_data: dict, model: str) -> dict:
 # ── Streaming: SSE chat chunks → SSE Anthropic events ───────────────
 
 
-def _sse_event(event_type: str, data: dict) -> bytes:
-    """Serialize a single SSE event for the Anthropic streaming protocol."""
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
-
-
 async def _stream_anthropic(
     state: ProxyState,
     chat_payload: dict,
@@ -451,84 +338,33 @@ async def _stream_anthropic(
     async with state.lock:
         candidates = state.get_candidate_keys()
 
-    # Key rotation (same pattern as the Responses shim).
+    # Saturation gate + bounded rotation (shared with responses shim).
+    _live, _valid = _live_pool_snapshot(state, candidates)
     resp = None
     used_key = None
     used_idx = None
-    for pass_num in range(3):
-        if pass_num > 0:
-            import asyncio
+    if not (_valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION))):
 
-            await asyncio.sleep(1.0)
-        for idx, k in candidates:
-            if not state.key_can_send_rpm(k) or state.is_key_on_cooldown(k):
-                continue
-            hdrs = {
+        def _hdr(k, idx):
+            return {
                 "Authorization": f"Bearer {k}",
                 "Content-Type": "application/json",
                 "User-Agent": "openvidia/2.0",
             }
-            state.begin_in_flight(k)
-            try:
-                req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
-                async with get_upstream_sem():
-                    resp = await client.send(req, stream=True)
-            except httpx.ReadTimeout:
-                state.log_cb(
-                    f"  anthropic shim: key[{idx}] no first byte — model too slow, not a key fault"
-                )
-                state.end_in_flight(k)
-                break
-            except httpx.HTTPError as e:
-                err_msg = str(e) or type(e).__name__
-                state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating)")
-                state.end_in_flight(k)
-                state.mark_key_failed(k)
-                continue
 
-            if resp.status_code == 200:
-                used_key = k  # claim held until the stream ends
-                used_idx = idx
-                break
-
-            state.end_in_flight(k)
-            err_status = resp.status_code
-            err_raw = await resp.aread()
-            await resp.aclose()
-            resp = None
-            state.log_cb(f"  anthropic shim: key[{idx}] HTTP {err_status}")
-
-            if err_status == 429 and is_resource_exhausted(err_raw):
-                import asyncio
-
-                state.log_cb(
-                    f"  anthropic shim: key[{idx}] ResourceExhausted (worker full) — pausing 0.8s"
-                )
-                state.stats.record_key_usage(k, ok=False, error="ResourceExhausted")
-                await asyncio.sleep(0.8)
-                continue
-
-            if err_status in _CLIENT_ERR:
-                yield _sse_event(
-                    "error",
-                    {
-                        "type": "error",
-                        "error": {
-                            "type": "invalid_request_error",
-                            "message": _extract_err(err_raw, err_status),
-                        },
-                    },
-                )
-                return
-            if err_status in _GATEWAY_TIMEOUTS:
-                state.log_cb(
-                    f"  anthropic shim: HTTP {err_status} gateway timeout — key[{idx}] 10s cooldown"
-                )
-                state.mark_key_failed(k, status=err_status, retry_after=10)
-                continue
-            state.mark_key_failed(k, status=err_status)
-        if used_key is not None:
-            break
+        resp, used_key, used_idx = await _rotation_phase(
+            client,
+            UPSTREAM,
+            chat_payload,
+            _hdr,
+            state,
+            candidates,
+            max_attempts=_MAX_ROTATE_ATTEMPTS,
+            timeout=_ROTATE_SEND_TIMEOUT,
+            stream=True,
+            log_tag="anthropic shim",
+            seen_429_box=[False],
+        )
 
     if resp is None or used_key is None:
         yield _sse_event(
@@ -537,7 +373,7 @@ async def _stream_anthropic(
                 "type": "error",
                 "error": {
                     "type": "api_error",
-                    "message": "all keys failed",
+                    "message": "all keys failed (pool saturated)" if _valid else "all keys failed",
                 },
             },
         )
@@ -812,77 +648,44 @@ async def handle_anthropic_messages(
             status_code=503,
         )
 
-    # Non-streaming: key rotation.
+    # Saturation gate + bounded rotation (shared with responses shim).
+    _live, _valid = _live_pool_snapshot(state, candidates)
+    resp = None
     used_key = None
     used_idx = None
-    resp = None
-    for pass_num in range(3):
-        if pass_num > 0:
-            import asyncio
+    if not (_valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION))):
 
-            await asyncio.sleep(1.0)
-        for idx, k in candidates:
-            if not state.key_can_send_rpm(k) or state.is_key_on_cooldown(k):
-                continue
-            hdrs = {
+        def _hdr(k, idx):
+            return {
                 "Authorization": f"Bearer {k}",
                 "Content-Type": "application/json",
                 "User-Agent": "openvidia/2.0",
             }
-            try:
-                req = client.build_request("POST", UPSTREAM, json=chat_payload, headers=hdrs)
-                async with get_upstream_sem():
-                    resp = await client.send(req)
-            except httpx.ReadTimeout:
-                state.log_cb(
-                    f"  anthropic shim: key[{idx}] no answer in time — model too slow, not a key fault"
-                )
-                break
-            except httpx.HTTPError as e:
-                err_msg = str(e) or type(e).__name__
-                state.log_cb(f"  anthropic shim: key[{idx}] {err_msg} (rotating)")
-                state.mark_key_failed(k)
-                continue
-            if resp.status_code == 200:
-                used_key = k
-                used_idx = idx
-                break
-            err_status = resp.status_code
-            err_raw = await resp.aread()
-            await resp.aclose()
-            resp = None
-            if err_status == 429 and is_resource_exhausted(err_raw):
-                import asyncio
 
-                state.log_cb(
-                    f"  anthropic shim: key[{idx}] ResourceExhausted (worker full) — pausing 0.8s"
-                )
-                state.stats.record_key_usage(k, ok=False, error="ResourceExhausted")
-                await asyncio.sleep(0.8)
-                continue
-            if err_status in _CLIENT_ERR:
-                return JSONResponse(
-                    {
-                        "type": "error",
-                        "error": {
-                            "type": "invalid_request_error",
-                            "message": _extract_err(err_raw, err_status),
-                        },
-                    },
-                    status_code=err_status,
-                )
-            state.log_cb(f"  anthropic shim: key[{idx}] HTTP {err_status}")
-            state.mark_key_failed(k, status=err_status)
-        if used_key is not None:
-            break
-        state.mark_key_failed(k, status=err_status)
-        continue
+        resp, used_key, used_idx = await _rotation_phase(
+            client,
+            UPSTREAM,
+            chat_payload,
+            _hdr,
+            state,
+            candidates,
+            max_attempts=_MAX_ROTATE_ATTEMPTS,
+            timeout=_ROTATE_SEND_TIMEOUT,
+            stream=False,
+            log_tag="anthropic shim",
+            seen_429_box=[False],
+        )
+        if used_idx is not None and isinstance(resp, httpx.Response):
+            await resp.aread()
 
     if resp is None or used_key is None:
         return JSONResponse(
             {
                 "type": "error",
-                "error": {"type": "api_error", "message": "all keys failed"},
+                "error": {
+                    "type": "api_error",
+                    "message": "all keys failed (pool saturated)" if _valid else "all keys failed",
+                },
             },
             status_code=503,
         )
@@ -895,6 +698,7 @@ async def handle_anthropic_messages(
 
     chat_data = resp.json()
     await resp.aclose()
+    state.end_in_flight(used_key)  # release the load-balancer claim
 
     anthropic_data = _chat_to_anthropic_response(chat_data, model_override or chat_payload["model"])
     return JSONResponse(anthropic_data)
