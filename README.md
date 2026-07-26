@@ -100,7 +100,8 @@ openvidia
 │  │            │                                        │    │
 │  │  On 429: read Retry-After → set cooldown → next key │    │
 │  │  On 401/403: cooldown 3600s (dead key)              │    │
-│  │  On 5xx: cooldown 30s (transient)                   │    │
+│  │  On 400/404: cooldown 60s (deterministic)            │    │
+│  │  On 5xx: cooldown 10s (gateway) / 30s (other)        │    │
 │  └─────────────────────────────────────────────────────┘    │
 │                          │                                  │
 │                   NVIDIA NIM API                            │
@@ -130,7 +131,7 @@ NVIDIA's free NIM tier limits each API key to ~40 RPM. Aggressive bursts trigger
 |---------|-------------|
 | `openvidia` | Start proxy in background + open desktop app |
 | `openvidia foreground` | Foreground mode (logs to stdout, no UI) |
-| `openvidia setup` | Auto-configure **all** detected CLIs: opencode, Codex, Claude Code, Grok |
+| `openvidia setup` | Auto-configure detected CLIs: opencode, Codex, Grok (Claude Code requires manual env vars) |
 
 ---
 
@@ -144,7 +145,7 @@ Supported clients:
 |-----|----------|----------|------------|
 | **opencode** | OpenAI-compatible | `http://localhost:1919/v1` | ✅ `openvidia setup` |
 | **Codex CLI** | OpenAI Responses API | `http://localhost:1919/v1` | ✅ `openvidia setup` |
-| **Claude Code** | Anthropic Messages API | `http://localhost:1919` | ✅ `openvidia setup` |
+| **Claude Code** | Anthropic Messages API | `http://localhost:1919` | ❌ manual env vars |
 | **Grok (xAI)** | OpenAI-compatible | `http://localhost:1919/v1` | ✅ `openvidia setup` |
 
 ---
@@ -204,18 +205,17 @@ export OPENVIDIA_API_KEY=ignored   # also added automatically by setup
 ### Claude Code
 
 ```bash
-openvidia setup    # writes ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY to your shell rc
+# Add to ~/.zshrc or ~/.bashrc manually (auto-setup is disabled)
+export ANTHROPIC_BASE_URL=http://localhost:1919
+export ANTHROPIC_API_KEY=ignored
+```
+
+```bash
 source ~/.zshrc    # (or restart your terminal)
 claude --model openvidia
 ```
 
-Manual (if `setup` didn't find `claude`):
-
-```bash
-# Add to ~/.zshrc or ~/.bashrc
-export ANTHROPIC_BASE_URL=http://localhost:1919
-export ANTHROPIC_API_KEY=ignored
-```
+> Auto-setup for Claude Code is intentionally disabled to avoid mutating shell rc files. Set the two environment variables manually as shown above.
 
 > The `/v1/messages` endpoint translates Anthropic Messages format ↔ NVIDIA chat/completions bidirectionally — streaming, tool use, and system prompts all work.
 >
@@ -278,8 +278,8 @@ Streaming (SSE) is fully supported — tokens flow through unbuffered.
 | **429** (real RPM limit) | `Retry-After` header (trusted as-is, no multiplication), or 45s + jitter | Rate limited — honour NVIDIA's own window exactly |
 | **429** (worker concurrency) | 0 — retried after 0.8s pause | `ResourceExhausted: Worker local total request limit reached` — transient pool saturation, key is healthy |
 | **401 / 403** | 3600s | Dead key — don't waste requests |
-| **400 / 404** | — (no cooldown) | Deterministic request error — returned to the client immediately, **key untouched**. Rotating wouldn't help: every key gets the same error. |
-| **5xx** | 10s (gateway timeout) / 30s (other) | Server error — retry soon |
+| **400 / 404** | 60s | Deterministic request error — short cooldown, key untouched for rotation. Every key gets the same error, so rotating only burns cooldown budget. |
+| **5xx** | 10s (502/503/504 gateway timeout) / 30s (500 other) | Server error — retry soon |
 | **Network error** | 30s | Transient connectivity issue |
 
 > **Retry-After is used as-is.** When NVIDIA provides a `Retry-After` header (e.g. 60s), the cooldown is exactly that value. Earlier versions multiplied it by an adaptive factor (`1.5^N`), which caused a doom loop: at 3 failures a 60s backoff became 135s and all 26 keys locked out longer than the real rate-limit window required.
@@ -299,11 +299,11 @@ Request arrives
     │   ├─ Key on cooldown?  → skip (including keys cooled mid-pass)
     │   ├─ Key RPM ≥ 28?    → skip
     │   ├─ Send to NVIDIA   → 200? ✅ record RPM, return response
-    │   │                   → 400/404? return to client (no rotation, key untouched)
+    │   │                   → 400/404? set 60s cooldown, next key
     │   │                   → 429 ResourceExhausted? pause 0.8s, retry (key untouched)
     │   │                   → 429 rate-limit? use Retry-After as-is, set cooldown, next key
     │   │                   → 401? set 3600s cooldown, next key
-    │   │                   → 5xx? set 10–30s cooldown, next key
+    │   │                   → 5xx? set 10s (502/503/504) or 30s (other), next key
     │   └─ (max 5 sends per pass, 3 passes with 1s pause between)
     │
     └─ All candidates exhausted? → 503 naming the model (never a substitute model)
@@ -311,7 +311,7 @@ Request arrives
 
 ### Health Check
 
-Every 30 seconds:
+Every 60 seconds:
 1. Finds keys still on cooldown
 2. Sends a lightweight `GET /v1/models` probe
 3. If the key responds OK — clears the cooldown (revived)

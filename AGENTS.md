@@ -1,107 +1,87 @@
-# OpenVidia Registration Agent — Autonomous NVIDIA Account Creator
+# OpenVidia — Multi-key proxy for NVIDIA NIM
 
 ## Mission
-Generare account NVIDIA BUILD con API Key nvapi-* e caricarli in OpenVidia proxy.
-
-**Loop**: Consult (brain) → Execute (tools) → Update (brain/accounts.json)
+Proxy multi-chiave per NVIDIA NIM con dashboard desktop nativa. Pool di API key free-tier dietro un singolo endpoint con rotazione automatica, cooldown per-key, RPM limiting sliding-window, e auto-compaction.
 
 ---
 
-## CONSULT — prima di agire
+## Architettura
 
-1. Esegui `brain_search "<query>"` per fatti su NVIDIA BUILD registration flow, email provider, captcha solver, config.toml
-2. Leggi `brain_get "path/to/doc"` per dettagli
-3. Verifica `qmd query "<fatto>" -c eros` per knowledge locale
-
-## EXECUTE — tools disponibili
-
-### 1. nvidia-register CLI (Python, Playwright)
-Path: `openvidia/nvidia-register/`
-```bash
-cd /home/ciroautuori/Scrivania/Projects/prod/openvidia/nvidia-register
-.venv/bin/python main.py              # interattivo
-.venv/bin/python main.py -n 3         # 3 account batch
-.venv/bin/python main.py --init       # genera config.toml
+```
+Client CLI → localhost:1919/v1 → Proxy Engine → integrate.api.nvidia.com/v1
+                                    │
+                                    ├─ /v1/chat/completions  (catch-all: opencode, Grok, qualsiasi client OpenAI)
+                                    ├─ /v1/responses         (shim: Codex CLI)
+                                    ├─ /v1/messages          (shim: Claude Code)
+                                    └─ /v1/models            (lista modelli upstream)
 ```
 
-Config in `config.toml`:
-- `email_provider = "mailtm"` (dominio @web-library.net) o `"duckmail"` (@duckmail.sbs)
-- `captcha.mode = "manual"` | `"nonecap"` | `"nopecha"` | `"yescaptcha"` | `"captcharun"`
-- `browser.headless = false` (true per headless)
-- `browser.nonecap_path = "nonecap"` (NoneCap extension se mode=manual)
+### Moduli core
 
-Email providers:
-- **MailTmProvider** → api.mail.tm, dominio @web-library.net (bloccato NVIDIA?)
-- **DuckMailProvider** → api.duckmail.sbs, dominio @duckmail.sbs (funzionante)
-- **CloudflareTempEmailProvider** → self-hosted CF Workers
+| File | Righe | Ruolo |
+|------|-------|-------|
+| `proxy_app.py` | ~573 | FastAPI app factory, routing, health check, pre-warm |
+| `proxy_state.py` | ~730 | Stato thread-safe: KeyState, cooldown, RPM tracker, circuit breaker |
+| `responses_shim.py` | ~1126 | Shim `/v1/responses` → `/v1/chat/completions` (Codex CLI) |
+| `anthropic_shim.py` | ~705 | Shim `/v1/messages` → `/v1/chat/completions` (Claude Code) |
+| `compaction.py` | ~784 | Auto-compaction contesto per context overflow |
+| `config.py` | ~351 | Path config cross-platform, timeout, model options |
+| `__main__.py` | ~727 | Entry point, setup CLI (opencode/codex/grok), tray, server manager |
+| `webui.py` | ~472 | Dashboard web (pywebview), API endpoints |
+| `server_manager.py` | 107 | Avvio/stop uvicorn, binding dual-stack |
+| `safe_file.py` | 197 | Backup atomico file di config |
+| `_upstream_utils.py` | 43 | Semaphore globale + detection ResourceExhausted |
 
-Captcha solvers:
-- **ManualCaptchaSolver** → attesa intervento umano
-- **NopeChaSolver** → nopecha.com (free 100/giorno, key in config.toml)
-- **YesCaptchaSolver** → yescaptcha.com (a pagamento)
-- **CaptchaRunSolver** → captcha-run.com (a pagamento)
+### Rotazione chiavi condivisa
 
-### 2. OpenVidia accounts.json import
-```bash
-# Dal progetto openvidia/
-python -m openvidia.import_accts                    # importa accounts.csv
-python -m openvidia.import_accts --csv /path/custom.csv
-python -m openvidia.import_accts --list             # elenca accounts esistenti
-```
+`_rotation_phase()` in `responses_shim.py` è la funzione condivisa per tutti i percorsi:
+- max 5 tentativi per fase, 3 fasi con 1s di pausa
+- saturation gate: se <5% chiavi live, fast-fail con 503
+- probe timeout (90s) sul primo tentativo per detection dead-model veloce
+- send timeout (180s) sui tentativi successivi
+- gestisce 429 ResourceExhausted (transient, key untouched) vs 429 rate-limit (cooldown)
+- importata da `proxy_app.py` (catch-all), `anthropic_shim.py` (Claude Code)
 
-Source: `openvidia/nvidia-register/accounts.csv`
-Dest: `~/.config/openvidia/accounts.json`
+### Costanti unificate
 
-### 3. OpenVidia proxy key management
-```bash
-ov keys list           # elenca chiavi nel pool
-ov accounts list       # elenca accounts
-ov accounts add <name> -e <email> -p <password>   # aggiungi manuale
-ov proxy start         # avvia proxy
-```
-
-### 4. Obscura MCP (browser stealth, anti-detection)
-Usa Obscura per debug o flow alternativi se Playwright viene bloccato:
-- `obscura_browser_navigate` → navigazione
-- `obscura_browser_click`/`obscura_browser_fill` → interazione
-- `obscura_browser_screenshot` → debug visivo
-- `obscura_browser_evaluate` → JS injection
+- `_MAX_ROTATE_ATTEMPTS`, `_ROTATE_SEND_TIMEOUT`, `_MODEL_PROBE_TIMEOUT`, `_MIN_LIVE_FRACTION` → definite in `responses_shim.py`, importate ovunque
+- `UPSTREAM_BASE`, `UPSTREAM_CHAT` → definite in `config.py`, importate in `anthropic_shim.py`, `compaction.py`, `proxy_app.py`, `webui.py`
 
 ---
 
-## FLOW: batch registration
+## CLI setup
 
-```mermaid
-flowchart TD
-    A[CONSULT: brain_search su flow] --> B[Config: email_provider + captcha mode]
-    B --> C[EXECUTE: main.py -n N]
-    C --> D{accounts.csv prodotto?}
-    D -->|SI| E[python -m openvidia.import_accts]
-    D -->|NO| F[debug: screenshot, logs]
-    E --> G[UPDATE: brain remember nuovi account]
-    G --> H[UPDATE: notify Telegram accounts count]
+```bash
+openvidia setup    # configura opencode + Codex + Grok automaticamente
+openvidia          # avvia proxy + dashboard desktop
 ```
 
-## Config tipiche
-
-| Scenario | email_provider | captcha.mode | note |
-|----------|---------------|--------------|------|
-| Primo test | duckmail | manual | vedi browser, risolvi captcha a mano |
-| Batch rapido | duckmail | nonecap | auto captcha via NoneCap ext |
-| Produzione | duckmail | nopecha | NopeCHA key da nopecha.com |
-| Fallback | mailtm | nopecha | se duckmail bloccato |
+Claude Code richiede env vars manuali (auto-setup disabilitato per non mutare shell rc):
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:1919
+export ANTHROPIC_API_KEY=ignored
+```
 
 ---
 
-## UPDATE — dopo ogni registrazione riuscita
+## Sviluppo
 
-1. `brain_search "nvidia registration success"` → per contesto
-2. `brain remember "account: {email}, key: {apikey[:16]}..., org: {org}"` → memory
-3. Se errore ricorrente: `brain remember "FAIL: {errore}"` → diagnostica
-
-## Telegram notifica
-Dopo il batch:
 ```bash
-# via EROS MCP
-eros_chat "Registrati N nuovi account NVIDIA, total: M, chiavi caricate in openvidia"
+pip install -e .
+pytest tests/ -v          # 91 test
+ruff check openvidia/ tests/
+ruff format --check openvidia/ tests/
 ```
+
+### Config files (`~/.config/openvidia/`)
+
+| File | Scopo |
+|------|-------|
+| `keys.json` | API keys (JSON array) |
+| `presets.json` | Modelli starred (quick-switch) |
+| `active_model` | Modello attivo (persiste tra restart) |
+| `index` | Indice rotazione chiavi |
+| `compaction.json` | Tuning auto-compaction (opzionale) |
+| `timeouts.json` | Timeout upstream (opzionale) |
+| `model_limits.json` | Context windows apprese dal proxy (non editare a mano) |
+| `model_options.json` | Toggle reasoning + payload per-modello |
