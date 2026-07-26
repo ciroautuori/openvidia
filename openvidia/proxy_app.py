@@ -428,14 +428,11 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         # Using the full pool as the denominator makes the gate fire correctly
         # when most of the 25 keys are on cooldown (the historical Codex block).
         _live, _total_pool = _live_pool_snapshot(state, candidates)
-        _pool_saturated = _total_pool > 0 and _live < max(
-            1, int(_total_pool * _MIN_LIVE_FRACTION)
-        )
+        _pool_saturated = _total_pool > 0 and _live < max(1, int(_total_pool * _MIN_LIVE_FRACTION))
         last_status = 429 if _pool_saturated else 503
         if _pool_saturated:
             state.log_cb(
-                f"⚠ pool saturated ({_live}/{_total_pool} live) → "
-                f"skip rotation, try model fallback"
+                f"⚠ pool saturated ({_live}/{_total_pool} live) → skip rotation, try model fallback"
             )
 
         # Bounded rotation via shared _rotation_phase (same logic as shims).
@@ -474,9 +471,7 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
 
         if resp is not None and resp.status_code == 200:
             out_headers = {
-                k: v
-                for k, v in resp.headers.items()
-                if k.lower() not in STRIPPED_RESPONSE_HEADERS
+                k: v for k, v in resp.headers.items() if k.lower() not in STRIPPED_RESPONSE_HEADERS
             }
             out_headers["access-control-allow-origin"] = "*"
             out_headers["access-control-allow-headers"] = "Content-Type, Authorization"

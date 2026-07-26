@@ -83,6 +83,7 @@ _DEFAULTS = {
     "min_healthy_fraction": 0.25,
 }
 
+
 # ── Dynamic per-model context budgets ──────────────────────────────────
 # DYNAMIC MODEL BUDGETS — no hardcoded per-model context windows.
 # NVIDIA NIM does NOT advertise a context_window/max_tokens field on
