@@ -100,8 +100,8 @@ openvidia
 │  │            │                                        │    │
 │  │  On 429: read Retry-After → set cooldown → next key │    │
 │  │  On 401/403: cooldown 3600s (dead key)              │    │
-│  │  On 400/404: cooldown 60s (deterministic)            │    │
-│  │  On 5xx: cooldown 10s (gateway) / 30s (other)        │    │
+│  │  On 400/404: cooldown 60s (deterministic)           │    │
+│  │  On 5xx: cooldown 10s (gateway) / 30s (other)       │    │
 │  └─────────────────────────────────────────────────────┘    │
 │                          │                                  │
 │                   NVIDIA NIM API                            │
