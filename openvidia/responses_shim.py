@@ -122,6 +122,20 @@ async def _send_once(client, method, upstream, payload, content, hdrs, send_time
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+def json_headers(key: str, _idx: int = 0) -> dict[str, str]:
+    """The upstream header set for a JSON request on ``key``.
+
+    One definition instead of five byte-identical closures. ``_idx`` exists
+    because _rotation_phase calls its header factory with (key, index); no
+    variant ever used it.
+    """
+    return {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "User-Agent": "openvidia/2.0",
+    }
+
+
 def _upstream_error_message(outcome: dict | None, fallback: str = "all keys failed") -> str:
     """Turn a rotation outcome into something a user can act on.
 
@@ -474,11 +488,19 @@ def _input_to_messages(input_data: Any) -> list[dict]:
             content = item.get("content", "")
             # content may be a string or an array of content parts.
             if isinstance(content, list):
-                # Codex uses type="input_text"; OpenAI standard uses type="text".
+                # Codex uses type="input_text" on the way in and "output_text"
+                # for assistant turns replayed from history. Omitting the
+                # latter emptied every previous assistant message: in a
+                # multi-turn session (Codex defaults to store:false, so the
+                # whole history is resent each time) the model saw its own
+                # replies as blank and repeated work it had already done.
                 text_parts = [
-                    p.get("text", "") for p in content if p.get("type") in ("text", "input_text")
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict)
+                    and p.get("type") in ("text", "input_text", "output_text")
                 ]
-                content = "\n".join(text_parts)
+                content = "\n".join(t for t in text_parts if t)
             messages.append({"role": role, "content": content})
 
         elif typ == "function_call_output":
@@ -637,15 +659,31 @@ def _build_chat_payload(body: dict, model_override: str | None) -> dict:
         if val is not None:
             payload[key] = val
 
-    # request-level response format: Codex may ask for {"type":"text"} or
-    # {"type":"json_object"}; forward to NVIDIA if present.
+    # The Responses API caps output with max_output_tokens; the loop above only
+    # looked for the Chat Completions spellings, so a client asking for a short
+    # answer got an unbounded one.
+    if body.get("max_output_tokens") is not None and "max_tokens" not in payload:
+        payload["max_tokens"] = body["max_output_tokens"]
+
+    # Structured output. Responses nests it as text.format; Chat Completions
+    # calls it response_format. Accept either, prefer what the client sent.
     if body.get("response_format"):
         payload["response_format"] = body["response_format"]
+    else:
+        text_cfg = body.get("text")
+        fmt = text_cfg.get("format") if isinstance(text_cfg, dict) else None
+        if isinstance(fmt, dict) and fmt.get("type"):
+            payload["response_format"] = fmt
 
     payload["messages"] = _sanitize_chat_messages(payload["messages"])
-    # Traduci reasoning_effort di Codex in parametri NVIDIA NIM thinking.
-    # Il _fill_missing гаранти che il client vinca sempre sul dashboard.
-    effort = body.get("reasoning_effort")
+    # Translate the client's reasoning effort into NVIDIA NIM thinking flags.
+    # _fill_missing means an explicit client choice always beats the dashboard
+    # default. The Responses API spells this `reasoning: {effort: "..."}` —
+    # reading `reasoning_effort` (a Chat Completions field) meant the branch
+    # below never ran for Codex and the dashboard silently won every time.
+    reasoning = body.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    effort = effort or body.get("reasoning_effort")
     if effort == "low":
         config._fill_missing(payload, {"chat_template_kwargs": {"enable_thinking": False}})
     elif effort in ("medium", "high"):
@@ -695,9 +733,12 @@ def _chat_response_to_responses(chat_data: dict, model: str) -> dict:
             }
         )
 
-    # Status derived from finish_reason.
+    # Status derived from finish_reason. "tool_calls" is a completed response
+    # that happens to end in a tool call — marking it "incomplete" told the
+    # client the answer had been truncated, and a conforming one may refuse to
+    # run the tools. Only a real cut-off is incomplete.
     finish = choice.get("finish_reason", "stop")
-    status = "completed" if finish == "stop" else "incomplete"
+    status = "incomplete" if finish in ("length", "content_filter") else "completed"
 
     # Usage mapping (prompt/completion → input/output/total). NVIDIA may
     # return completion_tokens_details to pass through if present.
@@ -799,21 +840,13 @@ async def _stream_responses(
             f"(fallback/503)"
         )
     else:
-
-        def _hdr(k, idx):
-            return {
-                "Authorization": f"Bearer {k}",
-                "Content-Type": "application/json",
-                "User-Agent": "openvidia/2.0",
-            }
-
         _box: list = []
         _task = asyncio.ensure_future(
             _rotation_phase(
                 client,
                 upstream,
                 chat_payload,
-                _hdr,
+                json_headers,
                 state,
                 candidates,
                 max_attempts=_MAX_ROTATE_ATTEMPTS,
@@ -1213,19 +1246,11 @@ async def handle_responses(
     if _valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION)):
         state.log_cb(f"  responses shim: pool saturated ({_live}/{_valid} live) → 503 fast")
     else:
-
-        def _hdr(k, idx):
-            return {
-                "Authorization": f"Bearer {k}",
-                "Content-Type": "application/json",
-                "User-Agent": "openvidia/2.0",
-            }
-
         resp, used_key, used_idx = await _rotation_phase(
             client,
             upstream,
             chat_payload,
-            _hdr,
+            json_headers,
             state,
             candidates,
             max_attempts=_MAX_ROTATE_ATTEMPTS,

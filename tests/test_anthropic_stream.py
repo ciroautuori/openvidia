@@ -22,7 +22,6 @@ def make_state(keys=("nvapi-a", "nvapi-b")):
     return ps.ProxyState(
         keys=list(keys),
         stats=ps.ProxyStats(),
-        index_path=None,
         log_cb=lambda _m: None,
     )
 

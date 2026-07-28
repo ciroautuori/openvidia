@@ -386,7 +386,7 @@ async def main_async():
         print("  Or run: openvidia setup")
         sys.exit(1)
 
-    stats = ProxyStats(current_index=config.load_saved_index())
+    stats = ProxyStats()
     saved_model = config.load_active_model()
 
     def log(msg: str):
@@ -398,7 +398,6 @@ async def main_async():
         keys,
         log,
         stats,
-        config.index_path(),
         web_dir=web_dir,
         initial_model=saved_model,
     )

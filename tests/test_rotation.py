@@ -30,7 +30,6 @@ def make_state(keys=None, log=None):
     return ps.ProxyState(
         keys=list(keys if keys is not None else KEYS),
         stats=ps.ProxyStats(),
-        index_path=None,
         log_cb=log or (lambda _m: None),
     )
 

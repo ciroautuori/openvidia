@@ -34,7 +34,6 @@ def client(tmp_path, monkeypatch):
     state = ProxyState(
         keys=[KEY_A, KEY_B],
         stats=ProxyStats(),
-        index_path=tmp_path / "index",
         log_cb=lambda _m: None,
     )
     web_dir = tmp_path / "web"

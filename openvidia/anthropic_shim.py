@@ -40,6 +40,7 @@ from .responses_shim import (
     _sanitize_chat_messages,
     _sse_event,
     _upstream_error_message,
+    json_headers,
 )
 
 # ── Request: Anthropic Messages → chat/completions ──────────────────
@@ -346,19 +347,11 @@ async def _stream_anthropic(
     used_idx = None
     _outcome: dict = {}
     if not (_valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION))):
-
-        def _hdr(k, idx):
-            return {
-                "Authorization": f"Bearer {k}",
-                "Content-Type": "application/json",
-                "User-Agent": "openvidia/2.0",
-            }
-
         resp, used_key, used_idx = await _rotation_phase(
             client,
             UPSTREAM,
             chat_payload,
-            _hdr,
+            json_headers,
             state,
             candidates,
             max_attempts=_MAX_ROTATE_ATTEMPTS,
@@ -666,19 +659,11 @@ async def handle_anthropic_messages(
     used_idx = None
     _outcome: dict = {}
     if not (_valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION))):
-
-        def _hdr(k, idx):
-            return {
-                "Authorization": f"Bearer {k}",
-                "Content-Type": "application/json",
-                "User-Agent": "openvidia/2.0",
-            }
-
         resp, used_key, used_idx = await _rotation_phase(
             client,
             UPSTREAM,
             chat_payload,
-            _hdr,
+            json_headers,
             state,
             candidates,
             max_attempts=_MAX_ROTATE_ATTEMPTS,

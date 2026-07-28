@@ -61,11 +61,10 @@ async def start(
     keys: list[str],
     log_cb: Callable[[str], None],
     stats: ProxyStats,
-    index_path: Path,
     web_dir: Path | None = None,
     initial_model: str = "",
 ) -> ProxyServer:
-    state = ProxyState(keys=keys, stats=stats, index_path=index_path, log_cb=log_cb, port=port)
+    state = ProxyState(keys=keys, stats=stats, log_cb=log_cb, port=port)
     if initial_model:
         state.active_model = initial_model
     app = create_app(state, web_dir=web_dir)

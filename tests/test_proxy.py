@@ -1,7 +1,6 @@
 """Tests for OpenVidia proxy rotation, cooldown, and compaction."""
 
 import time
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -48,11 +47,9 @@ def proxy_state(sample_keys):
     """Create a ProxyState instance with sample keys."""
     stats = ProxyStats(current_index=0)
     log_cb = MagicMock()
-    index_path = Path("/tmp/test_index.json")
     return ProxyState(
         keys=sample_keys,
         stats=stats,
-        index_path=index_path,
         log_cb=log_cb,
         port=3940,
     )
@@ -360,28 +357,6 @@ class TestProxyStateKeySelection:
         # But the key is still tracked and on cooldown
         assert proxy_state.is_key_on_cooldown(key) is True
 
-    def test_best_key_index_least_loaded(self, proxy_state):
-        """Test best_key_index returns least loaded key."""
-        # Make first key busy
-        key0 = proxy_state.keys[0]
-        proxy_state.begin_in_flight(key0)
-        proxy_state.begin_in_flight(key0)
-        proxy_state.begin_in_flight(key0)
-
-        # Second key is free
-
-        best_idx = proxy_state.best_key_index()
-
-        # Should prefer key1 (less loaded)
-        assert best_idx != 0
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Test ProxyState - Health Check
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestProxyStateHealth:
     def test_is_key_healthy(self, proxy_state):
         """Test key health status."""
         key = proxy_state.keys[0]
@@ -712,12 +687,10 @@ class TestEdgeCases:
         """Test handling empty key list."""
         stats = ProxyStats()
         log_cb = MagicMock()
-        index_path = Path("/tmp/test.json")
 
         state = ProxyState(
             keys=[],
             stats=stats,
-            index_path=index_path,
             log_cb=log_cb,
         )
 
@@ -728,12 +701,10 @@ class TestEdgeCases:
         """Test handling single key."""
         stats = ProxyStats()
         log_cb = MagicMock()
-        index_path = Path("/tmp/test.json")
 
         state = ProxyState(
             keys=["single-key"],
             stats=stats,
-            index_path=index_path,
             log_cb=log_cb,
         )
 
@@ -783,7 +754,6 @@ class TestKeySpreadUnderConcurrency:
         state = ProxyState(
             keys=sample_keys,
             stats=ProxyStats(current_index=0),
-            index_path=Path("/tmp/test_spread_index.json"),
             log_cb=MagicMock(),
             port=3940,
         )
@@ -804,7 +774,6 @@ class TestKeySpreadUnderConcurrency:
         state = ProxyState(
             keys=sample_keys,
             stats=ProxyStats(current_index=0),
-            index_path=Path("/tmp/test_spread_index2.json"),
             log_cb=MagicMock(),
             port=3940,
         )
@@ -815,7 +784,6 @@ class TestKeySpreadUnderConcurrency:
         state = ProxyState(
             keys=sample_keys,
             stats=ProxyStats(current_index=0),
-            index_path=Path("/tmp/test_spread_index3.json"),
             log_cb=MagicMock(),
             port=3940,
         )

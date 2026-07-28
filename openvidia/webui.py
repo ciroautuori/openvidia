@@ -343,13 +343,11 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
     @app.post("/api/stop")
     async def api_stop() -> dict:
         state.running = False
-        config.save_stop_flag()
         return {"ok": True, "status": "stopped"}
 
     @app.post("/api/start")
     async def api_start() -> dict:
         state.running = True
-        config.clear_stop_flag()
         return {"ok": True, "status": "running"}
 
     @app.post("/api/restart")

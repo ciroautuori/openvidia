@@ -246,10 +246,6 @@ def config_path() -> Path:
     return config_dir() / "keys.json"
 
 
-def index_path() -> Path:
-    return config_dir() / "index"
-
-
 def lock_path() -> Path:
     return config_dir() / "singleton.lock"
 
@@ -368,14 +364,6 @@ def harden_config_permissions() -> list[str]:
     return fixed
 
 
-def load_saved_index() -> int:
-    p = index_path()
-    try:
-        return int(p.read_text().strip())
-    except (FileNotFoundError, ValueError, OSError):
-        return 0
-
-
 def presets_path() -> Path:
     return config_dir() / "presets.json"
 
@@ -395,28 +383,12 @@ def save_presets_file(presets: list) -> None:
     atomic_write(presets_path(), json.dumps(presets, indent=2))
 
 
-def stop_flag_path() -> Path:
-    return config_dir() / "stop"
-
-
-def save_stop_flag() -> None:
-    atomic_write(stop_flag_path(), "1")
-
-
-def check_stop_flag() -> bool:
-    p = stop_flag_path()
-    if p.exists():
-        try:
-            return p.read_text().strip() == "1"
-        except OSError:
-            return False
-    return False
-
-
-def clear_stop_flag() -> None:
-    p = stop_flag_path()
-    if p.exists():
-        p.unlink()
+# The stop flag used to be persisted here (stop_flag_path / save_stop_flag /
+# check_stop_flag / clear_stop_flag). Nothing ever read it: ProxyState.running
+# starts True unconditionally. Wiring it up would have been worse than deleting
+# it — a user who paused the proxy from the dashboard would find it silently
+# refusing every request after a reboot, with no indication why. Stop is a
+# runtime toggle and stays one.
 
 
 def active_model_path() -> Path:

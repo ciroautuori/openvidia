@@ -29,7 +29,11 @@ def create_backup(
     backup_dir = backup_dir or file_path.parent
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Microseconds, not seconds. At second granularity two backups taken in the
+    # same second resolved to the same filename, so the second silently
+    # overwrote the first — the rotation kept one file where it claimed five,
+    # and the test that was supposed to catch it passed for the same reason.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_name = f"{file_path.stem}_backup_{timestamp}{file_path.suffix}"
     backup_path = backup_dir / backup_name
 
@@ -86,118 +90,11 @@ def cleanup_old_backups(
     return removed
 
 
-def safe_write_with_backup(
-    file_path: Path,
-    content: str,
-    create_backup_flag: bool = True,
-    max_backups: int = 5,
-) -> bool:
-    """Write content to file with optional automatic backup.
-
-    Uses atomic write (temp file + rename) for crash safety.
-
-    Args:
-        file_path: Path to write to
-        content: Content to write
-        create_backup_flag: Whether to create a backup first
-        max_backups: Maximum backups to keep
-
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        # Create backup if requested and file exists
-        if create_backup_flag and file_path.exists():
-            create_backup(file_path, max_backups=max_backups)
-
-        # Atomic write
-        tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
-        tmp_path.write_text(content)
-        tmp_path.rename(file_path)
-
-        return True
-    except OSError as e:
-        print(f"Error writing file {file_path}: {e}")
-        return False
-
-
-def restore_from_backup(
-    file_path: Path,
-    backup_dir: Path | None = None,
-    use_latest: bool = True,
-    backup_timestamp: str | None = None,
-) -> Path | None:
-    """Restore a file from backup.
-
-    Args:
-        file_path: Path to restore
-        backup_dir: Directory containing backups
-        use_latest: Use the most recent backup if True
-        backup_timestamp: Specific timestamp to restore (YYYYMMDD_HHMMSS)
-
-    Returns:
-        Path to restored backup, or None if restoration failed
-    """
-    backup_dir = backup_dir or file_path.parent
-
-    # Find all backups
-    prefix = f"{file_path.stem}_backup_"
-    suffix = file_path.suffix
-
-    backups = []
-    for f in backup_dir.iterdir():
-        if f.is_file() and f.name.startswith(prefix) and f.name.endswith(suffix):
-            backups.append(f)
-
-    if not backups:
-        return None
-
-    # Select backup to restore
-    if use_latest:
-        backups.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        selected_backup = backups[0]
-    elif backup_timestamp:
-        target_name = f"{prefix}{backup_timestamp}{suffix}"
-        selected_backup = backup_dir / target_name
-        if not selected_backup.exists():
-            return None
-    else:
-        return None
-
-    # Restore
-    try:
-        shutil.copy2(selected_backup, file_path)
-        return selected_backup
-    except OSError as e:
-        print(f"Error restoring from backup: {e}")
-        return None
-
-
-def list_backups(file_path: Path, backup_dir: Path | None = None) -> list[dict]:
-    """List all available backups for a file.
-
-    Returns:
-        List of dicts with backup info: path, timestamp, size
-    """
-    backup_dir = backup_dir or file_path.parent
-
-    prefix = f"{file_path.stem}_backup_"
-    suffix = file_path.suffix
-
-    backups = []
-    for f in backup_dir.iterdir():
-        if f.is_file() and f.name.startswith(prefix) and f.name.endswith(suffix):
-            stat = f.stat()
-            backups.append(
-                {
-                    "path": str(f),
-                    "timestamp": f.name.replace(prefix, "").replace(suffix, ""),
-                    "size": stat.st_size,
-                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                }
-            )
-
-    # Sort by timestamp (newest first)
-    backups.sort(key=lambda b: b["timestamp"], reverse=True)
-
-    return backups
+# Removed with this commit: safe_write_with_backup, restore_from_backup and
+# list_backups. None had a production caller — the test suite was their only
+# consumer, which made a dead API look maintained. safe_write_with_backup also
+# duplicated config.atomic_write with a *different* temp-file convention
+# (keys.json.tmp vs keys.tmp) and without the 0600 mode or the fsync, so the
+# two would have raced each other had anything used both. restore_from_backup
+# built its path from an unvalidated timestamp, so a caller that ever exposed
+# it over HTTP would have handed out arbitrary file overwrite.

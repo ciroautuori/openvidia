@@ -1,12 +1,20 @@
 """
-Thread-safe shared state for the running proxy.
+Shared state for the running proxy.
 
 Single source of truth for keys, cooldowns, RPM tracking and usage stats.
-``ProxyState`` is accessed concurrently by the asyncio event loop and by OS
-threads (health checks), so a plain ``asyncio.Lock`` is not enough. Critical
-sections that touch the key list are guarded by a real ``threading.Lock``;
-everything else relies on the async lock and is safe within a single-threaded
-event loop.
+
+Concurrency, accurately: everything here runs on the asyncio event loop. The
+health check and the pre-warm are coroutines, not OS threads — the only
+threading.Thread in the project is the restart helper in webui.py, and it does
+not touch this object. ``self.lock`` (asyncio) serialises the compound
+read-modify-write sequences that span an await; single statements are already
+atomic under the loop.
+
+The key list additionally takes a threading.Lock when replaced, because the
+list is swapped wholesale while readers may be iterating it. That is the only
+thing it protects, and it is not a claim that the rest of the class is
+thread-safe: an earlier version of this docstring said it was, which is worse
+than saying nothing, because the next person to add a thread would believe it.
 """
 
 from __future__ import annotations
@@ -18,9 +26,6 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
-
-from .config import atomic_write
 
 # ── Cooldown / RPM constants ──────────────────────────────────────────
 
@@ -301,7 +306,6 @@ class ProxyState:
         self,
         keys: list[str],
         stats: ProxyStats,
-        index_path: Path,
         log_cb: Callable[[str], None],
         port: int = 1919,
     ):
@@ -309,17 +313,14 @@ class ProxyState:
         self._key_states: dict[str, KeyState] = {k: KeyState(k) for k in keys}
         self._keys_write_lock = threading.Lock()
         self.stats = stats
-        self.index_path = index_path
         self.port = port
         self.lock = asyncio.Lock()
-        self.save_lock = asyncio.Lock()
         self.log_buffer: deque = deque(maxlen=500)
         self._log_cb = log_cb
 
         self.active_model: str | None = None
         self.running: bool = True
         self.health_task: asyncio.Task | None = None
-        self.warm_task: asyncio.Task | None = None
 
         self.cooldowns: dict[str, KeyCooldown] = {}
         self.rpm: dict[str, RpmTracker] = {}
@@ -347,6 +348,17 @@ class ProxyState:
 
     @keys.setter
     def keys(self, new_keys: list[str]) -> None:
+        """Replace the pool, carrying over state for keys that remain.
+
+        Everything keyed by the API string is pruned together. Only
+        ``_key_states`` used to be rebuilt, so ``cooldowns``, ``rpm`` and
+        ``stats.key_usage`` grew for the life of the process and — worse —
+        outlived the key itself. Since a key is identified by its own string,
+        removing one that a 401 had parked for an hour and pasting it back
+        produced a fresh KeyState with is_valid=True that is_key_healthy()
+        still rejected, from a cooldown attached to a key the pool no longer
+        believed it had.
+        """
         with self._keys_write_lock:
             updated_states = {}
             for k in new_keys:
@@ -356,6 +368,14 @@ class ProxyState:
                     updated_states[k] = KeyState(k)
             self._keys = list(new_keys)
             self._key_states = updated_states
+
+            live = set(new_keys)
+            for gone in [k for k in self.cooldowns if k not in live]:
+                del self.cooldowns[gone]
+            for gone in [k for k in self.rpm if k not in live]:
+                del self.rpm[gone]
+            for gone in [k for k in self.stats.key_usage if k not in live]:
+                del self.stats.key_usage[gone]
 
     @property
     def key_states(self) -> dict[str, KeyState]:
@@ -682,12 +702,15 @@ class ProxyState:
     def begin_in_flight(self, key: str) -> None:
         """Mark a key as serving a request; weighted by get_candidate_keys.
 
-        Decrement happens in the caller's finally block via end_in_flight.
-        Negative counts are clamped defensively in case of double-finally bugs.
+        Every caller must pair this with end_in_flight in a finally block: the
+        scheduling cost weighs in_flight at 4, so one leak per stream is enough
+        to walk a key out of the pool over an afternoon.
         """
         ks = self._key_states.get(key)
         if ks is not None:
-            ks.in_flight = max(0, ks.in_flight + 1)
+            # No clamp on the way up — the previous max(0, x + 1) suggested the
+            # count could be negative here, which it cannot.
+            ks.in_flight += 1
 
     def end_in_flight(self, key: str) -> None:
         ks = self._key_states.get(key)
@@ -701,35 +724,6 @@ class ProxyState:
         if ks and not ks.is_valid:
             return False
         return not self.is_key_on_cooldown(key)
-
-    def best_key_index(self) -> int:
-        """Index of the least-loaded healthy, RPM-eligible key.
-
-        Cost = in_flight_count + recent_rpm + small random tiebreaker. This
-        keeps bursts spreading across the pool (max-min fairness) instead of
-        slamming key[current_index] while the rest idle. When N concurrent
-        requests hit us simultaneously, they each grab a different key instead
-        of all queuing on the same one.
-        """
-        best_idx = -1
-        best_cost = float("inf")
-        for key in self._keys:
-            ks = self._key_states.get(key)
-            if not ks or not ks.is_valid:
-                continue
-            if self.is_key_on_cooldown(key):
-                continue
-            if not self.key_can_send_rpm(key):
-                continue
-            cost = (
-                (ks.in_flight * 4)  # in-flight dominates: drains fast on completion
-                + self.key_rpm(key)  # then recent rpm
-                + ks.consecutive_failures * 8  # deprioritize flaky keys
-            )
-            if cost < best_cost:
-                best_cost = cost
-                best_idx = self._keys.index(key)
-        return best_idx
 
     def get_candidate_keys(self) -> list[tuple[int, str]]:
         """
@@ -798,27 +792,23 @@ class ProxyState:
             live += 1
         return live, valid
 
+    def decay_stale_failures(self, older_than: float = 180.0) -> int:
+        """Forget consecutive failures a key has since outlived.
+
+        Without this a key that had two transient errors five minutes ago
+        keeps paying for them: the scheduling cost weighs failures at 8 each,
+        so it stays at the back of the queue indefinitely.
+        """
+        now = time.time()
+        decayed = 0
+        for ks in self._key_states.values():
+            if ks.consecutive_failures and now - ks.last_failure_at > older_than:
+                ks.consecutive_failures -= 1
+                decayed += 1
+        return decayed
+
     def key_cooldown_info(self, key: str) -> tuple[float, str]:
         """Return ``(remaining_seconds, reason)`` for the dashboard."""
         if self.is_key_on_cooldown(key):
             return self.cooldown_remaining(key), self.cooldown_reason(key)
         return 0.0, ""
-
-
-# ── Async index persistence ───────────────────────────────────────────
-
-
-async def _async_write_index(path: Path, i: int, lock: asyncio.Lock) -> None:
-    async with lock:
-        try:
-            await asyncio.to_thread(atomic_write, path, str(i))
-        except OSError:
-            pass
-
-
-def persist_index(state: ProxyState, i: int) -> None:
-    previous = state.stats.current_index
-    state.stats.current_index = i
-    state.stats.active_key_index = i
-    if previous != i:
-        asyncio.create_task(_async_write_index(state.index_path, i, state.save_lock))

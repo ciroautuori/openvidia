@@ -9,7 +9,6 @@ These lock the three properties that were broken and caused the observed
 """
 
 import asyncio
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,7 +53,6 @@ def state():
     return ProxyState(
         keys=keys,
         stats=ProxyStats(current_index=0),
-        index_path=Path("/tmp/test_compaction_index.json"),
         log_cb=MagicMock(),
         port=3940,
     )

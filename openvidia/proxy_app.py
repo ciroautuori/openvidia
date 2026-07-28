@@ -31,10 +31,6 @@ from .responses_shim import (
 
 MAX_BODY_BYTES = 64 * 1024 * 1024
 
-# 400/404 are deterministic content errors — rotating keys won't help and
-# just burns cooldown budget. 401/403/429 are key-specific → rotate + cooldown.
-ROTATE_STATUSES = {401, 403, 429}
-
 
 def default_model(state: ProxyState | None = None) -> str:
     """The model a request runs on when the client sends the ``openvidia`` alias.
@@ -136,32 +132,21 @@ async def _health_check_all(
 
 
 async def _background_health_check(state: ProxyState, client: httpx.AsyncClient) -> None:
-    try:
-        while True:
-            await asyncio.sleep(60)
-            await _health_check_all(state, client)
-    except asyncio.CancelledError:
-        pass
+    """Once a minute: age out stale failures, then probe expiring cooldowns.
 
+    The failure decay used to be a second task on its own 60s timer, reaching
+    into state._key_states from outside the class to decrement a counter. It
+    runs on the same schedule as the health check and belongs with it.
 
-async def _warm_keepalive_task(state: ProxyState, client: httpx.AsyncClient) -> None:
-    """Decay-only passive helper.
-
-    We DO NOT actively ping all healthy keys on a timer — that would burn
-    ~25 GET /v1/models every 45s across the pool, silently inflating the RPM
-    sliding window of every key and risking accidental self-induced 429 when
-    real user traffic arrives on top. Instead this task just ages out stale
-    consecutive-failure counters once per minute so a key that had a couple
-    of transient errors three minutes ago stops being deprioritized forever.
+    Note what neither of them does: ping healthy keys. That would spend ~25
+    requests a minute across the pool, inflate every key's RPM window, and
+    manufacture the 429s this whole module exists to avoid.
     """
     try:
         while True:
             await asyncio.sleep(60)
-            now = time.time()
-            for key in state.keys:
-                ks = state._key_states.get(key)
-                if ks and ks.consecutive_failures and now - ks.last_failure_at > 180:
-                    ks.consecutive_failures = max(0, ks.consecutive_failures - 1)
+            state.decay_stale_failures()
+            await _health_check_all(state, client)
     except asyncio.CancelledError:
         pass
 
@@ -242,16 +227,12 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
 
         asyncio.create_task(_pre_warm())
         state.health_task = asyncio.create_task(_background_health_check(state, client))
-        state.warm_task = asyncio.create_task(_warm_keepalive_task(state, client))
         yield
-        if state.warm_task is not None:
-            state.warm_task.cancel()
         if state.health_task is not None:
             state.health_task.cancel()
         await client.aclose()
 
     app = FastAPI(lifespan=lifespan)
-    app.state.http_client = client
 
     # Not a wildcard. The dashboard is same-origin with the proxy, so it never
     # needs CORS at all; the only reason to answer any origin is to let a
@@ -615,9 +596,7 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
     @app.get("/ops/health")
     async def _ops_health() -> JSONResponse:
         """Structured health report: model circuit states, pool stats, recent logs."""
-        import time as _time
-
-        now = _time.time()
+        now = time.time()
         models_out = []
         for model, h in state.model_health.items():
             models_out.append(
