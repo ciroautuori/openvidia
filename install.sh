@@ -69,7 +69,13 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     # substitution used | as its delimiter and left the value unquoted, so an
     # install path containing |, & or a space produced a broken or mangled
     # entry — "~/My Projects" was enough to break it.
-    grep -v '^Exec=' openvidia.desktop > "$DESKTOP_DIR/openvidia.desktop"
+    #
+    # TryExec is dropped along with Exec: the checked-in entry points both at
+    # /usr/bin/openvidia, which only the Arch package installs. Left in place,
+    # it would hide the menu item on every source install, where the binary
+    # lives in the generated launcher instead.
+    grep -vE '^(Exec|TryExec)=' openvidia.desktop > "$DESKTOP_DIR/openvidia.desktop"
+    printf 'TryExec=%s\n' "$LAUNCHER" >> "$DESKTOP_DIR/openvidia.desktop"
     printf 'Exec="%s"\n' "$LAUNCHER" >> "$DESKTOP_DIR/openvidia.desktop"
     chmod 644 "$DESKTOP_DIR/openvidia.desktop"
 

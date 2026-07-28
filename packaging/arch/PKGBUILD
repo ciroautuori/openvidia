@@ -65,10 +65,13 @@ package() {
 
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
-    # The desktop entry ships with Exec=openvidia, which resolves because the
-    # wheel installs that entry point to /usr/bin. The previous revision shipped
-    # an entry pointing at openvidia-launcher.sh — a script this package never
-    # installed anywhere — so the menu item did nothing at all.
+    # The desktop entry ships with Exec=/usr/bin/openvidia — the absolute path
+    # this wheel installs the entry point to. A bare `Exec=openvidia` was
+    # resolved against the desktop environment's PATH, so a leftover shim from
+    # an earlier `pip install --user` shadowed the packaged binary and the menu
+    # item died with ModuleNotFoundError, on stderr nobody sees. The revision
+    # before that pointed at openvidia-launcher.sh, a script this package never
+    # installed anywhere, so the menu item did nothing at all.
     install -Dm644 openvidia.desktop "$pkgdir/usr/share/applications/openvidia.desktop"
     install -Dm644 openvidia/web/assets/logo.png \
         "$pkgdir/usr/share/icons/hicolor/256x256/apps/openvidia.png"

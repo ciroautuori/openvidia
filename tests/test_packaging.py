@@ -50,6 +50,43 @@ def test_package_data_declares_the_bundle():
     assert 'openvidia = ["web/*", "web/assets/*"]' in pyproject
 
 
+REPO_ROOT = PKG_ROOT.parent
+DESKTOP = REPO_ROOT / "openvidia.desktop"
+
+
+def _desktop_entries():
+    return dict(
+        line.split("=", 1)
+        for line in DESKTOP.read_text().splitlines()
+        if "=" in line and not line.startswith("[")
+    )
+
+
+def test_desktop_entry_launches_an_absolute_path():
+    """A bare `Exec=openvidia` is resolved against the DE's PATH.
+
+    ~/.local/bin comes first there, so a shim left by an old `pip install
+    --user` shadowed the packaged binary: clicking the icon raised
+    ModuleNotFoundError on a stderr no one reads, and the app simply never
+    opened. The packaged entry names the path the wheel actually installs.
+    """
+    entries = _desktop_entries()
+    assert entries["Exec"].startswith("/"), "Exec must not depend on PATH"
+    assert entries["TryExec"] == entries["Exec"]
+
+
+def test_the_source_installer_replaces_both_exec_keys():
+    """install.sh points the entry at its generated launcher instead.
+
+    It has to strip TryExec as well: that key names /usr/bin/openvidia, which
+    only the Arch package installs, and a TryExec that does not resolve makes
+    the desktop environment hide the entry outright.
+    """
+    install_sh = (REPO_ROOT / "install.sh").read_text()
+    assert "grep -vE '^(Exec|TryExec)=' openvidia.desktop" in install_sh
+    assert "printf 'TryExec=%s\\n' \"$LAUNCHER\"" in install_sh
+
+
 def test_health_is_only_available_when_the_bundle_is():
     """Documents the coupling that made the missing bundle so hard to see:
     /health is registered by attach_webui, which is skipped when web_dir does
