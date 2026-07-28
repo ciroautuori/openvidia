@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
 from pathlib import Path
@@ -341,6 +342,45 @@ def save_keys_file(keys: list[str], create_backup: bool = True) -> None:
             print(f"⚠ keys.json backup failed: {exc}", flush=True)
 
     atomic_write(cfg_path, content)
+
+
+def control_token_path() -> Path:
+    return config_dir() / "control_token"
+
+
+_control_token: str | None = None
+
+
+def control_token() -> str:
+    """The shared secret that authenticates the control plane.
+
+    Checking Origin and Host is not authentication. Those headers are
+    unforgeable *by a browser*, which is why they stop a malicious page — but
+    any script can set them to whatever it likes, so anything that can open a
+    TCP connection to the port could reach /api/* by sending
+    ``Host: localhost:1919``. Loopback binding does not help either: a
+    forwarder (``tailscale serve``, an SSH tunnel, a container port map)
+    connects from 127.0.0.1 on the client's behalf, so the proxy cannot tell
+    the traffic apart by source address.
+
+    A secret in a 0600 file can: possession of it means the caller could read
+    a file only this UID can read. It is generated once and reused, so the
+    dashboard keeps working across restarts.
+    """
+    global _control_token
+    if _control_token:
+        return _control_token
+    p = control_token_path()
+    try:
+        existing = p.read_text().strip()
+        if len(existing) >= 32:
+            _control_token = existing
+            return _control_token
+    except (FileNotFoundError, OSError):
+        pass
+    _control_token = secrets.token_urlsafe(32)
+    atomic_write(p, _control_token + "\n")
+    return _control_token
 
 
 def harden_config_permissions() -> list[str]:

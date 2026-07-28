@@ -33,11 +33,33 @@ const POPULAR_MODELS = new Set([
 
 const $ = id => document.getElementById(id)
 
+/* ── Control-plane token ─────────────────────────
+   The proxy hands it over in the URL on open. It goes into sessionStorage and
+   out of the address bar immediately: leaving it there would put a live
+   credential into the window title, the history, and any screenshot. */
+const TOKEN_HEADER = 'X-OpenVidia-Token'
+
+function readToken() {
+  const fromUrl = new URLSearchParams(location.search).get('token')
+  if (fromUrl) {
+    sessionStorage.setItem('openvidia-token', fromUrl)
+    history.replaceState(null, '', location.pathname)
+    return fromUrl
+  }
+  return sessionStorage.getItem('openvidia-token') || ''
+}
+
+let controlToken = readToken()
+
 /* ── API helper ──────────────────────────────── */
 async function api(method, path, body) {
   const opts = { method, headers: {} }
+  if (controlToken) opts.headers[TOKEN_HEADER] = controlToken
   if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body) }
   const r = await fetch(path, opts)
+  if (r.status === 401) {
+    throw new Error('This dashboard has no control token. Reopen it from the OpenVidia app, or append ?token=<contents of ~/.config/openvidia/control_token>')
+  }
   if (!r.ok) { let t; try { t = await r.text() } catch { t = r.statusText }; throw new Error(t) }
   return r.json()
 }
@@ -461,7 +483,9 @@ function appendLog(level, msg) {
   $('logDot')._timer = setTimeout(() => { $('logDot').className = 'log-dot' }, 2000)
 }
 
-new EventSource('/api/logs/stream').onmessage = e => {
+// EventSource cannot set request headers, which is the reason the middleware
+// accepts ?token= as well as the header.
+new EventSource(`/api/logs/stream?token=${encodeURIComponent(controlToken)}`).onmessage = e => {
   try {
     const { msg } = JSON.parse(e.data)
     let level = 'info'

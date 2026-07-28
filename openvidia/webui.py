@@ -489,4 +489,5 @@ def auto_open(port: int = 1919) -> None:
     The delay gives the proxy a head start so the browser doesn't race
     the listener and show a connection-refused page on slow machines.
     """
-    threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{port}")).start()
+    url = f"http://localhost:{port}/?token={config.control_token()}"
+    threading.Timer(1.5, lambda: webbrowser.open(url)).start()

@@ -24,18 +24,19 @@ KEY_B = "nvapi-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    """A live app with a two-key pool and an isolated config directory."""
+def token(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(config, "_control_token", None)
+    return config.control_token()
+
+
+@pytest.fixture
+def raw_client(tmp_path, monkeypatch, token):
+    """A live app with a two-key pool, WITHOUT the token attached."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    # config_dir() is resolved per call, so the env var above is enough on
-    # Linux; on other platforms pin the whole directory.
     monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
 
-    state = ProxyState(
-        keys=[KEY_A, KEY_B],
-        stats=ProxyStats(),
-        log_cb=lambda _m: None,
-    )
+    state = ProxyState(keys=[KEY_A, KEY_B], stats=ProxyStats(), log_cb=lambda _m: None)
     web_dir = tmp_path / "web"
     web_dir.mkdir()
     (web_dir / "index.html").write_text("<h1>ok</h1>")
@@ -46,6 +47,13 @@ def client(tmp_path, monkeypatch):
     with TestClient(app, base_url="http://localhost:1919") as c:
         c.state = state
         yield c
+
+
+@pytest.fixture
+def client(raw_client, token):
+    """The dashboard's view: authenticated, same-origin."""
+    raw_client.headers.update({"X-OpenVidia-Token": token})
+    return raw_client
 
 
 # --------------------------------------------------------------------------- #
@@ -128,6 +136,85 @@ def test_rebound_host_is_rejected(client):
 def test_cors_does_not_answer_wildcard(client):
     r = client.get("/api/keys", headers={"Origin": "http://localhost:1919"})
     assert r.headers.get("access-control-allow-origin") != "*"
+
+
+# --------------------------------------------------------------------------- #
+# Token authentication
+#
+# The Origin/Host guard alone was NOT authentication. Any non-browser client
+# can set both headers, so a `tailscale serve` forward on this port let every
+# node on the tailnet reveal keys in cleartext and stop the proxy. Loopback
+# binding does not help: the forwarder connects from 127.0.0.1 on the peer's
+# behalf. Only a secret the caller has to read from a 0600 file does.
+# --------------------------------------------------------------------------- #
+
+
+def test_control_plane_requires_a_token(raw_client):
+    r = raw_client.get("/api/keys")
+    assert r.status_code == 401
+
+
+def test_spoofed_host_no_longer_gets_in(raw_client):
+    """The exact bypass: connect from anywhere, claim to be localhost."""
+    r = raw_client.get("/api/keys", headers={"Host": "localhost:1919"})
+    assert r.status_code == 401
+
+
+def test_key_reveal_is_unreachable_without_the_token(raw_client):
+    r = raw_client.post("/api/keys/reveal", json={"index": 0}, headers={"Host": "localhost:1919"})
+    assert r.status_code == 401
+    assert KEY_A not in r.text
+
+
+@pytest.mark.parametrize("path", ["/api/stop", "/api/start", "/api/restart"])
+def test_lifecycle_routes_are_unreachable_without_the_token(raw_client, path):
+    assert raw_client.post(path).status_code == 401
+
+
+def test_ops_routes_are_guarded_too(raw_client):
+    assert raw_client.get("/ops/keys").status_code == 401
+    assert raw_client.get("/ops/health").status_code == 401
+
+
+def test_a_wrong_token_is_rejected(raw_client):
+    r = raw_client.get("/api/keys", headers={"X-OpenVidia-Token": "not-the-token"})
+    assert r.status_code == 401
+
+
+def test_the_token_also_works_as_a_query_param(raw_client, token):
+    """EventSource cannot set headers, so the SSE log stream needs this."""
+    assert raw_client.get(f"/api/keys?token={token}").status_code == 200
+
+
+def test_the_proxy_itself_stays_open(raw_client):
+    """/v1/* must not require the token — every local client would need it,
+    and it hands out no secrets."""
+    assert raw_client.get("/v1/models").status_code == 200
+
+
+def test_the_dashboard_page_stays_reachable(raw_client):
+    """/ has to bootstrap before it can know the token."""
+    assert raw_client.get("/").status_code == 200
+
+
+def test_the_page_does_not_carry_the_token(raw_client, token):
+    """If / embedded it, anyone who could reach the port could read it."""
+    assert token not in raw_client.get("/").text
+
+
+def test_token_is_persisted_0600(tmp_path, token):
+    p = tmp_path / "control_token"
+    assert p.read_text().strip() == token
+    assert p.stat().st_mode & 0o077 == 0
+
+
+def test_token_is_stable_across_calls(monkeypatch, tmp_path, token):
+    monkeypatch.setattr(config, "_control_token", None)
+    assert config.control_token() == token
+
+
+def test_token_is_long_enough_to_be_unguessable(token):
+    assert len(token) >= 32
 
 
 # --------------------------------------------------------------------------- #

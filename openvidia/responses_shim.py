@@ -136,6 +136,24 @@ def json_headers(key: str, _idx: int = 0) -> dict[str, str]:
     }
 
 
+def _detail_from_body(body: str) -> str:
+    """The human-readable sentence out of a NIM error body, if there is one."""
+    body = (body or "").strip()
+    if not body:
+        return ""
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return body[:400]
+    if isinstance(parsed, dict):
+        detail = parsed.get("detail") or parsed.get("message") or parsed.get("title")
+        if isinstance(parsed.get("error"), dict):
+            detail = parsed["error"].get("message") or detail
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()[:400]
+    return body[:400]
+
+
 def _upstream_error_message(outcome: dict | None, fallback: str = "all keys failed") -> str:
     """Turn a rotation outcome into something a user can act on.
 
@@ -147,21 +165,20 @@ def _upstream_error_message(outcome: dict | None, fallback: str = "all keys fail
     if not outcome:
         return fallback
     status = outcome.get("status")
-    body = (outcome.get("body") or "").strip()
-    if not body:
+    detail = _detail_from_body(outcome.get("body") or "")
+
+    # A deterministic rejection is not a key problem, so it must never be
+    # described as one. "all keys failed (last upstream status 404)" sent
+    # people hunting through their key pool for what was a path the provider
+    # simply does not serve — no key was even tried twice.
+    if outcome.get("deterministic"):
+        if detail:
+            return f"upstream rejected the request ({status}): {detail}"
+        return f"upstream rejected the request with {status}"
+
+    if not detail:
         return f"{fallback} (last upstream status {status})" if status else fallback
-    # NIM errors are JSON with the useful text under a couple of known keys.
-    try:
-        parsed = json.loads(body)
-    except (json.JSONDecodeError, TypeError):
-        parsed = None
-    if isinstance(parsed, dict):
-        detail = parsed.get("detail") or parsed.get("message") or parsed.get("title")
-        if isinstance(parsed.get("error"), dict):
-            detail = parsed["error"].get("message") or detail
-        if isinstance(detail, str) and detail.strip():
-            body = detail.strip()
-    return f"upstream {status}: {body[:400]}" if status else body[:400]
+    return f"upstream {status}: {detail}" if status else detail
 
 
 async def _rotation_phase(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -177,22 +178,35 @@ LOCAL_HOSTS = frozenset(
 GUARDED_PREFIXES = ("/api", "/ops")
 
 
+TOKEN_HEADER = "x-openvidia-token"
+
+
 class LocalOnlyMiddleware(BaseHTTPMiddleware):
-    """Reject cross-origin and rebound access to the control plane.
+    """Authenticate the control plane, and stop browsers from riding along.
 
-    The proxy binds loopback, but loopback is not a security boundary against
-    the browser: any page the user opens can fetch http://localhost:1919. The
-    control routes hand out key material and can restart the process, so they
-    check two things a foreign page cannot forge:
+    Two independent checks, because they defend against different attackers:
 
-    * ``Origin`` — browsers set it on every cross-origin fetch and refuse to
-      let script override it. CLI clients omit it entirely, so they pass.
-    * ``Host`` — must be a loopback name, which defeats DNS rebinding.
+    * **A token** (``config.control_token``) — the actual authentication.
+      Holding it proves the caller could read a 0600 file owned by this user.
+      This is what stops a script: header checks alone did not, because any
+      non-browser client can send ``Host: localhost:1919`` and walk straight
+      in. That was reachable in practice — a ``tailscale serve`` forward on
+      this port let every node on the tailnet reveal keys in cleartext and
+      stop the proxy. Loopback binding is no defence there either: the
+      forwarder connects from 127.0.0.1 on the peer's behalf, so the source
+      address says nothing.
 
-    /v1/* is deliberately not guarded: it is the whole point of the proxy and
-    is reachable by any local process anyway. Cross-origin *reads* of it are
-    still blocked, because CORS no longer answers with a wildcard.
+    * **Origin / Host** — kept as defence in depth against the browser. A page
+      cannot forge either, so even a token that leaked into a URL the user
+      pasted somewhere cannot be replayed cross-origin.
+
+    /v1/* is deliberately unauthenticated: it is the proxy's whole purpose,
+    every local client would need the token, and it hands out no secrets.
     """
+
+    def __init__(self, app, token: str):
+        super().__init__(app)
+        self._token = token
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -203,6 +217,19 @@ class LocalOnlyMiddleware(BaseHTTPMiddleware):
             host = (request.headers.get("host") or "").lower()
             if host and host not in LOCAL_HOSTS:
                 return JSONResponse({"error": "invalid host header"}, status_code=403)
+
+            supplied = request.headers.get(TOKEN_HEADER) or request.query_params.get("token") or ""
+            # compare_digest, not ==: string comparison returns early on the
+            # first differing byte, which leaks the prefix to a timing attack.
+            if not secrets.compare_digest(supplied, self._token):
+                return JSONResponse(
+                    {
+                        "error": "control plane requires a token",
+                        "hint": f"send it as {TOKEN_HEADER} or ?token=; "
+                        f"it lives in {config.control_token_path()}",
+                    },
+                    status_code=401,
+                )
         return await call_next(request)
 
 
@@ -244,7 +271,7 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.add_middleware(LocalOnlyMiddleware)
+    app.add_middleware(LocalOnlyMiddleware, token=config.control_token())
     app.add_middleware(BodyLimitMiddleware)
 
     if web_dir and web_dir.exists():

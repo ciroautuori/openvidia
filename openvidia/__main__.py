@@ -576,7 +576,12 @@ def open_desk(port: int) -> None:
         auto_open(port)
         return
 
-    url = f"http://localhost:{port}"
+    # The token rides in the URL, the way Jupyter does it. It cannot be
+    # embedded in the page instead: / is unauthenticated (it has to be, or the
+    # dashboard could never bootstrap), so anything the HTML carries is
+    # readable by whoever can reach the port. main.js moves it straight into
+    # sessionStorage and strips it from the address bar.
+    url = f"http://localhost:{port}/?token={config.control_token()}"
     assets = Path(__file__).resolve().parent / "web" / "assets"
     icon_path = str(assets / "logo.png")
     print(f"● Desktop window → {url}", flush=True)
