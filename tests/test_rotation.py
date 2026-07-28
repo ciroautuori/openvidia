@@ -286,6 +286,44 @@ async def test_throttle_expires():
 # --------------------------------------------------------------------------- #
 
 
+_WORKER_FULL_503 = json.dumps(
+    {
+        "error": {
+            "message": "ResourceExhausted: Worker local total request limit reached (48/48)",
+            "type": "Service Unavailable",
+            "code": 503,
+        }
+    }
+).encode()
+
+
+async def test_worker_full_503_does_not_cool_the_key():
+    """NVIDIA sends ResourceExhausted under 503 too, nested under `error`.
+
+    Both halves used to miss it — the status check only looked at 429, and the
+    body parser only read the flat keys — so every refusal from a full worker
+    pool cooled a key for 10s and drained the pool during an upstream peak.
+    """
+    state = make_state()
+    client = FakeClient([(503, _WORKER_FULL_503), (503, _WORKER_FULL_503), 200])
+
+    resp, key, idx = await run(state, client)
+
+    assert resp is not None and resp.status_code == 200
+    assert not any(state.is_key_on_cooldown(k) for k in state.keys)
+
+
+async def test_a_bare_503_still_cools_the_key():
+    """Only the ResourceExhausted body is exempt — a plain 503 is not."""
+    state = make_state()
+    client = FakeClient([(503, b'{"detail":"upstream unavailable"}'), 200])
+
+    resp, key, idx = await run(state, client)
+
+    assert resp is not None and resp.status_code == 200
+    assert sum(state.is_key_on_cooldown(k) for k in state.keys) == 1
+
+
 async def test_gateway_timeout_honours_the_short_retry_after():
     """The log said 10s while the pool actually sat out the 30s default."""
     state = make_state()

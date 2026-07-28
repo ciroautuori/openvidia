@@ -30,14 +30,28 @@ def get_upstream_sem() -> asyncio.Semaphore:
 def is_resource_exhausted(body: bytes | None) -> bool:
     """True when NVIDIA says the worker is full (concurrent limit), not RPM.
 
-    429 with ResourceExhausted body = transient concurrency limit.
+    429/503 with ResourceExhausted body = transient concurrency limit.
     429 without it = real RPM rate-limit → burn the key cooldown.
+
+    The message arrives in two shapes: flat (``{"message": ...}``) and nested
+    under ``error`` (``{"error": {"message": "ResourceExhausted: Worker local
+    total request limit reached (48/48)"}}``), which is the one the 503 form
+    uses. Reading only the flat keys parsed that body successfully and then
+    reported "not exhausted", so the caller cooled the key down.
     """
     if not body:
         return False
     try:
         data = json.loads(body)
-        msg = str(data.get("message", "") or data.get("detail", "") or "")
+        err = data.get("error")
+        if not isinstance(err, dict):
+            err = {}
+        msg = str(
+            data.get("message", "")
+            or data.get("detail", "")
+            or err.get("message", "")
+            or err.get("detail", "")
+        )
         return "ResourceExhausted" in msg or "request limit reached" in msg.lower()
     except Exception:
         return "ResourceExhausted" in body.decode("utf-8", errors="replace")

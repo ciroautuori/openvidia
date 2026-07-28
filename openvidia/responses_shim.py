@@ -332,7 +332,12 @@ async def _rotation_phase(
 
             # ResourceExhausted = worker concurrency limit, not RPM.
             # Don't burn the key — just skip and let the next key try.
-            if err_status == 429 and is_resource_exhausted(error_body_bytes):
+            # NVIDIA sends it under 429 *and* under 503 ("Worker local total
+            # request limit reached (48/48)"). Matching on the status alone let
+            # the 503 form fall through to the gateway-timeout branch below,
+            # which cooled a key down for every request the shared worker pool
+            # refused — draining a healthy 31-key pool during an upstream peak.
+            if err_status in (429, 503) and is_resource_exhausted(error_body_bytes):
                 exhausted_waits += 1
                 if exhausted_waits > _MAX_EXHAUSTED_WAITS:
                     state.log_cb(f"  {log_tag}: upstream workers full — giving up")
