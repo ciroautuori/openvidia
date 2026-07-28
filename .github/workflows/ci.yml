@@ -14,12 +14,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          python3 -m pip install --break-system-packages --quiet pytest pytest-asyncio httpx fastapi psutil
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # `uv sync` resolves from pyproject + uv.lock, so CI runs the same
+      # versions as a developer's machine. The previous job pip-installed a
+      # hand-written list (pytest pytest-asyncio httpx fastapi psutil) which
+      # omitted uvicorn and tomlkit and passed only because nothing imported
+      # them at module scope — the first test to touch server_manager would
+      # have failed for a reason that had nothing to do with the change.
+      - name: Sync dependencies
+        run: uv sync --frozen
 
       - name: Run tests
-        run: PYTHONPATH=. python3 -m pytest tests/ -v --tb=short
+        run: uv run pytest tests/ -v --tb=short
 
   lint:
     name: Ruff
@@ -28,11 +36,70 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ruff
-        run: python3 -m pip install --break-system-packages --quiet ruff
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync --frozen
 
       - name: Lint
-        run: python3 -m ruff check openvidia/ tests/
+        run: uv run ruff check openvidia/ tests/
 
       - name: Format check
-        run: python3 -m ruff format --check openvidia/ tests/
+        run: uv run ruff format --check openvidia/ tests/
+
+  package:
+    name: Wheel installs and serves
+    runs-on: [self-hosted, soliso, openvidia]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # An editable install runs from the source tree, so it cannot tell you
+      # whether the wheel is complete. It was not: the dashboard bundle lived
+      # outside the package for two releases, and every real install shipped a
+      # proxy with no UI and no /health. This job builds the artifact users
+      # actually get, installs it elsewhere, and checks it.
+      - name: Build the wheel
+        run: uv build --wheel
+
+      - name: Install it into a clean environment
+        run: |
+          uv venv /tmp/ov-pkg-check
+          uv pip install --python /tmp/ov-pkg-check/bin/python dist/*.whl
+
+      - name: The dashboard bundle shipped
+        run: |
+          /tmp/ov-pkg-check/bin/python - <<'PY'
+          import pathlib, openvidia
+          web = pathlib.Path(openvidia.__file__).parent / "web"
+          assert web.is_dir(), f"{web} is not in the wheel"
+          missing = [n for n in ("index.html", "main.js", "styles.css") if not (web / n).is_file()]
+          assert not missing, f"missing from the wheel: {missing}"
+          print("dashboard bundle OK:", web)
+          PY
+
+      - name: The entry point runs
+        run: /tmp/ov-pkg-check/bin/openvidia --help
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/ov-pkg-check
+
+  shell:
+    name: Shellcheck
+    runs-on: [self-hosted, soliso, openvidia]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the installer and launcher
+        run: |
+          if ! command -v shellcheck >/dev/null; then
+            echo "shellcheck is not installed on this runner — skipping"
+            exit 0
+          fi
+          shellcheck install.sh openvidia-launcher.sh

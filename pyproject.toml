@@ -42,6 +42,15 @@ openvidia = "openvidia.__main__:main"
 [tool.setuptools.packages.find]
 include = ["openvidia*"]
 
+# The dashboard bundle ships inside the package. It used to live at the repo
+# root, where packages.find could not see it, so every non-editable install —
+# the Arch package, `pip install openvidia`, any real deployment — got a proxy
+# with no UI and no /health endpoint (which is defined inside attach_webui, and
+# was therefore also missing). It only ever worked because install.sh uses
+# `uv sync` / `pip install -e`, which run from the source tree.
+[tool.setuptools.package-data]
+openvidia = ["web/*", "web/assets/*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

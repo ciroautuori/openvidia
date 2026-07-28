@@ -3,7 +3,7 @@
 # use the openvidia package (tagged versions) when available.
 
 pkgname=openvidia-git
-pkgver=2.0.0
+pkgver=2.0.0.r0.gunknown
 pkgrel=1
 pkgdesc="Multi-key proxy for NVIDIA NIM with a native desktop dashboard — auto-rotation, cooldown, RPM limiting, Claude Code + Codex CLI + opencode support"
 arch=('any')
@@ -16,13 +16,23 @@ depends=(
     'python-httpx'
     'python-psutil'
     'python-pywebview'
+    # tomlkit is imported by the CLI helpers, and the Qt WebEngine backend is
+    # what pywebview actually uses on this platform. Both were missing, so the
+    # package installed cleanly and then failed at runtime with ImportError.
+    'python-tomlkit'
+    'python-pyqt6'
+    'python-pyqt6-webengine'
     'webkit2gtk'
     'gobject-introspection'
 )
 optdepends=(
     'uv: faster dependency resolution'
 )
-makedepends=('python-setuptools' 'git')
+# build() uses python-build and package() uses python-installer; neither was
+# declared, so the build only worked on a machine that happened to have them —
+# and fell back to `pip install --root`, which downloads from the network
+# during package(), something a PKGBUILD must never do.
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'git')
 provides=('openvidia')
 conflicts=('openvidia')
 source=("$pkgname::git+https://github.com/ciroautuori/openvidia.git")
@@ -30,36 +40,36 @@ md5sums=('SKIP')
 
 pkgver() {
     cd "$srcdir/$pkgname"
-    # Extract version from pyproject.toml — falls back to git describe
-    local ver
-    ver=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
-    if [[ -n "$ver" ]]; then
-        printf "%s" "$ver"
-    else
-        git describe --tags --long 2>/dev/null | sed 's/^v//;s/-/.r/;s/-/./' || echo "0.0.0"
-    fi
+    # A -git package must produce a NEW version for every commit, or pacman -Syu
+    # never offers an update. Reading pyproject.toml returned the same string
+    # until someone bumped it by hand, which for a branch-tracking package is
+    # effectively never. Base it on the commit, keeping the declared version as
+    # the human-readable prefix.
+    local base
+    base=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+    printf "%s.r%s.g%s" \
+        "${base:-0.0.0}" \
+        "$(git rev-list --count HEAD)" \
+        "$(git rev-parse --short HEAD)"
 }
 
 build() {
     cd "$srcdir/$pkgname"
-    python -m build --no-isolation 2>/dev/null || python setup.py build
+    python -m build --wheel --no-isolation
 }
 
 package() {
     cd "$srcdir/$pkgname"
 
-    # Install the Python package
-    python -m installer --destdir="$pkgdir" dist/*.whl 2>/dev/null || \
-        pip install --root="$pkgdir" --prefix=/usr --optimize=1 .
+    python -m installer --destdir="$pkgdir" dist/*.whl
 
-    # Install LICENSE
-    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
-    # Desktop entry + icon (if present in repo)
-    if [[ -f openvidia.desktop ]]; then
-        install -Dm644 openvidia.desktop "$pkgdir/usr/share/applications/openvidia.desktop"
-    fi
-    if [[ -f web/assets/logo.png ]]; then
-        install -Dm644 web/assets/logo.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/openvidia.png"
-    fi
+    # The desktop entry ships with Exec=openvidia, which resolves because the
+    # wheel installs that entry point to /usr/bin. The previous revision shipped
+    # an entry pointing at openvidia-launcher.sh — a script this package never
+    # installed anywhere — so the menu item did nothing at all.
+    install -Dm644 openvidia.desktop "$pkgdir/usr/share/applications/openvidia.desktop"
+    install -Dm644 openvidia/web/assets/logo.png \
+        "$pkgdir/usr/share/icons/hicolor/256x256/apps/openvidia.png"
 }

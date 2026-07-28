@@ -392,7 +392,7 @@ async def main_async():
     def log(msg: str):
         print(msg, flush=True)
 
-    web_dir = Path(__file__).resolve().parent.parent / "web"
+    web_dir = Path(__file__).resolve().parent / "web"
     srv = await start(
         PORT,
         keys,
@@ -577,7 +577,7 @@ def open_desk(port: int) -> None:
         return
 
     url = f"http://localhost:{port}"
-    assets = Path(__file__).resolve().parent.parent / "web" / "assets"
+    assets = Path(__file__).resolve().parent / "web" / "assets"
     icon_path = str(assets / "logo.png")
     print(f"● Desktop window → {url}", flush=True)
 

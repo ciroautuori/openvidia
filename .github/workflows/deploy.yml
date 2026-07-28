@@ -1,19 +1,42 @@
 name: Deploy to Soliso
 
+# Triggered by CI finishing, not by the push itself. As a `push` workflow this
+# ran in PARALLEL with CI, so a commit with failing tests was deployed anyway —
+# `needs:` cannot reference jobs in another workflow file, which is presumably
+# why the gate was missing. The `conclusion == success` check below is what
+# actually enforces it: workflow_run fires on failure too.
 on:
-  push:
-    branches: [ main ]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
 
 jobs:
   deploy:
     name: Install & Restart
     runs-on: [self-hosted, soliso, openvidia]
+    if: github.event.workflow_run.conclusion == 'success'
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
 
       - name: Install / update package
-        run: python3 -m pip install --break-system-packages -e . --quiet
+        run: uv pip install --system --break-system-packages .
 
+      # `|| true` used to swallow every failure here, so this job was green by
+      # construction and told you nothing about whether the deploy worked. A
+      # unit that is not installed on this host is reported and skipped; a
+      # restart that is attempted and fails is a real failure.
       - name: Restart service
-        run: sudo systemctl restart openvidia || true
+        run: |
+          if ! systemctl list-unit-files openvidia.service >/dev/null 2>&1; then
+            echo "::notice::openvidia.service is not installed here — nothing to restart"
+            exit 0
+          fi
+          sudo systemctl restart openvidia.service
+          sudo systemctl is-active --quiet openvidia.service

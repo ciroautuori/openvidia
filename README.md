@@ -11,7 +11,7 @@
 **Multi-key proxy for NVIDIA NIM with a native desktop dashboard.**
 
 <p align="center">
-  <img src="web/assets/dashboard.gif" alt="OpenVidia dashboard — pooled keys, ★ Starred model shortlist, live activity log" width="400">
+  <img src="openvidia/web/assets/dashboard.gif" alt="OpenVidia dashboard — pooled keys, ★ Starred model shortlist, live activity log" width="400">
 </p>
 
 Pool multiple free-tier API keys behind one endpoint. Automatic rotation, per-key cooldown, sliding-window RPM limiting, and a compact desktop app — no browser needed.
@@ -410,7 +410,7 @@ pywebview auto-detects the best available backend.
 # .desktop file (auto-installed by install.sh)
 cp openvidia.desktop ~/.local/share/applications/
 # Icon
-cp web/assets/logo.png ~/.local/share/icons/hicolor/256x256/apps/openvidia.png
+cp openvidia/web/assets/logo.png ~/.local/share/icons/hicolor/256x256/apps/openvidia.png
 update-desktop-database ~/.local/share/applications/
 ```
 

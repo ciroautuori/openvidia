@@ -1,4 +1,3 @@
-#!/usr/bin/env xdg-open
 [Desktop Entry]
 Type=Application
 Name=OpenVidia
@@ -8,6 +7,6 @@ Comment[it]=Proxy multi-chiave per NVIDIA NIM con dashboard desktop
 Exec=openvidia
 Icon=openvidia
 Terminal=false
-Categories=Development;Network;Utility;
+Categories=Development;
 Keywords=nvidia;nim;proxy;api;llm;development;
 StartupNotify=true
