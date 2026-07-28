@@ -617,7 +617,11 @@ async def handle_anthropic_messages(
     from .compaction import maybe_compact
 
     chat_payload["messages"] = await maybe_compact(
-        chat_payload["messages"], state=state, client=client, log=state.log_cb
+        chat_payload["messages"],
+        state=state,
+        client=client,
+        log=state.log_cb,
+        model=chat_payload.get("model", ""),
     )
 
     want_stream = body.get("stream", False)

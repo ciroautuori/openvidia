@@ -215,10 +215,12 @@ def test_saved_keys_are_not_world_readable(tmp_path, monkeypatch):
 
 @posix_only
 def test_atomic_write_leaves_no_temp_file_behind(tmp_path):
-    target = tmp_path / "out.json"
+    d = tmp_path / "writes"
+    d.mkdir()
+    target = d / "out.json"
     config.atomic_write(target, json.dumps({"a": 1}))
     assert target.read_text() == '{"a": 1}'
-    assert [p.name for p in tmp_path.iterdir()] == ["out.json"]
+    assert [p.name for p in d.iterdir()] == ["out.json"]
 
 
 @posix_only

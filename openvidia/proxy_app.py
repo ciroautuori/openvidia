@@ -436,7 +436,11 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
             from .compaction import maybe_compact
 
             new_messages = await maybe_compact(
-                payload["messages"], state=state, client=client, log=state.log_cb
+                payload["messages"],
+                state=state,
+                client=client,
+                log=state.log_cb,
+                model=payload.get("model", "") or "",
             )
             if new_messages is not payload["messages"]:
                 payload["messages"] = new_messages

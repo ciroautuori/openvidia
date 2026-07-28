@@ -354,7 +354,6 @@ class TestLearnedContextWindows:
         monkeypatch.setattr(compaction.config, "config_dir", lambda: tmp_path)
         compaction._learned_limits.clear()
         compaction._learned_loaded = False
-        compaction._probing.clear()
         yield
         compaction._learned_limits.clear()
         compaction._learned_loaded = False

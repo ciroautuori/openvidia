@@ -288,6 +288,15 @@ async def _rotation_phase(
             if err_status in _DETERMINISTIC_STATUSES:
                 state.log_cb(f"  {log_tag}: HTTP {err_status} is a request error — not rotating")
                 _record(status=err_status, body=error_body, deterministic=True)
+                # A context-overflow rejection states the model's real window.
+                # Learning it here is what replaced the 1.3 MB probe: the answer
+                # arrives from a request the user was making anyway.
+                if _model and error_body:
+                    from .compaction import note_context_limit
+
+                    learned = note_context_limit(_model, error_body)
+                    if learned:
+                        state.log_cb(f"⧉ learned {_model} context window = {learned} tokens")
                 return None, None, None
 
             # ResourceExhausted = worker concurrency limit, not RPM.
@@ -1159,7 +1168,11 @@ async def handle_responses(
     from .compaction import maybe_compact
 
     chat_payload["messages"] = await maybe_compact(
-        chat_payload["messages"], state=state, client=client, log=state.log_cb
+        chat_payload["messages"],
+        state=state,
+        client=client,
+        log=state.log_cb,
+        model=chat_payload.get("model", ""),
     )
 
     want_stream = body.get("stream", False)

@@ -108,20 +108,23 @@ def _model_budgets(cfg: dict) -> dict[str, int]:
 #     This model's maximum context length is 202752 tokens. However, your
 #     messages resulted in 320011 tokens.
 #
-# So we ask once, in the background, with a payload above every window the
-# provider currently serves. The upstream rejects it before doing any
-# inference, which makes the probe cheap; the answer is cached on disk
-# forever. Until it lands, the conservative default applies — an unknown
-# model is never allowed to overflow.
-_CTX_PROBE_CHARS = 1_300_000  # ≈325k tokens
+# So the number is read out of that rejection, once, and cached on disk. Until
+# a model has overflowed at least once the conservative default applies, so an
+# unknown model is never allowed to overflow in the first place.
 _CTX_LIMIT_RE = re.compile(r"maximum context length is (\d+)")
 # The ~4 chars/token estimator underestimates on code and JSON, so only spend
 # this fraction of a learned window.
 _LEARNED_SAFETY = 0.8
 
+# Value the removed probe wrote whenever it could not parse a window out of
+# the response — which included 401, 403, 429 and any differently-worded 400.
+# It means "this model accepted 325k tokens", which no NIM model does, and it
+# disabled compaction for that model permanently. Entries carrying it are
+# discarded on load rather than trusted.
+_PROBE_ARTIFACT_WINDOW = 325_000
+
 _learned_limits: dict[str, int] = {}
 _learned_loaded = False
-_probing: set[str] = set()
 
 
 def _limits_path():
@@ -136,7 +139,13 @@ def _load_learned() -> dict[str, int]:
             p = _limits_path()
             if p.exists():
                 data = json.loads(p.read_text())
-                _learned_limits.update({str(k): int(v) for k, v in data.items() if int(v) > 0})
+                _learned_limits.update(
+                    {
+                        str(k): int(v)
+                        for k, v in data.items()
+                        if int(v) > 0 and int(v) != _PROBE_ARTIFACT_WINDOW
+                    }
+                )
         except (json.JSONDecodeError, OSError, TypeError, ValueError):
             pass
     return _learned_limits
@@ -145,8 +154,8 @@ def _load_learned() -> dict[str, int]:
 def note_context_limit(model: str, body: str) -> int | None:
     """Record the window stated in an upstream error body, if any.
 
-    Passive counterpart to the probe: whenever a real request overflows, the
-    answer is right there in the error and costs nothing to keep.
+    This is the only way a window is learned. It costs nothing: the number
+    comes out of a rejection the user's own request already received.
     """
     if not model or not body:
         return None
@@ -165,42 +174,20 @@ def note_context_limit(model: str, body: str) -> int | None:
     return limit
 
 
-async def _probe_context_window(client, key: str, model: str, log) -> None:
-    """One oversized request; the rejection states the window exactly."""
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": "word " * (_CTX_PROBE_CHARS // 5)}],
-        "max_completion_tokens": 1,
-        "stream": False,
-    }
-    try:
-        resp = await client.post(
-            UPSTREAM,
-            json=payload,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            timeout=httpx.Timeout(connect=5.0, read=60.0, write=120.0, pool=60.0),
-        )
-        body = resp.text
-    except httpx.HTTPError as e:
-        log(f"⧉ compaction: context probe for {model} failed ({type(e).__name__})")
-        return
-    finally:
-        _probing.discard(model)
-
-    limit = note_context_limit(model, body)
-    if limit:
-        log(f"⧉ compaction: learned {model} context window = {limit} tokens")
-    else:
-        # It accepted a payload larger than anything the provider currently
-        # serves. Record that as a lower bound rather than probing higher.
-        lower = _CTX_PROBE_CHARS // 4
-        _load_learned()
-        _learned_limits[model] = lower
-        try:
-            config.atomic_write(_limits_path(), json.dumps(_learned_limits, indent=2))
-        except OSError:
-            pass
-        log(f"⧉ compaction: {model} accepted ≥{lower} tokens — using that as the window")
+# The active probe that used to live here sent a 1.3 MB request to make the
+# provider state its context window in the rejection. It was removed because
+# every failure mode it had was worse than the problem it solved:
+#
+#   * Any non-matching response — 401, 403, 429, an unknown model, a 400 worded
+#     differently — fell through to "it accepted 325k tokens", which was then
+#     written to disk. Compaction was disabled for that model permanently, and
+#     nothing ever corrected it.
+#   * A probe that raised was never recorded, so it ran again on the next
+#     request. Forever. At 1.3 MB of upload each time.
+#   * It bypassed the upstream semaphore and the RPM accounting entirely.
+#
+# note_context_limit() above learns the same number from the error body of a
+# request the user actually made — which is now forwarded instead of discarded.
 
 
 def _resolve_budget(cfg: dict, model: str) -> int:
@@ -481,6 +468,39 @@ async def _summarize(
     raise RuntimeError((last_err or "summarize: all keys failed") + suffix)
 
 
+def _orphan_free(msgs: list[dict]) -> list[dict]:
+    """Drop leading tool results whose assistant message is not in ``msgs``.
+
+    Every cut this module makes is at a numeric index, and a message with
+    role "tool" only means anything next to the assistant message whose
+    tool_calls it answers. Cutting between the two leaves an orphan, and NIM
+    enforces the pairing strictly:
+
+        400 — messages with role 'tool' must be a response to a preceding
+              message with 'tool_calls'
+
+    which the rotation loop then charged to the keys, cooling down five of
+    them for a request no key could have served. The failure appears exactly
+    when compaction is doing its job: a long agentic history, dense with tool
+    calls. Dropping forward is always safe — it only ever removes messages,
+    so it cannot push the result back over budget.
+    """
+    i = 0
+    n = len(msgs)
+    while i < n and msgs[i].get("role") == "tool":
+        i += 1
+    return msgs[i:] if i else msgs
+
+
+def _safe_cut(rest: list[dict], idx: int) -> int:
+    """Move a boundary forward until the suffix ``rest[idx:]`` has no orphans."""
+    n = len(rest)
+    i = max(0, min(idx, n))
+    while i < n and rest[i].get("role") == "tool":
+        i += 1
+    return i
+
+
 def _trim(system_block: list[dict], rest: list[dict], budget: int, keep_recent: int) -> list[dict]:
     """Deterministic fallback: keep system + first msg + as many recent as fit.
 
@@ -504,22 +524,27 @@ def _trim(system_block: list[dict], rest: list[dict], budget: int, keep_recent: 
     if base > budget:  # system block itself overflows: notice only
         return [notice]
 
+    # Contiguous suffix. The previous version did `continue` here, which
+    # skipped a message that did not fit and carried on with older ones — so
+    # the kept tail had a hole in the middle, and the message most likely to be
+    # skipped is the big one: the assistant turn carrying tool_calls, or its
+    # result. Stopping at the first message that does not fit keeps the tail a
+    # real suffix of the conversation.
     tail: list[dict] = []
     total = base
     for m in reversed(rest[1:]):
         t = _msg_tokens(m)
-        if total + t > budget:
-            if len(tail) >= keep_recent:
-                break
-            continue
+        if total + t > budget and len(tail) >= keep_recent:
+            break
         tail.insert(0, m)
         total += t
 
+    tail = _orphan_free(tail)
     result = system_block + head + [notice] + tail
     # Cheap post-condition check against the real serialization; the summed
     # estimate is an upper bound, so this practically never fires.
     while tail and estimate_tokens(result) > budget:
-        tail.pop(0)
+        tail = _orphan_free(tail[1:])
         result = system_block + head + [notice] + tail
     return result
 
@@ -564,14 +589,20 @@ def _assemble(
     They are dropped oldest-first until the result fits.
     """
     block = _summary_block(summary)
+    tail = _orphan_free(list(tail))
     fixed = sum(_msg_tokens(m) for m in system_block + [block] + tail)
     rem = list(remainder)
     total = fixed + sum(_msg_tokens(m) for m in rem)
     while rem and total > budget:
         total -= _msg_tokens(rem.pop(0))
+        # Dropping the assistant turn leaves its tool results answering
+        # nothing, so they go with it.
+        while rem and rem[0].get("role") == "tool":
+            total -= _msg_tokens(rem.pop(0))
+    rem = _orphan_free(rem)
     result = system_block + [block] + rem + tail
     while len(tail) > 1 and estimate_tokens(result) > budget:
-        tail = tail[1:]
+        tail = _orphan_free(tail[1:])
         result = system_block + [block] + rem + tail
     return result
 
@@ -647,11 +678,19 @@ def _start_summarize(
 
 
 async def maybe_compact(
-    messages: list[dict], *, state, client, log: Callable[[str], None]
+    messages: list[dict],
+    *,
+    state,
+    client,
+    log: Callable[[str], None],
+    model: str = "",
 ) -> list[dict]:
     """
     Return compacted messages if needed, otherwise the original list
     (same reference — caller can skip re-serializing).
+
+    ``model`` is the model this request will run on; it sizes the budget.
+    Callers that omit it fall back to the dashboard selection.
     """
     cfg = _settings()
     if not cfg["enabled"] or not isinstance(messages, list) or len(messages) < 4:
@@ -660,21 +699,11 @@ async def maybe_compact(
     # override comes from the user compaction.json ``model_budgets`` map
     # (dynamic, no hardcoded provider names). Falls back to budget_tokens.
     reserved = cfg.get("reserved_tokens", _DEFAULTS["reserved_tokens"])
-    active = state.active_model or ""
-    # An unseen model runs on the conservative default while a one-off
-    # background probe learns its real window. No per-model configuration is
-    # ever required — a model added by the provider tomorrow works at full
-    # context the request after we first see it.
-    if (
-        active
-        and active not in _model_budgets(cfg)
-        and active not in _load_learned()
-        and active not in _probing
-    ):
-        keys, _ = _healthy_keys(state)
-        if keys:
-            _probing.add(active)
-            asyncio.ensure_future(_probe_context_window(client, keys[0], active, log))
+    # The model this request will actually run on. Using state.active_model
+    # sized the budget for whatever the dashboard had selected, so a client
+    # asking for a different model was compacted against the wrong window —
+    # too little, and it overflowed; too much, and it compacted for nothing.
+    active = model or state.active_model or ""
     budget = max(_resolve_budget(cfg, active) - reserved, reserved)
     if estimate_tokens(messages) <= budget:
         return messages
@@ -701,20 +730,21 @@ async def maybe_compact(
         # summary boundary only advances when this no longer fits, so an
         # upstream summarize happens once every few turns instead of once
         # per turn — and the model keeps the maximum verbatim context.
-        candidate = system_block + [_summary_block(base)] + rest[covered:]
+        verbatim = rest[_safe_cut(rest, covered) :]
+        candidate = system_block + [_summary_block(base)] + verbatim
         if estimate_tokens(candidate) <= budget:
             return candidate
 
     # Boundary must advance: keep the largest recent suffix that fits the
     # target and summarize everything before it.
     keep_n = _split_point(system_block, rest, target, reserve)
-    split = len(rest) - keep_n
+    split = _safe_cut(rest, len(rest) - keep_n)
     new_msgs = rest[covered:split]
     if not new_msgs:
         # Already summarized up to the split yet still over budget (huge
         # recent messages): shed verbatim messages oldest-first.
         if base is not None:
-            return _assemble(system_block, base, rest[covered:], [], target)
+            return _assemble(system_block, base, rest[_safe_cut(rest, covered) :], [], target)
         return _trim(system_block, rest, target, keep_recent)
 
     # Summarize ALWAYS runs on the server-local "quiet" model, NOT the hot
@@ -773,7 +803,7 @@ async def maybe_compact(
     # Stale-but-valid summary beats a raw trim: keep the compressed early
     # context and append as many verbatim newer messages as fit.
     if base is not None:
-        result = _assemble(system_block, base, rest[covered:], [], target)
+        result = _assemble(system_block, base, rest[_safe_cut(rest, covered) :], [], target)
         log(
             f"⧉ compaction: summary covers {covered}/{len(rest)} msg "
             f"+ {len(result) - len(system_block) - 1} verbatim (~{estimate_tokens(result)} tok)"
