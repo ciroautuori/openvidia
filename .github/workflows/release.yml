@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Prefer the hand-written CHANGELOG entry when one exists for this tag;
+      # fall back to the commit log so a release is never empty.
+      - name: Build release notes
+        id: notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if [ -f CHANGELOG.md ] && grep -q "^## \[${version}\]" CHANGELOG.md; then
+            awk -v v="$version" '
+              $0 ~ "^## \\["v"\\]" {f=1; next}
+              f && /^## \[/ {exit}
+              f {print}
+            ' CHANGELOG.md > notes.md
+          else
+            prev=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)
+            if [ -n "$prev" ]; then
+              git log --pretty='- %s' "${prev}..${tag}" > notes.md
+            else
+              git log --pretty='- %s' > notes.md
+            fi
+          fi
+          cat notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          draft: false
