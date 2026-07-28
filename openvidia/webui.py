@@ -129,47 +129,59 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
     # Keys CRUD
     # ----------------------------------------------------------------------- #
 
+    # The dashboard never holds a usable key. It works entirely in masked
+    # strings plus an index, so a bug in the page — or a script that got past
+    # the origin guard — has nothing to steal. Copy-to-clipboard is the one
+    # operation that genuinely needs cleartext, and it asks for one key at a
+    # time through its own route.
+
     @app.get("/api/keys")
     async def api_get_keys() -> dict:
         async with state.lock:
-            return {"keys": list(state.keys)}
+            return {"keys": [config.mask_key(k) for k in state.keys]}
 
-    @app.post("/api/keys")
-    async def api_save_keys(request: Request) -> dict:
+    @app.post("/api/keys/reveal")
+    async def api_reveal_key(request: Request) -> dict:
+        """Return one key in cleartext, by index, for the copy button."""
         body = await request.json()
-        keys = body.get("keys", [])
+        idx = body.get("index")
+        if not isinstance(idx, int):
+            return {"ok": False, "error": "index required"}
         async with state.lock:
-            state.keys = list(keys)
-        config.save_keys_file(keys)
-        return {"ok": True}
+            if not 0 <= idx < len(state.keys):
+                return {"ok": False, "error": "index out of range"}
+            return {"ok": True, "key": state.keys[idx]}
 
     @app.post("/api/keys/add")
     async def api_add_key(request: Request) -> dict:
         body = await request.json()
         key = body.get("key", "")
-        if not key:
+        if not isinstance(key, str) or not key.strip():
             return {"ok": False, "error": "key required"}
+        key = key.strip()
         async with state.lock:
+            # Duplicates would each get their own index while sharing a single
+            # KeyState, which double-counts in-flight and misattributes errors.
+            if key in state.keys:
+                return {"ok": False, "error": "key already in pool"}
             state.keys = list(state.keys) + [key]
             keys = list(state.keys)
         config.save_keys_file(keys)
-        return {"ok": True, "keys": keys}
+        return {"ok": True, "keys": [config.mask_key(k) for k in keys]}
 
     @app.post("/api/keys/remove")
     async def api_remove_key(request: Request) -> dict:
         body = await request.json()
         idx = body.get("index")
-        key = body.get("key", "")
+        if not isinstance(idx, int):
+            return {"ok": False, "error": "index required"}
         async with state.lock:
-            # Allow removal by index or by value; index wins when both are
-            # provided and in range, matching what the dashboard sends.
-            if idx is not None and 0 <= idx < len(state.keys):
-                state.keys = [k for i, k in enumerate(state.keys) if i != idx]
-            elif key:
-                state.keys = [k for k in state.keys if k != key]
+            if not 0 <= idx < len(state.keys):
+                return {"ok": False, "error": "index out of range"}
+            state.keys = [k for i, k in enumerate(state.keys) if i != idx]
             keys = list(state.keys)
         config.save_keys_file(keys)
-        return {"ok": True, "keys": keys}
+        return {"ok": True, "keys": [config.mask_key(k) for k in keys]}
 
     # ----------------------------------------------------------------------- #
     # Per-key live stats (cooldown, RPM, validity, freshness)
@@ -228,7 +240,12 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
     @app.post("/api/model")
     async def api_set_model(request: Request) -> dict:
         body = await request.json()
-        m = body.get("model", "") or None
+        raw = body.get("model", "")
+        if not isinstance(raw, str):
+            return {"ok": False, "error": "model must be a string"}
+        m = raw.strip() or None
+        if m is not None and not config.is_valid_model_id(m):
+            return {"ok": False, "error": "invalid model id"}
         state.active_model = m
         config.save_active_model(m or "")
         return {"ok": True, "model": m or ""}
@@ -419,7 +436,13 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
     @app.post("/api/presets")
     async def api_save_presets(request: Request) -> dict:
         body = await request.json()
-        presets = body.get("presets", [])
+        raw = body.get("presets", [])
+        if not isinstance(raw, list):
+            return {"ok": False, "error": "presets must be a list"}
+        # Same rule as the active model: these ids are persisted and rendered.
+        presets = [m for m in raw if isinstance(m, str) and config.is_valid_model_id(m)]
+        if len(presets) != len(raw):
+            return {"ok": False, "error": "invalid model id in presets"}
         config.save_presets_file(presets)
         return {"ok": True}
 

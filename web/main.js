@@ -47,7 +47,12 @@ function toast(msg, level = 'info') {
   const icons = { ok: '✓', error: '✕', warn: '⚠', info: 'ℹ' }
   const el = document.createElement('div')
   el.className = 'toast'
-  el.innerHTML = `<span class="toast-icon ${level}">${icons[level] || icons.info}</span><span>${msg}</span>`
+  // msg carries server text verbatim — including upstream error bodies — so
+  // it is set as text, never parsed as markup.
+  const ic = document.createElement('span')
+  ic.className = `toast-icon ${level}`; ic.textContent = icons[level] || icons.info
+  const tx = document.createElement('span'); tx.textContent = msg
+  el.appendChild(ic); el.appendChild(tx)
   $('toast-container').appendChild(el)
   setTimeout(() => { el.classList.add('toast-out'); setTimeout(() => el.remove(), 260) }, 3500)
 }
@@ -281,7 +286,14 @@ function renderModelList() {
   f.forEach(m => {
     const item = document.createElement('div')
     item.className = `browser-item ${m.id === activeModel ? 'active' : ''}`
-    item.innerHTML = `<span class="browser-name">${m.id}</span>${m.owned_by ? `<span class="browser-owner">${m.owned_by}</span>` : ''}`
+    // m.id / m.owned_by come straight from the upstream /v1/models response.
+    // Remote data never becomes markup.
+    const nm = document.createElement('span'); nm.className = 'browser-name'; nm.textContent = m.id
+    item.appendChild(nm)
+    if (m.owned_by) {
+      const ow = document.createElement('span'); ow.className = 'browser-owner'; ow.textContent = m.owned_by
+      item.appendChild(ow)
+    }
     const acts = document.createElement('div'); acts.className = 'browser-acts'
     const test = document.createElement('button'); test.className = 'browser-test'; test.textContent = '▶'; test.title = 'Test'
     test.onclick = e => { e.stopPropagation(); testModel(m.id, test) }
@@ -307,8 +319,26 @@ function renderModelList() {
 $('modelSearch').addEventListener('input', renderModelList)
 
 /* ── Key management: CRUD + filters ──────────── */
-function maskKey(k) { return k.length <= 14 ? k : `${k.slice(0, 8)}…${k.slice(-4)}` }
 function copyToClipboard(t) { navigator.clipboard.writeText(t).then(() => toast('Key copied', 'ok')).catch(() => {}) }
+
+/* Keys live server-side. The page only ever holds masked strings, so copying
+   asks for the one key it needs, when the user asks for it. */
+async function copyKey(i) {
+  try {
+    const d = await api('POST', '/api/keys/reveal', { index: i })
+    if (d.ok) copyToClipboard(d.key); else toast(d.error || 'Reveal failed', 'error')
+  } catch (e) { toast(`Reveal failed: ${e.message}`, 'error') }
+}
+
+async function removeKey(i) {
+  try {
+    const d = await api('POST', '/api/keys/remove', { index: i })
+    if (!d.ok) return toast(d.error || 'Remove failed', 'error')
+    keys = d.keys || []
+    toast('Key removed', 'warn')
+    renderKeys(await api('GET', '/api/keys/stats').catch(() => null))
+  } catch (e) { toast(`Remove failed: ${e.message}`, 'error') }
+}
 function timeAgo(ts) { if (!ts) return ''; const s = Math.floor(Date.now() / 1000 - ts); if (s < 60) return `${s}s`; if (s < 3600) return `${Math.floor(s / 60)}m`; return `${Math.floor(s / 3600)}h` }
 
 function keyStatus(k, i, stats) {
@@ -356,8 +386,8 @@ function renderKeys(data) {
     dot.className = `key-dot key-${status}`
     row.appendChild(dot)
     const val = document.createElement('span')
-    val.className = 'key-val'; val.textContent = maskKey(k); val.title = k
-    val.onclick = () => copyToClipboard(k)
+    val.className = 'key-val'; val.textContent = k; val.title = 'Click to copy'
+    val.onclick = () => copyKey(i)
     row.appendChild(val)
     const acts = document.createElement('div'); acts.className = 'key-acts'
     if (i === ai) { const b = document.createElement('span'); b.className = `key-badge ${isCd ? 'cd' : ''}`; b.textContent = isCd ? '⏳' : 'active'; acts.appendChild(b) }
@@ -366,12 +396,9 @@ function renderKeys(data) {
     else if (s && s.requests > 0) { info.textContent = `${s.success}✓${s.failed > 0 ? ' ' + s.failed + '✗' : ''} ${timeAgo(s.last_used)}`; info.title = s.last_error || '' }
     else { info.textContent = 'idle' }
     acts.appendChild(info)
-    const cp = document.createElement('button'); cp.className = 'key-act'; cp.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'; cp.title = 'Copy'; cp.onclick = () => copyToClipboard(k)
+    const cp = document.createElement('button'); cp.className = 'key-act'; cp.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'; cp.title = 'Copy'; cp.onclick = () => copyKey(i)
     acts.appendChild(cp)
-    const del = document.createElement('button'); del.className = 'key-act danger'; del.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'; del.title = 'Remove'; del.onclick = () => {
-      keys = keys.filter(x => x !== k)
-      persistKeys(); toast('Key removed', 'warn')
-    }
+    const del = document.createElement('button'); del.className = 'key-act danger'; del.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'; del.title = 'Remove'; del.onclick = () => removeKey(i)
     acts.appendChild(del)
     row.appendChild(acts)
     list.appendChild(row)
@@ -385,10 +412,6 @@ async function pollKeyStats() {
   } catch (_) {}
 }
 
-async function persistKeys() {
-  try { await api('POST', '/api/keys', { keys }) } catch (e) { toast(`Save failed: ${e.message}`, 'error') }
-  renderKeys(await api('GET', '/api/keys/stats').catch(() => null))
-}
 
 /* ── Key filter buttons ──────────────────────── */
 document.querySelectorAll('.key-filter').forEach(btn => {
@@ -405,11 +428,16 @@ $('cancelAddKeyBtn').addEventListener('click', () => $('keyAddForm').classList.a
 $('confirmAddKeyBtn').addEventListener('click', async () => {
   const v = $('newKeyInput').value.trim()
   if (!v) return toast('Enter a key', 'warn')
-  if (keys.includes(v)) return toast('Key already exists', 'warn')
-  keys.push(v)
-  $('keyAddForm').classList.add('hidden')
-  await persistKeys()
-  toast('Key added', 'ok')
+  try {
+    // The pool is server-side, so duplicate detection lives there too — the
+    // page cannot compare a cleartext key against its masked list.
+    const d = await api('POST', '/api/keys/add', { key: v })
+    if (!d.ok) return toast(d.error || 'Add failed', 'warn')
+    keys = d.keys || []
+    $('keyAddForm').classList.add('hidden')
+    toast('Key added', 'ok')
+    renderKeys(await api('GET', '/api/keys/stats').catch(() => null))
+  } catch (e) { toast(`Add failed: ${e.message}`, 'error') }
 })
 $('newKeyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('confirmAddKeyBtn').click() })
 
@@ -545,13 +573,24 @@ context_window = 128000` },
   if (!ex) return
   const container = $('usageCode') || $('cliSetup')
   if (!container) return
-  const stepsHtml = ex.steps.map((s, i) => `
-    <div class="cli-step">
-      <div class="cli-step-label">${i + 1}. ${s.label}</div>
-      <pre class="cli-step-code"><code>${s.code}</code></pre>
-    </div>
-  `).join('')
-  container.innerHTML = `<div class="cli-setup-content"><h4>${ex.title}</h4>${stepsHtml}</div>`
+  // s.code interpolates activeModel, which is server-persisted state. Building
+  // this as an HTML string would make a stored model name executable markup,
+  // so the whole block is assembled from nodes and text.
+  container.innerHTML = ''
+  const wrap = document.createElement('div'); wrap.className = 'cli-setup-content'
+  const h = document.createElement('h4'); h.textContent = ex.title
+  wrap.appendChild(h)
+  ex.steps.forEach((s, i) => {
+    const step = document.createElement('div'); step.className = 'cli-step'
+    const lab = document.createElement('div'); lab.className = 'cli-step-label'
+    lab.textContent = `${i + 1}. ${s.label}`
+    const pre = document.createElement('pre'); pre.className = 'cli-step-code'
+    const code = document.createElement('code'); code.textContent = s.code
+    pre.appendChild(code)
+    step.appendChild(lab); step.appendChild(pre)
+    wrap.appendChild(step)
+  })
+  container.appendChild(wrap)
 }
 
 /* ── Init ───────────────────────────────────── */
@@ -561,7 +600,10 @@ context_window = 128000` },
     await loadModel()
     await loadPresets()
     await fetchModels()
-    renderKeys()
+    // Render with real stats: renderKeys(undefined) leaves active_index at -1,
+    // and the default 'active' filter then matches nothing — the list showed
+    // empty for the first two seconds while claiming N keys were loaded.
+    renderKeys(await api('GET', '/api/keys/stats').catch(() => null))
     if (keys.length) toast(`${keys.length} keys loaded`, 'ok')
   } catch (_) {}
   await updateRunningState()

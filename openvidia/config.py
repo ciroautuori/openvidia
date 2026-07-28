@@ -5,12 +5,19 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 
 
 def config_dir() -> Path:
-    """Platform-specific config directory."""
+    """Platform-specific config directory, private to the user.
+
+    The directory holds API keys in cleartext, so it is chmod'd 0700 on every
+    call — cheap, and it repairs a directory created by an older version that
+    left it world-readable.
+    """
     if sys.platform == "win32":
         d = Path(os.environ.get("APPDATA", Path.home())) / "openvidia"
     elif sys.platform == "darwin":
@@ -19,6 +26,11 @@ def config_dir() -> Path:
         xdg = os.environ.get("XDG_CONFIG_HOME", "")
         d = Path(xdg) / "openvidia" if xdg else Path.home() / ".config" / "openvidia"
     d.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        try:
+            d.chmod(0o700)
+        except OSError:
+            pass
     return d
 
 
@@ -242,42 +254,118 @@ def lock_path() -> Path:
     return config_dir() / "singleton.lock"
 
 
+# Model ids are vendor/name slugs. Anything else is either a typo or an
+# attempt to smuggle markup into state the dashboard later renders.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+
+
+def is_valid_model_id(model: str) -> bool:
+    return bool(_MODEL_ID_RE.match(model))
+
+
+def mask_key(key: str) -> str:
+    """Redact a key for display. Enough prefix to tell keys apart, never enough to use."""
+    if not isinstance(key, str):
+        return "?"
+    return key if len(key) <= 12 else f"{key[:5]}…{key[-4:]}"
+
+
 def load_saved_keys_file() -> list[str]:
+    """Load the key pool, rejecting anything that is not a list of non-empty strings.
+
+    A hand-edited ``keys.json`` that holds a dict or a number used to flow
+    straight into ``Bearer {k}`` and produce an unexplainable 401 loop, so the
+    shape is checked here rather than at the point of use.
+    """
     p = config_path()
     try:
-        return json.loads(p.read_text())
+        data = json.loads(p.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return []
+    if not isinstance(data, list):
+        return []
+    return [k for k in data if isinstance(k, str) and k.strip()]
 
 
-def atomic_write(path: Path, content: str) -> None:
-    """Write to a temp file then rename — crash-safe, atomic on POSIX."""
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(content)
-    tmp.rename(path)
+def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
+    """Write to a unique temp file, fsync, then replace — crash-safe and private.
+
+    Three things the obvious version gets wrong. The temp file is created with
+    an explicit mode, because the default would be 0644 and this function's
+    main caller writes API keys. It is fsynced (file *and* directory) before
+    the rename, since rename is atomic against readers but not against power
+    loss. And the temp name is unique, so two processes — which happens during
+    the ~1s restart overlap — cannot clobber each other's staging file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # os.replace, not Path.rename: rename() raises if the destination
+        # exists on Windows, which config_dir() explicitly supports.
+        os.replace(tmp, path)
+        # Directory fsync makes the rename itself durable. Not possible on
+        # Windows (a directory cannot be opened), where it is also not needed.
+        if sys.platform != "win32":
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def save_keys_file(keys: list[str], create_backup: bool = True) -> None:
-    """Save keys with optional automatic backup.
+    """Save the key pool 0600, backing up the previous file first.
 
-    Args:
-        keys: List of API keys to save
-        create_backup: Whether to create a backup before writing
+    Returns nothing but raises on write failure: losing the key file silently
+    is worse than a traceback, because the user has no way to notice until the
+    next start.
     """
-
-    content = json.dumps(keys, indent=2)
+    clean = [k for k in keys if isinstance(k, str) and k.strip()]
+    content = json.dumps(clean, indent=2)
     cfg_path = config_path()
 
     if create_backup and cfg_path.exists():
-        # Create backup before writing
         try:
             from .safe_file import create_backup as make_backup
 
             make_backup(cfg_path)
-        except Exception:
-            pass  # Backup is optional, continue with write
+        except OSError as exc:
+            # A failed backup is survivable, an unexplained one is not: if the
+            # disk is full the write below will fail too, and the user needs
+            # both facts to understand what happened.
+            print(f"⚠ keys.json backup failed: {exc}", flush=True)
 
     atomic_write(cfg_path, content)
+
+
+def harden_config_permissions() -> list[str]:
+    """Tighten anything an older version left world-readable. Returns what changed.
+
+    Versions before this one wrote keys.json and its backups 0644, so upgrading
+    is not enough — the files already on disk stay readable by every account on
+    the machine until something repairs them. This runs at startup.
+    """
+    if sys.platform == "win32":
+        return []
+    fixed: list[str] = []
+    d = config_dir()
+    for p in d.glob("keys*.json"):
+        try:
+            if p.stat().st_mode & 0o077:
+                p.chmod(0o600)
+                fixed.append(p.name)
+        except OSError:
+            continue
+    return fixed
 
 
 def load_saved_index() -> int:
@@ -295,9 +383,12 @@ def presets_path() -> Path:
 def load_saved_presets() -> list:
     p = presets_path()
     try:
-        return json.loads(p.read_text())
+        data = json.loads(p.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return []
+    if not isinstance(data, list):
+        return []
+    return [m for m in data if isinstance(m, str) and is_valid_model_id(m)]
 
 
 def save_presets_file(presets: list) -> None:

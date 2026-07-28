@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,11 @@ def create_backup(
 
     try:
         shutil.copy2(file_path, backup_path)
+        # copy2 preserves the source mode, which is right for a key file — but
+        # a backup taken from a file an older version wrote 0644 would inherit
+        # 0644. Pin it: a backup of a secret is still a secret.
+        if os.name != "nt":
+            os.chmod(backup_path, 0o600)
 
         # Cleanup old backups
         cleanup_old_backups(file_path, backup_dir, max_backups)

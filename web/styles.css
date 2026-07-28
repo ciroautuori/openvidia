@@ -68,7 +68,11 @@
   --c-bg: rgba(0,0,0,0.03);
 }
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+/* No webfont import. It sat after the :root blocks, where the CSS spec says
+   @import is invalid and browsers drop it — so Inter never actually loaded and
+   the stacks below have always been what rendered. Making it work would mean a
+   local dashboard calling out to Google on every open, which is the opposite of
+   what this app is for. The system stacks in --font/--mono stand on their own. */
 
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{font-size:14px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;-webkit-tap-highlight-color:transparent}

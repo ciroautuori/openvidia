@@ -168,6 +168,49 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+# Origins the dashboard itself can be served from. Anything else asking for
+# /api/* or /ops/* is a foreign page using the user's browser as a deputy.
+LOCAL_ORIGINS = frozenset(f"http://{host}:1919" for host in ("localhost", "127.0.0.1", "[::1]"))
+
+# Host values that legitimately reach a loopback-bound server. A request whose
+# Host is a public name resolving to 127.0.0.1 is DNS rebinding, not a user.
+LOCAL_HOSTS = frozenset(
+    ["localhost", "127.0.0.1", "::1", "[::1]"]
+    + [f"{h}:1919" for h in ("localhost", "127.0.0.1", "[::1]")]
+)
+
+GUARDED_PREFIXES = ("/api", "/ops")
+
+
+class LocalOnlyMiddleware(BaseHTTPMiddleware):
+    """Reject cross-origin and rebound access to the control plane.
+
+    The proxy binds loopback, but loopback is not a security boundary against
+    the browser: any page the user opens can fetch http://localhost:1919. The
+    control routes hand out key material and can restart the process, so they
+    check two things a foreign page cannot forge:
+
+    * ``Origin`` — browsers set it on every cross-origin fetch and refuse to
+      let script override it. CLI clients omit it entirely, so they pass.
+    * ``Host`` — must be a loopback name, which defeats DNS rebinding.
+
+    /v1/* is deliberately not guarded: it is the whole point of the proxy and
+    is reachable by any local process anyway. Cross-origin *reads* of it are
+    still blocked, because CORS no longer answers with a wildcard.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path.startswith(GUARDED_PREFIXES):
+            origin = request.headers.get("origin")
+            if origin is not None and origin not in LOCAL_ORIGINS:
+                return JSONResponse({"error": "cross-origin request denied"}, status_code=403)
+            host = (request.headers.get("host") or "").lower()
+            if host and host not in LOCAL_HOSTS:
+                return JSONResponse({"error": "invalid host header"}, status_code=403)
+        return await call_next(request)
+
+
 def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
     limits = httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=30.0)
     proxy_url = config.outbound_proxy()
@@ -200,12 +243,17 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
     app.state.http_client = client
 
+    # Not a wildcard. The dashboard is same-origin with the proxy, so it never
+    # needs CORS at all; the only reason to answer any origin is to let a
+    # foreign page read the response — which is exactly the thing to prevent
+    # when one of the responses is the user's API keys.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=sorted(LOCAL_ORIGINS),
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(LocalOnlyMiddleware)
     app.add_middleware(BodyLimitMiddleware)
 
     if web_dir and web_dir.exists():

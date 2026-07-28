@@ -437,6 +437,9 @@ async def main_async():
     _setup_codex()
     _setup_claude_code()
     _setup_grok()
+    repaired = config.harden_config_permissions()
+    if repaired:
+        print(f"  ✓ tightened permissions on {', '.join(repaired)} (was world-readable)")
     keys = config.load_saved_keys_file()
     if not keys:
         print("✗ No keys found. Add keys to ~/.config/openvidia/keys.json")
