@@ -25,6 +25,7 @@ from .responses_shim import (
     _ROTATE_SEND_TIMEOUT,
     _live_pool_snapshot,
     _rotation_phase,
+    _upstream_error_message,
     handle_responses,
 )
 
@@ -93,6 +94,13 @@ async def _health_check_all(
     for key in state.keys:
         if not force and not state.is_key_on_cooldown(key):
             continue
+        # A rate limit is not something GET /v1/models can disprove. That
+        # endpoint serves metadata and answers 200 for a key whose
+        # chat/completions quota is spent, so probing a 429 cooldown only ever
+        # ends it early — and the key goes straight back to being rate-limited.
+        # Let 429 cooldowns expire on their own schedule.
+        if not force and state.cooldown_status(key) == 429:
+            continue
         # Skip keys with most of their cooldown left — probe only when nearing expiry.
         if not force and state.cooldown_remaining(key) > 30:
             continue
@@ -112,7 +120,9 @@ async def _health_check_all(
         if isinstance(healthy, Exception):
             healthy = False
         if healthy:
-            state.restore_key(key)
+            # Reachability restored, throughput unproven: clear the cooldown but
+            # leave the adaptive RPM ceiling where the pool learned to put it.
+            state.restore_key(key, rehab_rpm=False)
             revived += 1
         elif force:
             state.mark_key_failed(key)
@@ -487,6 +497,7 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         # The catch-all passes method + raw content so it supports GET, POST,
         # PUT, etc. — the shims use the default POST + json=payload.
         _payload_for_rotation = payload if isinstance(payload, dict) else {"model": ""}
+        _outcome: dict = {}
 
         def _hdr(k, idx):
             h = {
@@ -511,57 +522,88 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
             timeout=_ROTATE_SEND_TIMEOUT,
             stream=True,
             log_tag="catch-all",
-            seen_429_box=[False],
+            outcome_box=_outcome,
             method=request.method,
             content=body if body else None,
             probe_timeout=_MODEL_PROBE_TIMEOUT,
         )
 
         if resp is not None and resp.status_code == 200:
+            # CORS is the middleware's job. Setting the headers by hand here
+            # re-introduced the wildcard the middleware no longer sends, on the
+            # one route that carries model output.
             out_headers = {
                 k: v for k, v in resp.headers.items() if k.lower() not in STRIPPED_RESPONSE_HEADERS
             }
-            out_headers["access-control-allow-origin"] = "*"
-            out_headers["access-control-allow-headers"] = "Content-Type, Authorization"
-            out_headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
+            state.stats.success += 1
+            state.stats.record_key_usage(used_key, ok=True)
 
             async def body_iter(resp=resp, key=used_key, orig_idx=used_idx):
                 try:
-                    async for chunk in resp.aiter_raw():
+                    # aiter_bytes, not aiter_raw: httpx asks for gzip by
+                    # default, and content-encoding is stripped from the
+                    # forwarded headers above. Passing the raw stream through
+                    # would hand the client compressed bytes labelled identity.
+                    async for chunk in resp.aiter_bytes():
                         if await request.is_disconnected():
                             break
                         yield chunk
-                except (httpx.ReadTimeout, httpx.StreamError, httpx.HTTPError) as e:
-                    state.log_cb(f"key[{orig_idx}] stream timeout/error: {e}")
+                except httpx.HTTPError as e:
+                    # The client already has a 200 and some bytes, so there is
+                    # no status left to change. Say so in the stream instead of
+                    # closing cleanly, which reads as a complete answer.
+                    state.log_cb(f"key[{orig_idx}] stream error: {e}")
+                    yield b'\ndata: {"error":"upstream stream interrupted"}\n\n'
                 finally:
                     state.end_in_flight(key)
                     await resp.aclose()
 
             return StreamingResponse(body_iter(), status_code=resp.status_code, headers=out_headers)
 
-        # Rotation failed: read body for error response, record model result.
-        if resp is not None:
-            last_status = resp.status_code
-            try:
-                await resp.aread()
-            except Exception:
-                pass
-            await resp.aclose()
-        else:
-            pass
+        # Rotation failed. _rotation_phase already closed the response and
+        # captured the upstream status and body in _outcome.
+        if _outcome.get("status"):
+            last_status = _outcome["status"]
 
-        # All rotation attempts exhausted. Check if model circuit should auto-open
-        # so the next request gets failover immediately instead of repeating all this.
         model_name = payload.get("model", "") if isinstance(payload, dict) else ""
         if model_name:
             state.record_model_result(model_name, status=last_status)
+
+        # A request the provider rejected outright keeps its own status: a 400
+        # reported as 503 tells the client to retry something that cannot work.
+        if _outcome.get("deterministic"):
+            return JSONResponse(
+                {
+                    "error": _upstream_error_message(_outcome),
+                    "last_upstream_status": last_status,
+                },
+                status_code=last_status or 400,
+            )
+
+        if state.is_pool_throttled():
+            retry_in = int(state.pool_throttle_remaining()) + 1
+            return JSONResponse(
+                {
+                    "error": (
+                        "upstream rate limit applies to the whole account, not to individual "
+                        "keys — rotating cannot help. Retry shortly."
+                    ),
+                    "last_upstream_status": 429,
+                },
+                status_code=429,
+                headers={"Retry-After": str(retry_in)},
+            )
+
         msg = "all keys exhausted"
         if model_name:
             msg += f" for {model_name}"
         if model_name and state.is_model_circuit_open(model_name):
             msg += " (circuit open — will auto-failover on next request)"
         return JSONResponse(
-            {"error": msg, "last_upstream_status": last_status},
+            {
+                "error": _upstream_error_message(_outcome, msg),
+                "last_upstream_status": last_status,
+            },
             status_code=last_status,
         )
 

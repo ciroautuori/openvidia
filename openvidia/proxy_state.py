@@ -52,6 +52,22 @@ ADAPTIVE_429_FACTOR = 0.5  # multiply per-key ceiling by this on each 429
 ADAPTIVE_FLOOR_RPM = 14  # minimum floor per-key to maintain throughput
 ADAPTIVE_REHAB_STEP = 10  # fast per-key ceiling growth (+10 RPM) on success
 
+# ── Aggregate (account/IP) throttle detection ──────────────────────────
+# NVIDIA documents the free tier as ~40 RPM bound to the API key. Observed
+# behaviour says that is not the only limiter: several distinct keys can take
+# a 429 inside the same second, and the rejection arrives in ~0.16s — far too
+# fast to have reached a model. Independent per-key budgets do not expire in
+# lockstep, so that signature means something upstream is counting across the
+# whole pool (same account, same source address, or an anti-abuse heuristic).
+#
+# It matters because the pool's entire strategy — rotate to another key — is
+# useless against an aggregate limit, and actively harmful: each rotation adds
+# another cooled-down key, so one throttling event takes the whole pool out of
+# service. When the signature appears, stop rotating and wait instead.
+POOL_429_WINDOW = 10.0  # look-back for correlating 429s
+POOL_429_DISTINCT_KEYS = 3  # distinct keys inside the window → aggregate limit
+POOL_THROTTLE_PAUSE = 15.0  # how long to stop spending keys on it
+
 
 # ── Per-key state ──────────────────────────────────────────────────────
 
@@ -93,6 +109,9 @@ class KeyCooldown:
 
     until: float = 0.0
     reason: str = ""
+    # The upstream status that caused it. A rate limit and a dead socket both
+    # park a key, but only one of them can be disproved by a cheap probe.
+    status: int = 0
 
     @property
     def remaining(self) -> float:
@@ -304,6 +323,10 @@ class ProxyState:
 
         self.cooldowns: dict[str, KeyCooldown] = {}
         self.rpm: dict[str, RpmTracker] = {}
+        # (timestamp, key) for recent 429s, used to tell a per-key rate limit
+        # apart from an account-wide one. See POOL_429_WINDOW.
+        self._recent_429: deque[tuple[float, str]] = deque()
+        self.pool_throttled_until: float = 0.0
         # Per-model health, learned from real traffic (see ModelHealth).
         self.model_health: dict[str, ModelHealth] = {}
 
@@ -362,8 +385,54 @@ class ProxyState:
         cd = self.cooldowns.get(key)
         return cd.reason if cd is not None else ""
 
-    def set_cooldown(self, key: str, reason: str = "", duration: float = DEFAULT_COOLDOWN) -> None:
-        self.cooldowns[key] = KeyCooldown(until=time.time() + duration, reason=reason)
+    def set_cooldown(
+        self,
+        key: str,
+        reason: str = "",
+        duration: float = DEFAULT_COOLDOWN,
+        status: int = 0,
+    ) -> None:
+        self.cooldowns[key] = KeyCooldown(
+            until=time.time() + duration, reason=reason, status=status
+        )
+
+    def cooldown_status(self, key: str) -> int:
+        cd = self.cooldowns.get(key)
+        return cd.status if cd is not None else 0
+
+    # ── Aggregate throttle ──────────────────────────────────────────
+
+    def note_rate_limited(self, key: str) -> bool:
+        """Record a 429 and report whether it looks account-wide rather than per-key.
+
+        Returns True when the pool has just been put on an aggregate pause.
+        """
+        now = time.time()
+        self._recent_429.append((now, key))
+        cutoff = now - POOL_429_WINDOW
+        while self._recent_429 and self._recent_429[0][0] < cutoff:
+            self._recent_429.popleft()
+
+        if now < self.pool_throttled_until:
+            return False  # already paused; don't re-log on every straggler
+        distinct = {k for _ts, k in self._recent_429}
+        if len(distinct) < POOL_429_DISTINCT_KEYS:
+            return False
+
+        self.pool_throttled_until = now + POOL_THROTTLE_PAUSE
+        self.log_cb(
+            f"⏸ {len(distinct)} keys rate-limited within {POOL_429_WINDOW:.0f}s — this is an "
+            f"account-wide limit, not per-key. Pausing {POOL_THROTTLE_PAUSE:.0f}s instead of "
+            f"rotating (rotation cannot beat a shared quota)."
+        )
+        return True
+
+    def pool_throttle_remaining(self) -> float:
+        r = self.pool_throttled_until - time.time()
+        return r if r > 0 else 0.0
+
+    def is_pool_throttled(self) -> bool:
+        return self.pool_throttle_remaining() > 0
 
     def clear_cooldown(self, key: str) -> None:
         self.cooldowns.pop(key, None)
@@ -433,6 +502,8 @@ class ProxyState:
             if error_body:
                 reason += f" - {error_body[:50]}"
 
+            self.note_rate_limited(key)
+
             # Log detailed 429 info
             self.log_cb(f"⚠ key[{self._keys.index(key) if key in self._keys else '?'}] {reason}")
 
@@ -447,6 +518,18 @@ class ProxyState:
                     ADAPTIVE_FLOOR_RPM,
                     int(ceil * ADAPTIVE_429_FACTOR),
                 )
+        elif retry_after:
+            # An explicit retry_after is the caller stating how long this key
+            # should sit out, and it used to be honoured for 429 only: a 503
+            # asking for 10s silently became the 30s default, so the log said
+            # one thing ("10s cooldown") and the pool did another. A provider
+            # outage then drained the pool three times faster than the code
+            # claimed it would.
+            try:
+                duration = float(retry_after)
+            except (ValueError, TypeError):
+                duration = COOLDOWN_DURATIONS.get(status, DEFAULT_COOLDOWN)
+            reason = f"{error_details} (cooldown {duration:.0f}s)"
         elif status in COOLDOWN_DURATIONS:
             base_duration = COOLDOWN_DURATIONS[status]
             # Apply adaptive multiplier for repeated failures (except auth errors)
@@ -463,7 +546,7 @@ class ProxyState:
             duration = DEFAULT_COOLDOWN
             reason = error_details
 
-        self.set_cooldown(key, reason=reason, duration=duration)
+        self.set_cooldown(key, reason=reason, duration=duration, status=status)
 
         # Log detailed error information for debugging
         if status in (400, 404, 500, 502, 503):
@@ -487,7 +570,17 @@ class ProxyState:
                 ks.cooldown_until = time.time() + duration
                 ks.last_error = reason
 
-    def restore_key(self, key: str) -> None:
+    def restore_key(self, key: str, *, rehab_rpm: bool = True) -> None:
+        """Return a key to the pool.
+
+        ``rehab_rpm=False`` clears the cooldown without giving throughput back.
+        The health check needs that distinction: it proves a key is alive with
+        GET /v1/models, which is a metadata endpoint that answers 200 even
+        while chat/completions is rate-limited for that same key. Treating that
+        as evidence of recovered throughput undid the backoff the pool had just
+        learned, and the key went straight back into 429 — visible in the logs
+        as "revived" followed within a minute by the same key rate-limited.
+        """
         self.clear_cooldown(key)
         ks = self._key_states.get(key)
         if ks:
@@ -495,11 +588,12 @@ class ProxyState:
             ks.is_valid = True
             ks.consecutive_failures = 0
             ks.last_success_at = time.time()
+        if not rehab_rpm:
+            return
         # Graceful RPM rehab: bump the per-key ceiling back up by
-        # ADAPTIVE_REHAB_STEP (default +4) capped at MAX_RPM. A key that was
-        # stepped down on 429 earns throughput back one successful window at
-        # a time, instead of snapping straight to MAX_RPM (which would risk
-        # re-429). Snap straight to MAX_RPM only if already close.
+        # ADAPTIVE_REHAB_STEP capped at MAX_RPM. A key that was stepped down on
+        # 429 earns throughput back one successful window at a time, instead of
+        # snapping straight to MAX_RPM (which would risk re-429).
         tracker = self.rpm.get(key)
         if tracker is None:
             return

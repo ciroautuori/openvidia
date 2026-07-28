@@ -39,6 +39,7 @@ from .responses_shim import (
     _rotation_phase,
     _sanitize_chat_messages,
     _sse_event,
+    _upstream_error_message,
 )
 
 # ── Request: Anthropic Messages → chat/completions ──────────────────
@@ -343,6 +344,7 @@ async def _stream_anthropic(
     resp = None
     used_key = None
     used_idx = None
+    _outcome: dict = {}
     if not (_valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION))):
 
         def _hdr(k, idx):
@@ -363,17 +365,23 @@ async def _stream_anthropic(
             timeout=_ROTATE_SEND_TIMEOUT,
             stream=True,
             log_tag="anthropic shim",
-            seen_429_box=[False],
+            outcome_box=_outcome,
         )
 
     if resp is None or used_key is None:
+        # _live is the count of usable keys; the old check used _valid (the
+        # whole pool), so it reported "pool saturated" whenever any key
+        # existed — which is always.
+        base = "all keys failed (pool saturated)" if _live == 0 else "all keys failed"
         yield _sse_event(
             "error",
             {
                 "type": "error",
                 "error": {
-                    "type": "api_error",
-                    "message": "all keys failed (pool saturated)" if _valid else "all keys failed",
+                    "type": "invalid_request_error"
+                    if _outcome.get("deterministic")
+                    else "api_error",
+                    "message": _upstream_error_message(_outcome, base),
                 },
             },
         )
@@ -381,7 +389,6 @@ async def _stream_anthropic(
 
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)
-    state.record_request(used_key)
     if used_idx is not None:
         state.log_cb(f"✔ key[{used_idx}] OK")
 
@@ -392,175 +399,172 @@ async def _stream_anthropic(
 
     # Tool calls: index → state.
     tool_map: dict[int, dict] = {}
-    next_block_index = 1  # 0 = text block, then tool blocks
+    # Block indices are handed out in arrival order. This used to start at 1 on
+    # the assumption that index 0 was always the text block — but a reply that
+    # is nothing but tool calls (finish_reason == "tool_calls" with no preamble,
+    # which is the common case in an agent loop) never opens a text block. The
+    # client then received its first content block at index 1 and was left with
+    # a hole at content[0].
+    next_block_index = 0
+    # Whether the content_block_stop events have already been emitted, so the
+    # tail below closes the blocks exactly once.
+    blocks_closed = False
+    stop_reason = "end_turn"
+    usage_out = 0
 
-    async for line in resp.aiter_lines():
-        if await request.is_disconnected():
-            break
-        if not line or not line.startswith("data: "):
-            continue
-        data_str = line[6:]
-        if data_str.strip() == "[DONE]":
-            break
-
-        try:
-            chunk = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-
-        choice = (chunk.get("choices") or [{}])[0]
-        delta = choice.get("delta", {})
-
-        # Text delta → content_block_delta (text_delta).
-        text_content = delta.get("content")
-        if text_content:
-            if not text_block_started:
-                text_block_started = True
-                text_block_index = 0
-                yield _sse_event(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": text_block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
+    def _close_blocks():
+        """The content_block_stop events for every block opened so far."""
+        events = []
+        if text_block_started:
+            events.append(
+                _sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": text_block_index},
                 )
-            yield _sse_event(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": text_block_index,
-                    "delta": {"type": "text_delta", "text": text_content},
-                },
             )
-            text_full += text_content
-
-        # Tool call deltas → content_block_start (tool_use) + input_json_delta.
-        tc_deltas = delta.get("tool_calls", [])
-        for tc in tc_deltas:
-            idx = tc.get("index", 0)
-            if idx not in tool_map:
-                toolu_id = f"toolu_{uuid.uuid4().hex[:24]}"
-                call_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
-                block_idx = next_block_index
-                next_block_index += 1
-                tool_map[idx] = {
-                    "toolu_id": toolu_id,
-                    "call_id": call_id,
-                    "name": tc.get("function", {}).get("name", ""),
-                    "arguments": "",
-                    "block_idx": block_idx,
-                }
-                yield _sse_event(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": toolu_id,
-                            "name": tc.get("function", {}).get("name", ""),
-                            "input": {},
-                        },
-                    },
+        for tcm in tool_map.values():
+            events.append(
+                _sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": tcm["block_idx"]},
                 )
-            tcm = tool_map[idx]
-            args_delta = tc.get("function", {}).get("arguments", "")
-            if args_delta:
-                tcm["arguments"] += args_delta
+            )
+        return events
+
+    try:
+        async for line in resp.aiter_lines():
+            if await request.is_disconnected():
+                break
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str.strip() == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            # A usage-only chunk (choices == []) arrives after the finish chunk
+            # when stream_options.include_usage is set. Read it rather than
+            # reporting a character-count estimate.
+            usage = chunk.get("usage")
+            if isinstance(usage, dict) and usage.get("completion_tokens"):
+                usage_out = usage["completion_tokens"]
+
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta", {})
+
+            # Text delta → content_block_delta (text_delta).
+            text_content = delta.get("content")
+            if text_content:
+                if not text_block_started:
+                    text_block_started = True
+                    text_block_index = next_block_index
+                    next_block_index += 1
+                    yield _sse_event(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": text_block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
                 yield _sse_event(
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
-                        "index": tcm["block_idx"],
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": args_delta,
-                        },
-                    },
-                )
-
-        # Finish: close all open blocks, then message_delta + message_stop.
-        finish = choice.get("finish_reason")
-        if finish:
-            # Close the text block.
-            if text_block_started:
-                yield _sse_event(
-                    "content_block_stop",
-                    {
-                        "type": "content_block_stop",
                         "index": text_block_index,
+                        "delta": {"type": "text_delta", "text": text_content},
                     },
                 )
-            # Close tool blocks.
-            for tcm in tool_map.values():
-                yield _sse_event(
-                    "content_block_stop",
-                    {
-                        "type": "content_block_stop",
-                        "index": tcm["block_idx"],
-                    },
-                )
+                text_full += text_content
 
-            # stop_reason mapping.
-            stop_map = {
-                "stop": "end_turn",
-                "length": "max_tokens",
-                "tool_calls": "tool_use",
-            }
-            stop_reason = stop_map.get(finish, "end_turn")
+            # Tool call deltas → content_block_start (tool_use) + input_json_delta.
+            tc_deltas = delta.get("tool_calls", [])
+            for tc in tc_deltas:
+                idx = tc.get("index", 0)
+                if idx not in tool_map:
+                    toolu_id = f"toolu_{uuid.uuid4().hex[:24]}"
+                    block_idx = next_block_index
+                    next_block_index += 1
+                    tool_map[idx] = {
+                        "toolu_id": toolu_id,
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": "",
+                        "block_idx": block_idx,
+                    }
+                    yield _sse_event(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": toolu_id,
+                                "name": tc.get("function", {}).get("name", ""),
+                                "input": {},
+                            },
+                        },
+                    )
+                tcm = tool_map[idx]
+                args_delta = tc.get("function", {}).get("arguments", "")
+                if args_delta:
+                    tcm["arguments"] += args_delta
+                    yield _sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": tcm["block_idx"],
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": args_delta,
+                            },
+                        },
+                    )
 
-            # message_delta carries stop_reason and a rough output token estimate.
-            yield _sse_event(
-                "message_delta",
-                {
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": stop_reason,
-                        "stop_sequence": None,
-                    },
-                    "usage": {"output_tokens": len(text_full) // 4},  # approx
-                },
-            )
+            # Finish: close the content blocks now, but hold the terminator.
+            # The usage chunk arrives AFTER this one, and message_delta is
+            # where the token counts belong.
+            finish = choice.get("finish_reason")
+            if finish and not blocks_closed:
+                blocks_closed = True
+                for event in _close_blocks():
+                    yield event
+                stop_map = {
+                    "stop": "end_turn",
+                    "length": "max_tokens",
+                    "tool_calls": "tool_use",
+                }
+                stop_reason = stop_map.get(finish, "end_turn")
 
-            # message_stop — terminal event.
-            yield _sse_event(
-                "message_stop",
-                {
-                    "type": "message_stop",
-                },
-            )
-            break
-
-    # If upstream closed without a finish_reason, close gracefully anyway.
-    if text_block_started:
-        yield _sse_event(
-            "content_block_stop",
-            {
-                "type": "content_block_stop",
-                "index": text_block_index,
-            },
-        )
-    for tcm in tool_map.values():
-        yield _sse_event(
-            "content_block_stop",
-            {
-                "type": "content_block_stop",
-                "index": tcm["block_idx"],
-            },
-        )
+        # One terminator, always, whatever the upstream did. Reaching here
+        # without a finish_reason (disconnect, bare [DONE], absorbed protocol
+        # error) used to emit nothing at all when there were no tool calls,
+        # leaving the client waiting on its own timeout — and to emit one copy
+        # per tool call when there were, the second of which overwrote
+        # stop_reason "tool_use" with "end_turn" and killed the agent loop.
+        if not blocks_closed:
+            for event in _close_blocks():
+                yield event
         yield _sse_event(
             "message_delta",
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                "usage": {"output_tokens": 0},
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": usage_out or len(text_full) // 4},
             },
         )
         yield _sse_event("message_stop", {"type": "message_stop"})
-
-    await resp.aclose()
-    state.end_in_flight(used_key)  # release the load-balancer claim
+    finally:
+        # Must run even when the client disconnects mid-stream (GeneratorExit)
+        # or httpx raises while reading the body. Without it the key keeps its
+        # in-flight claim forever: the scheduler weighs in_flight heavily, so
+        # each leak pushes that key further down the ranking until it is
+        # effectively out of the pool until restart.
+        await resp.aclose()
+        state.end_in_flight(used_key)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────
@@ -620,6 +624,9 @@ async def handle_anthropic_messages(
 
     if want_stream:
         chat_payload["stream"] = True
+        # Ask for real token counts. Without this the shim reported
+        # len(text)//4, so Claude Code showed an invented number.
+        chat_payload.setdefault("stream_options", {"include_usage": True})
         return StreamingResponse(
             _stream_anthropic(
                 state,
@@ -653,6 +660,7 @@ async def handle_anthropic_messages(
     resp = None
     used_key = None
     used_idx = None
+    _outcome: dict = {}
     if not (_valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION))):
 
         def _hdr(k, idx):
@@ -673,18 +681,30 @@ async def handle_anthropic_messages(
             timeout=_ROTATE_SEND_TIMEOUT,
             stream=False,
             log_tag="anthropic shim",
-            seen_429_box=[False],
+            outcome_box=_outcome,
         )
         if used_idx is not None and isinstance(resp, httpx.Response):
             await resp.aread()
 
     if resp is None or used_key is None:
+        if _outcome.get("deterministic"):
+            return JSONResponse(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": _upstream_error_message(_outcome),
+                    },
+                },
+                status_code=_outcome.get("status") or 400,
+            )
+        base = "all keys failed (pool saturated)" if _live == 0 else "all keys failed"
         return JSONResponse(
             {
                 "type": "error",
                 "error": {
                     "type": "api_error",
-                    "message": "all keys failed (pool saturated)" if _valid else "all keys failed",
+                    "message": _upstream_error_message(_outcome, base),
                 },
             },
             status_code=503,
@@ -692,7 +712,6 @@ async def handle_anthropic_messages(
 
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)
-    state.record_request(used_key)
     if used_idx is not None:
         state.log_cb(f"✔ key[{used_idx}] OK")
 

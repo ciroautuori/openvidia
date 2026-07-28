@@ -77,6 +77,79 @@ async def _keepalive_until(task, result_box: list):
             return
 
 
+# Statuses that describe the REQUEST, not the key. Every key in the pool would
+# answer these identically, so rotating just converts one malformed request
+# into N cooled-down keys. This is the single most expensive thing the rotation
+# loop used to do: a long conversation whose tool-call pairing broke would take
+# five keys out of service per attempt.
+_DETERMINISTIC_STATUSES = frozenset({400, 404, 405, 413, 415, 422})
+
+# Bound on how long a phase will sit in the ResourceExhausted back-off, which
+# is refunded rather than counted against ``max_attempts``. Without a separate
+# cap the refund makes that branch unbounded: 3 passes over a 25-key pool at
+# 0.8s each is a minute of the caller waiting under the semaphore.
+_MAX_EXHAUSTED_WAITS = 6
+
+
+async def _send_once(client, method, upstream, payload, content, hdrs, send_timeout, stream):
+    """Build and send one upstream request, retrying once on a GOAWAY.
+
+    HTTP/2 servers recycle connections by sending GOAWAY, which httpx surfaces
+    as RemoteProtocolError(ConnectionTerminated). It says nothing about the key
+    — it is the pooled socket reaching end of life. Treating it as a key fault
+    is how four keys got marked bad in the same second for a single connection
+    handover. The right response is to send it again, on the same key, over a
+    fresh connection.
+    """
+    for goaway_retry in range(2):
+        if content is not None:
+            req = client.build_request(
+                method, upstream, content=content, headers=hdrs, timeout=send_timeout
+            )
+        else:
+            req = client.build_request(
+                method, upstream, json=payload, headers=hdrs, timeout=send_timeout
+            )
+        try:
+            # Global concurrency semaphore (shared with proxy_app): never
+            # exceed the cap on concurrent upstream sends.
+            async with get_upstream_sem():
+                return await client.send(req, stream=stream)
+        except httpx.RemoteProtocolError:
+            if goaway_retry:
+                raise
+            continue
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _upstream_error_message(outcome: dict | None, fallback: str = "all keys failed") -> str:
+    """Turn a rotation outcome into something a user can act on.
+
+    "all keys exhausted" was true and useless: it hid the provider's own
+    explanation — context overflow, unsupported parameter, unknown model —
+    behind a message about key management. When upstream said something,
+    say it.
+    """
+    if not outcome:
+        return fallback
+    status = outcome.get("status")
+    body = (outcome.get("body") or "").strip()
+    if not body:
+        return f"{fallback} (last upstream status {status})" if status else fallback
+    # NIM errors are JSON with the useful text under a couple of known keys.
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        detail = parsed.get("detail") or parsed.get("message") or parsed.get("title")
+        if isinstance(parsed.get("error"), dict):
+            detail = parsed["error"].get("message") or detail
+        if isinstance(detail, str) and detail.strip():
+            body = detail.strip()
+    return f"upstream {status}: {body[:400]}" if status else body[:400]
+
+
 async def _rotation_phase(
     client,
     upstream,
@@ -89,7 +162,7 @@ async def _rotation_phase(
     timeout,
     stream,
     log_tag,
-    seen_429_box,
+    outcome_box=None,
     method="POST",
     content=None,
     probe_timeout=None,
@@ -101,18 +174,49 @@ async def _rotation_phase(
         content: raw body bytes (used by catch-all; when None, json=payload is used).
         probe_timeout: se fornito, il primo tentativo usa questo timeout per
             rilevare modelli morti; i successivi usano ``timeout``.
+        outcome_box: optional dict filled with the last upstream status and
+            error body. The caller needs it to answer with what the provider
+            actually said instead of a generic "all keys exhausted", which is
+            the only place a context-overflow message or an "unsupported
+            parameter" ever appears.
     """
+
+    def _record(status=None, body="", deterministic=False):
+        if outcome_box is not None:
+            outcome_box["status"] = status
+            outcome_box["body"] = body
+            outcome_box["deterministic"] = deterministic
+
     attempts = 0
+    exhausted_waits = 0
     for pass_num in range(3):
         if pass_num > 0:
             await asyncio.sleep(1.0)
         for idx, k in candidates:
+            # Return, not break: breaking only left the inner loop, so a phase
+            # that had spent its attempt budget still paid two 1s sleeps before
+            # giving up.
+            if attempts >= max_attempts:
+                return None, None, None
+            # An account-wide limit is shared by every key in the pool, so the
+            # next one cannot beat it. Checked before sending, not after: the
+            # point is to stop spending keys, and that includes the key this
+            # iteration was about to spend.
+            if state.is_pool_throttled():
+                _record(status=429, body="account-wide rate limit")
+                return None, None, None
             if not state.key_can_send_rpm(k) or state.is_key_on_cooldown(k):
                 continue
-            if attempts >= max_attempts:
-                break
             attempts += 1
             hdrs = headers_factory(k, idx)
+            # Count the request against the sliding window BEFORE sending, and
+            # here rather than in each caller. Every upstream send in the proxy
+            # goes through this function, so this is the one place that cannot
+            # be forgotten — and it was: the catch-all (which serves
+            # /v1/chat/completions, i.e. all opencode traffic) never recorded
+            # anything, leaving key_can_send_rpm() permanently True and the
+            # whole preventive throttle inert on the main path.
+            state.record_request(k)
             # Claim the key BEFORE sending. get_candidate_keys() scores a key by
             # in_flight + recent RPM, and neither is set until a request finishes:
             # without this claim, N requests arriving together all score every key
@@ -128,18 +232,9 @@ async def _rotation_phase(
             if probe_timeout is not None and attempts == 1:
                 _send_timeout = probe_timeout
             try:
-                if content is not None:
-                    req = client.build_request(
-                        method, upstream, content=content, headers=hdrs, timeout=_send_timeout
-                    )
-                else:
-                    req = client.build_request(
-                        method, upstream, json=payload, headers=hdrs, timeout=_send_timeout
-                    )
-                # Global concurrency semaphore (shared with proxy_app): never
-                # exceed 28 concurrent upstream sends (NVIDIA worker cap is 32).
-                async with get_upstream_sem():
-                    resp = await client.send(req, stream=stream)
+                resp = await _send_once(
+                    client, method, upstream, payload, content, hdrs, _send_timeout, stream
+                )
             except httpx.ReadTimeout:
                 # The key connected and the upstream ACCEPTED the request — it is
                 # simply still thinking. Two things must NOT happen here:
@@ -156,6 +251,7 @@ async def _rotation_phase(
                 state.record_model_result(_model, too_slow=True)
                 state.end_in_flight(k)
                 released = True
+                _record(status=504, body="model produced no first byte", deterministic=False)
                 break
             except httpx.HTTPError as e:
                 err_msg = str(e) or type(e).__name__
@@ -163,6 +259,7 @@ async def _rotation_phase(
                 state.end_in_flight(k)
                 released = True
                 state.mark_key_failed(k)
+                _record(status=None, body=err_msg, deterministic=False)
                 continue
             finally:
                 # A 200 keeps the claim: the key stays busy for as long as the
@@ -184,18 +281,29 @@ async def _rotation_phase(
             await resp.aclose()
             state.log_cb(f"  {log_tag}: key[{idx}] HTTP {err_status}")
             state.record_model_result(_model, status=err_status)
-            if err_status == 429:
-                # ResourceExhausted = worker concurrency limit, not RPM.
-                # Don't burn the key — just skip and let the next key try.
-                if is_resource_exhausted(error_body_bytes):
-                    attempts -= 1  # Don't burn attempt budget on worker-level transient peak
-                    state.log_cb(
-                        f"  {log_tag}: key[{idx}] ResourceExhausted (worker full) — pausing 0.8s"
-                    )
-                    state.stats.record_key_usage(k, ok=False, error="ResourceExhausted")
-                    await asyncio.sleep(0.8)
-                    continue
-                seen_429_box[0] = True
+            _record(status=err_status, body=error_body)
+
+            # The request is wrong, not the key. Stop immediately and hand the
+            # provider's own explanation back to the caller.
+            if err_status in _DETERMINISTIC_STATUSES:
+                state.log_cb(f"  {log_tag}: HTTP {err_status} is a request error — not rotating")
+                _record(status=err_status, body=error_body, deterministic=True)
+                return None, None, None
+
+            # ResourceExhausted = worker concurrency limit, not RPM.
+            # Don't burn the key — just skip and let the next key try.
+            if err_status == 429 and is_resource_exhausted(error_body_bytes):
+                exhausted_waits += 1
+                if exhausted_waits > _MAX_EXHAUSTED_WAITS:
+                    state.log_cb(f"  {log_tag}: upstream workers full — giving up")
+                    return None, None, None
+                attempts -= 1  # Don't burn attempt budget on worker-level transient peak
+                state.log_cb(
+                    f"  {log_tag}: key[{idx}] ResourceExhausted (worker full) — pausing 0.8s"
+                )
+                state.stats.record_key_usage(k, ok=False, error="ResourceExhausted")
+                await asyncio.sleep(0.8)
+                continue
             # A gateway timeout is the MODEL being slow, not the key being bad:
             # NVIDIA's edge gave up waiting for it, and every other key would hit
             # the same wall. Cooling keys down for it empties the pool one 504 at
@@ -673,6 +781,7 @@ async def _stream_responses(
     resp = None
     used_key = None
     used_idx = None
+    _outcome: dict = {}
 
     _live, _valid = _live_pool_snapshot(state, candidates)
     if _valid and _live < max(1, int(_valid * _MIN_LIVE_FRACTION)):
@@ -702,7 +811,7 @@ async def _stream_responses(
                 timeout=_ROTATE_SEND_TIMEOUT,
                 stream=True,
                 log_tag="responses shim",
-                seen_429_box=[False],
+                outcome_box=_outcome,
             )
         )
         # No deadline and no model substitution: the selected model is THE
@@ -718,8 +827,10 @@ async def _stream_responses(
             "error",
             {
                 "type": "error",
-                "code": "server_error",
-                "message": "all keys failed",
+                "code": "invalid_request_error"
+                if _outcome.get("deterministic")
+                else "server_error",
+                "message": _upstream_error_message(_outcome),
                 "param": None,
             },
         )
@@ -741,7 +852,6 @@ async def _stream_responses(
 
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)
-    state.record_request(used_key)
     if used_idx is not None:
         state.log_cb(f"✔ key[{used_idx}] OK")
 
@@ -820,176 +930,183 @@ async def _stream_responses(
             )
         return events
 
-    async for line in resp.aiter_lines():
-        if await request.is_disconnected():
-            break
-        if not line or not line.startswith("data: "):
-            continue
-        data_str = line[6:]
-        if data_str.strip() == "[DONE]":
-            break
+    # Usage arrives in its own trailing chunk (choices == []) AFTER the one
+    # carrying finish_reason. Reading it from a single `chunk` variable at the
+    # end of the loop found the finish chunk instead, so usage was always
+    # zeros — and when the loop never iterated (an immediate [DONE], a client
+    # that disconnected on the first line, an empty body) that variable was
+    # never assigned at all, raising UnboundLocalError inside the generator
+    # after the 200 headers had shipped: a truncated stream with no
+    # response.completed. Accumulate it as it arrives instead.
+    final_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-        try:
-            chunk = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
+    try:
+        async for line in resp.aiter_lines():
+            if await request.is_disconnected():
+                break
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str.strip() == "[DONE]":
+                break
 
-        choice = (chunk.get("choices") or [{}])[0]
-        delta = choice.get("delta", {})
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
 
-        # Text delta → response.output_text.delta
-        text_content = delta.get("content")
-        if text_content:
-            if not text_started:
-                text_started = True
-                text_output_index = next_output_index
-                next_output_index += 1
-                yield _sse_event(
-                    "response.output_item.added",
-                    {
-                        "type": "response.output_item.added",
-                        "output_index": text_output_index,
-                        "item": {
-                            "type": "message",
-                            "id": text_item_id,
-                            "role": "assistant",
-                            "status": "in_progress",
-                            "content": [],
-                        },
-                    },
-                )
-            yield _sse_event(
-                "response.output_text.delta",
-                {
-                    "type": "response.output_text.delta",
-                    "item_id": text_item_id,
-                    "output_index": text_output_index,
-                    "delta": text_content,
-                },
-            )
-            text_full += text_content
-
-        # Tool call deltas → function_call item add + arguments deltas.
-        tc_deltas = delta.get("tool_calls", [])
-        for tc in tc_deltas:
-            idx = tc.get("index", 0)
-            if idx not in tool_calls_map:
-                fc_id = f"fc_{uuid.uuid4().hex[:24]}"
-                call_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
-                tc_output_index = next_output_index
-                next_output_index += 1
-                tool_calls_map[idx] = {
-                    "fc_id": fc_id,
-                    "call_id": call_id,
-                    "name": tc.get("function", {}).get("name", ""),
-                    "arguments": "",
-                    "output_index": tc_output_index,
+            usage = chunk.get("usage")
+            if isinstance(usage, dict) and usage:
+                final_usage = {
+                    "input_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
                 }
-                yield _sse_event(
-                    "response.output_item.added",
-                    {
-                        "type": "response.output_item.added",
-                        "output_index": tc_output_index,
-                        "item": {
-                            "type": "function_call",
-                            "id": fc_id,
-                            "call_id": call_id,
-                            "name": tc.get("function", {}).get("name", ""),
-                            "arguments": "",
-                            "status": "in_progress",
-                        },
-                    },
-                )
-            tcm = tool_calls_map[idx]
-            args_delta = tc.get("function", {}).get("arguments", "")
-            if args_delta:
-                tcm["arguments"] += args_delta
-                yield _sse_event(
-                    "response.function_call_arguments.delta",
-                    {
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": tcm["fc_id"],
-                        "output_index": tcm["output_index"],
-                        "delta": args_delta,
-                    },
-                )
 
-        # Finish: close all open items, then emit response.completed.
-        finish = choice.get("finish_reason")
-        if finish and not items_done_emitted:
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta", {})
+
+            # Text delta → response.output_text.delta
+            text_content = delta.get("content")
+            if text_content:
+                if not text_started:
+                    text_started = True
+                    text_output_index = next_output_index
+                    next_output_index += 1
+                    yield _sse_event(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": text_output_index,
+                            "item": {
+                                "type": "message",
+                                "id": text_item_id,
+                                "role": "assistant",
+                                "status": "in_progress",
+                                "content": [],
+                            },
+                        },
+                    )
+                yield _sse_event(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": text_item_id,
+                        "output_index": text_output_index,
+                        "delta": text_content,
+                    },
+                )
+                text_full += text_content
+
+            # Tool call deltas → function_call item add + arguments deltas.
+            tc_deltas = delta.get("tool_calls", [])
+            for tc in tc_deltas:
+                idx = tc.get("index", 0)
+                if idx not in tool_calls_map:
+                    fc_id = f"fc_{uuid.uuid4().hex[:24]}"
+                    call_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
+                    tc_output_index = next_output_index
+                    next_output_index += 1
+                    tool_calls_map[idx] = {
+                        "fc_id": fc_id,
+                        "call_id": call_id,
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": "",
+                        "output_index": tc_output_index,
+                    }
+                    yield _sse_event(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": tc_output_index,
+                            "item": {
+                                "type": "function_call",
+                                "id": fc_id,
+                                "call_id": call_id,
+                                "name": tc.get("function", {}).get("name", ""),
+                                "arguments": "",
+                                "status": "in_progress",
+                            },
+                        },
+                    )
+                tcm = tool_calls_map[idx]
+                args_delta = tc.get("function", {}).get("arguments", "")
+                if args_delta:
+                    tcm["arguments"] += args_delta
+                    yield _sse_event(
+                        "response.function_call_arguments.delta",
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": tcm["fc_id"],
+                            "output_index": tcm["output_index"],
+                            "delta": args_delta,
+                        },
+                    )
+
+            # Finish: close all open items, then emit response.completed.
+            finish = choice.get("finish_reason")
+            if finish and not items_done_emitted:
+                items_done_emitted = True
+                for ev in _emit_items_done():
+                    yield ev
+                # Deliberately no break: the items are closed, but the usage
+                # chunk still follows. The loop ends on [DONE] a moment later.
+                continue
+
+        # Safety catch: ensure items are closed even if finish_reason was omitted or [DONE] arrived early
+        if not items_done_emitted:
             items_done_emitted = True
             for ev in _emit_items_done():
                 yield ev
-            break
 
-    # Safety catch: ensure items are closed even if finish_reason was omitted or [DONE] arrived early
-    if not items_done_emitted:
-        items_done_emitted = True
-        for ev in _emit_items_done():
-            yield ev
-
-    # Capture usage from the terminal chunk (NVIDIA streams usage only when
-    # stream_options.include_usage=true). If absent we report zeros — Codex
-    # tolerates it but misses token accounting; we forward it when upstream
-    # sends it.
-    final_usage = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-    }
-    if isinstance(chunk, dict):
-        usage = chunk.get("usage")
-        if isinstance(usage, dict):
-            final_usage = {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            }
-
-    # Final response.completed event. A non-empty output array lets Codex
-    # reconstruct the assistant message instead of relying on delta replay.
-    final_output: list[dict] = []
-    if text_started:
-        final_output.append(
+        # Final response.completed event. A non-empty output array lets Codex
+        # reconstruct the assistant message instead of relying on delta replay.
+        final_output: list[dict] = []
+        if text_started:
+            final_output.append(
+                {
+                    "type": "message",
+                    "id": text_item_id,
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text_full}],
+                }
+            )
+        for tcm in tool_calls_map.values():
+            final_output.append(
+                {
+                    "type": "function_call",
+                    "id": tcm["fc_id"],
+                    "call_id": tcm["call_id"],
+                    "name": tcm["name"],
+                    "arguments": tcm["arguments"],
+                    "status": "completed",
+                }
+            )
+        yield _sse_event(
+            "response.completed",
             {
-                "type": "message",
-                "id": text_item_id,
-                "role": "assistant",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": text_full}],
-            }
-        )
-    for tcm in tool_calls_map.values():
-        final_output.append(
-            {
-                "type": "function_call",
-                "id": tcm["fc_id"],
-                "call_id": tcm["call_id"],
-                "name": tcm["name"],
-                "arguments": tcm["arguments"],
-                "status": "completed",
-            }
-        )
-    yield _sse_event(
-        "response.completed",
-        {
-            "type": "response.completed",
-            "response": {
-                "id": resp_id,
-                "object": "response",
-                "created_at": created_ts,
-                "model": model,
-                "output": final_output,
-                "status": "completed",
-                "usage": final_usage,
+                "type": "response.completed",
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "created_at": created_ts,
+                    "model": model,
+                    "output": final_output,
+                    "status": "completed",
+                    "usage": final_usage,
+                },
             },
-        },
-    )
-
-    await resp.aclose()
-    # Release the load-balancer claim taken in _rotation_phase. Without this
-    # the key looks permanently busy and the scheduler stops choosing it.
-    state.end_in_flight(used_key)
+        )
+    finally:
+        # Runs on client disconnect (GeneratorExit) and on any httpx error
+        # while reading the body. Previously both skipped the release, and
+        # the key kept its in-flight claim for the life of the process.
+        await resp.aclose()
+        # Release the load-balancer claim taken in _rotation_phase. Without
+        # this the key looks permanently busy and the scheduler stops
+        # choosing it.
+        state.end_in_flight(used_key)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────
@@ -1075,6 +1192,7 @@ async def handle_responses(
     used_key = None
     used_idx = None
     resp = None
+    _outcome: dict = {}
 
     # Bounded attempts + saturation fast-fail (was serial across all
     # candidates with the 120s client default → Codex block).
@@ -1101,20 +1219,28 @@ async def handle_responses(
             timeout=_ROTATE_SEND_TIMEOUT,
             stream=False,
             log_tag="responses shim",
-            seen_429_box=[False],
+            outcome_box=_outcome,
         )
         if used_idx is not None and isinstance(resp, httpx.Response):
             await resp.aread()
 
     if resp is None or used_key is None:
+        # A deterministic upstream rejection is the client's problem to fix, so
+        # it keeps its own status instead of being flattened into a 503 that
+        # invites the client to retry something that will never succeed.
+        if _outcome.get("deterministic"):
+            return JSONResponse(
+                {"error": _upstream_error_message(_outcome)},
+                status_code=_outcome.get("status") or 400,
+            )
+        base = "all keys failed (pool saturated)" if _live == 0 else "all keys failed"
         return JSONResponse(
-            {"error": "all keys failed (pool saturated)" if _live else "all keys failed"},
+            {"error": _upstream_error_message(_outcome, base)},
             status_code=503,
         )
 
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)
-    state.record_request(used_key)
     if used_idx is not None:
         state.log_cb(f"✔ key[{used_idx}] OK")
 
