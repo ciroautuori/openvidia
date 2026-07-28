@@ -500,7 +500,7 @@ function renderUsage() {
     opencode: {
       title: 'opencode',
       steps: [
-        { label: 'Auto-setup (recommended)', code: `openvidia setup` },
+        { label: 'Auto-setup (opencode is the one CLI OpenVidia configures)', code: `openvidia setup` },
         { label: 'Manual — ~/.config/opencode/opencode.json', code: `{
   "provider": {
     "openvidia": {
@@ -518,8 +518,8 @@ function renderUsage() {
     codex: {
       title: 'Codex CLI',
       steps: [
-        { label: 'Auto-setup (recommended)', code: `openvidia setup` },
-        { label: 'Manual — ~/.codex/config.toml', code: `model = "${m}"
+        { label: 'Run against the proxy (nothing is written)', code: `openvidia run codex` },
+        { label: 'If Codex needs its own provider block — ~/.codex/config.toml', code: `model = "${m}"
 model_provider = "openvidia"
 
 [model_providers.openvidia]
@@ -542,21 +542,18 @@ cost_output_tokens = 0` },
     claude: {
       title: 'Claude Code',
       steps: [
-        { label: 'Auto-setup (recommended)', code: `openvidia setup` },
-        { label: 'Reload shell after setup', code: `source ~/.zshrc  # or ~/.bashrc` },
-        { label: 'Manual — add to ~/.zshrc or ~/.bashrc', code: `export ANTHROPIC_BASE_URL=http://localhost:1919
-export ANTHROPIC_API_KEY=ignored` },
-        { label: 'Run', code: `claude --model ${m}` },
-        { label: 'Or one-shot', code: `ANTHROPIC_BASE_URL=http://localhost:1919 \\
+        { label: 'Run against the proxy (nothing is written)', code: `openvidia run claude` },
+        { label: 'With arguments', code: `openvidia run claude -p "explain this file"` },
+        { label: 'Equivalent by hand — one shell, no config edits', code: `ANTHROPIC_BASE_URL=http://localhost:1919 \\
   ANTHROPIC_API_KEY=ignored \\
-  claude -p "explain this file"` },
+  claude --model ${m}` },
       ],
     },
     grok: {
       title: 'Grok (xAI)',
       steps: [
-        { label: 'Auto-setup (recommended)', code: `openvidia setup` },
-        { label: 'Manual — ~/.grok/config.toml', code: `[models]
+        { label: 'Run against the proxy (nothing is written)', code: `openvidia run grok` },
+        { label: 'If Grok needs its own provider block — ~/.grok/config.toml', code: `[models]
 default = "${m}"
 
 [model.${m}]

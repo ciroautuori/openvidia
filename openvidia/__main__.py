@@ -5,18 +5,19 @@ Install:
     pip install -e .
 
 Usage:
-    openvidia              # start proxy + desktop window
-    openvidia foreground    # foreground mode (logs stdout)
-    openvidia setup        # auto-configure ALL detected CLIs (opencode, Codex, Claude Code, Grok)
+    openvidia                    # start proxy + desktop window
+    openvidia foreground         # foreground mode (logs stdout)
+    openvidia setup              # configure opencode (the only persistent edit)
+    openvidia run <cli> [args]   # run any CLI against the proxy, writing nothing
 
 Dashboard + API at http://localhost:1919
 Edit keys via ~/.config/openvidia/keys.json or dashboard Keys tab.
-Keys auto-extracted from accounts.json if keys.json is empty.
 """
 
 import asyncio
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -154,219 +155,48 @@ def _setup_opencode():
             changed = True
             print("✓ Added OpenVidia model to opencode provider")
 
-    # Auto-compaction for NVIDIA models (smaller context than Claude)
-    comp = cfg.get("compaction")
-    if not isinstance(comp, dict) or not comp.get("auto") or not comp.get("prune"):
+    # Auto-compaction, but only as a default. Forcing it back on every run
+    # overrode users who had deliberately turned it off.
+    if "compaction" not in cfg:
         cfg["compaction"] = {"auto": True, "prune": True, "reserved": 8000}
         changed = True
         print("✓ Enabled auto-compaction (prune=true, reserved=8000)")
 
-    # Default model → openvidia/openvidia (provider/model_id)
-    if cfg.get("model") != "openvidia/openvidia":
+    # Select the provider only when nothing is selected. This used to be
+    # unconditional and ran on every proxy start, so a user who picked another
+    # provider in opencode found it reset the next time OpenVidia launched.
+    if not cfg.get("model"):
         cfg["model"] = "openvidia/openvidia"
         changed = True
         print("✓ Default model set to openvidia/openvidia")
+    elif cfg.get("model") != "openvidia/openvidia":
+        print(f"ℹ Leaving your opencode model as {cfg['model']} — switch with /model openvidia")
 
-    # Small model for lightweight tasks (titles, etc.) — same provider
     if not cfg.get("small_model"):
         cfg["small_model"] = "openvidia/openvidia"
         changed = True
         print("✓ Small model set to openvidia/openvidia")
 
-    # Instructions: point to AGENTS.md if it exists in the project
-    agents_md = Path.cwd() / "AGENTS.md"
-    if agents_md.exists():
-        instr = cfg.get("instructions", [])
-        if "AGENTS.md" not in instr:
-            cfg["instructions"] = ["AGENTS.md"] + instr
-            changed = True
-            print("✓ Instructions → AGENTS.md")
+    # NOTE: the previous version also prepended Path.cwd()/AGENTS.md to
+    # opencode's GLOBAL instructions. Launched from this repo — which the
+    # desktop launcher does — that meant every opencode project everywhere
+    # started loading OpenVidia's own AGENTS.md. A proxy has no business
+    # deciding what instructions another tool reads.
 
     if changed:
-        tmp = oc_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(cfg, indent=2))
-        tmp.rename(oc_path)
+        # Someone else's config file: back it up before touching it. This is
+        # the protection save_keys_file already gave OpenVidia's own data.
+        try:
+            from .safe_file import create_backup
+
+            create_backup(oc_path)
+        except OSError as e:
+            print(f"✗ could not back up {oc_path}: {e} — not writing")
+            return False
+        config.atomic_write(oc_path, json.dumps(cfg, indent=2), mode=0o644)
 
     print(f"✓ OpenVidia provider ready → http://localhost:{PORT}/v1")
     print(f"✓ Dashboard at http://localhost:{PORT}")
-    return True
-
-
-def _ensure_env_var():
-    """Ensure OPENVIDIA_API_KEY=ignored is in the shell rc file."""
-    shell = os.environ.get("SHELL", "")
-    home = Path.home()
-    rc = home / ".zshrc"
-    if "bash" in shell:
-        rc = home / ".bashrc"
-    elif "fish" in shell:
-        rc = home / ".config" / "fish" / "config.fish"
-    else:
-        rc = home / ".zshrc"
-
-    rc.parent.mkdir(parents=True, exist_ok=True)
-
-    line = f"export {ENV_VAR}={ENV_VAL}"
-    try:
-        content = rc.read_text() if rc.exists() else ""
-    except OSError:
-        content = ""
-
-    if ENV_VAR in content:
-        return False
-
-    with open(rc, "a") as f:
-        if content and not content.endswith("\n"):
-            f.write("\n")
-        f.write(f"\n# OpenVidia proxy (NVIDIA NIM multi-key)\n{line}\n")
-    print(f"✓ Added {ENV_VAR}={ENV_VAL} to {rc}")
-    return True
-
-
-def _setup_codex():
-    """Configure the Codex CLI (~/.codex/config.toml) to use OpenVidia.
-
-    Usa tomlkit per parse→modify→serialize: preserva commenti e sezioni
-    esistenti, elimina il rischio di duplicati TOML che rompevano il parse.
-    """
-    import tomlkit
-
-    codex_dir = Path.home() / ".codex"
-    if not codex_dir.exists():
-        print("ℹ Codex CLI not found — skipping")
-        return False
-
-    cfg_path = codex_dir / "config.toml"
-    try:
-        doc = tomlkit.parse(cfg_path.read_text()) if cfg_path.exists() else tomlkit.document()
-    except Exception as e:
-        print(f"✗ Cannot parse {cfg_path}: {e}")
-        print("  Backing up and starting fresh")
-        if cfg_path.exists():
-            cfg_path.rename(cfg_path.with_suffix(".toml.bak-eros"))
-        doc = tomlkit.document()
-
-    changed = False
-
-    # Top-level model + model_provider
-    if doc.get("model") != "openvidia":
-        doc["model"] = "openvidia"
-        changed = True
-    if doc.get("model_provider") != "openvidia":
-        doc["model_provider"] = "openvidia"
-        changed = True
-
-    # Provider block: openvidia
-    providers = doc.setdefault("model_providers", {})
-    if "openvidia" not in providers:
-        providers["openvidia"] = {
-            "name": "OpenVidia",
-            "base_url": f"http://localhost:{PORT}/v1",
-            "env_key": ENV_VAR,
-            "wire_api": "responses",
-        }
-        # Model metadata — senza questo Codex mostra "Model metadata not found"
-        providers["openvidia"]["models"] = {
-            "openvidia": {
-                "name": "OpenVidia (NVIDIA NIM via proxy)",
-                "context_window": 128000,
-                "supports_tool_use": True,
-                "supports_parallel_tool_use": True,
-                "cost_input_tokens": 0,
-                "cost_output_tokens": 0,
-            }
-        }
-        changed = True
-    else:
-        # Assicurati che i campi critici siano corretti anche se il blocco esiste
-        ov = providers["openvidia"]
-        if ov.get("base_url") != f"http://localhost:{PORT}/v1":
-            ov["base_url"] = f"http://localhost:{PORT}/v1"
-            changed = True
-        if ov.get("wire_api") != "responses":
-            ov["wire_api"] = "responses"
-            changed = True
-        # Assicurati che il sub-blocco models.openvidia esista
-        models = ov.get("models", {})
-        if "openvidia" not in models:
-            models["openvidia"] = {
-                "name": "OpenVidia (NVIDIA NIM via proxy)",
-                "context_window": 128000,
-                "supports_tool_use": True,
-                "supports_parallel_tool_use": True,
-                "cost_input_tokens": 0,
-                "cost_output_tokens": 0,
-            }
-            ov["models"] = models
-            changed = True
-
-    # Provider block: openai-direct (GPT/Codex — richiede OPENAI_API_KEY sk-...)
-    # Non possiamo usare "openai" perché Codex lo riserva come built-in.
-    if "openai-direct" not in providers:
-        providers["openai-direct"] = {
-            "name": "OpenAI Direct",
-            "base_url": "https://api.openai.com/v1",
-            "env_key": "OPENAI_API_KEY",
-            "wire_api": "responses",
-        }
-        changed = True
-
-    if changed:
-        cfg_path.write_text(tomlkit.dumps(doc))
-        print("✓ Configured Codex CLI → ~/.codex/config.toml")
-    else:
-        print("✓ Codex CLI already configured")
-
-    _ensure_env_var()
-    print("✓ Codex CLI ready — run: codex --model openvidia")
-    return True
-
-
-def _setup_claude_code():
-    """Skip mutating shell rc files for Claude Code to ensure standard native operation is never affected."""
-    print("ℹ Claude Code auto-config disabled (use native Claude Code).")
-    return True
-
-
-def _setup_grok():
-    """Configure the Grok CLI (~/.grok/config.toml) to use OpenVidia."""
-    grok_dir = Path.home() / ".grok"
-    if not grok_dir.exists():
-        print("ℹ Grok CLI not found — skipping")
-        return False
-
-    import tomlkit
-
-    cfg_path = grok_dir / "config.toml"
-    try:
-        doc = tomlkit.parse(cfg_path.read_text()) if cfg_path.exists() else tomlkit.document()
-    except Exception:
-        backup = cfg_path.with_suffix(".toml.bak-eros")
-        cfg_path.rename(backup)
-        print(f"⚠ Grok config parse error — backed up to {backup.name}, starting fresh")
-        doc = tomlkit.document()
-
-    # Model provider block
-    if "model" not in doc:
-        doc["model"] = tomlkit.table()
-    model_tbl = doc["model"]
-    if "openvidia" not in model_tbl:
-        model_tbl["openvidia"] = tomlkit.table()
-    ov = model_tbl["openvidia"]
-    ov["api_key"] = "ignored"
-    ov["base_url"] = f"http://localhost:{PORT}/v1"
-    ov["api_backend"] = "chat_completions"
-    ov["context_window"] = 128000
-
-    # Default model selection
-    if "models" not in doc:
-        doc["models"] = tomlkit.table()
-    doc["models"]["default"] = "openvidia"
-
-    cfg_path.write_text(tomlkit.dumps(doc))
-    print("✓ Configured Grok CLI → ~/.grok/config.toml")
-    _ensure_env_var()
-    print("✓ Grok CLI ready — run: grok -m openvidia")
     return True
 
 
@@ -385,43 +215,155 @@ def _setup_proxy_config():
         print(f"✓ Proxy config ready → {p}")
 
 
+# ---------------------------------------------------------------------------
+# Running another CLI against the proxy
+# ---------------------------------------------------------------------------
+# The proxy used to reconfigure opencode, Codex, Claude Code and Grok on every
+# single start — not just on `setup`. That reset the user's chosen opencode
+# model to openvidia/openvidia on each launch, re-enabled compaction settings
+# they had turned off, rewrote ~/.codex/config.toml and ~/.grok/config.toml
+# without a backup, appended to shell rc files (with bash syntax, even under
+# fish, so every new shell printed an error), and injected whatever AGENTS.md
+# happened to be in the launch directory into opencode's GLOBAL instructions.
+#
+# `openvidia run <cli>` replaces all of that with the ollama model: nothing on
+# disk changes, ever. The environment is set for one child process and the CLI
+# is exec'd into it.
+BASE_URL = f"http://localhost:{PORT}/v1"
+ROOT_URL = f"http://localhost:{PORT}"
+
+# Defaults ship for the variables these tools document. The table is
+# user-editable at ~/.config/openvidia/cli_targets.json so a CLI that renames
+# its variables tomorrow is a config edit rather than a release — the same
+# choice model_options.json already makes for payload flags.
+_DEFAULT_CLI_TARGETS: dict[str, dict] = {
+    "opencode": {
+        "argv": ["opencode"],
+        "env": {"OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": ENV_VAL, ENV_VAR: ENV_VAL},
+    },
+    "claude": {
+        "argv": ["claude"],
+        "env": {"ANTHROPIC_BASE_URL": ROOT_URL, "ANTHROPIC_API_KEY": ENV_VAL},
+    },
+    "codex": {
+        "argv": ["codex"],
+        "env": {"OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": ENV_VAL, ENV_VAR: ENV_VAL},
+        # Codex resolves providers from ~/.codex/config.toml, so the base URL
+        # alone may not be enough. We refuse to write that file behind the
+        # user's back; print it instead and let them decide.
+        "note": (
+            "Codex may also need a provider block in ~/.codex/config.toml.\n"
+            "  If it does not pick up the proxy, add once:\n"
+            "\n"
+            '    model = "openvidia"\n'
+            '    model_provider = "openvidia"\n'
+            "\n"
+            "    [model_providers.openvidia]\n"
+            '    name = "OpenVidia"\n'
+            f'    base_url = "{BASE_URL}"\n'
+            f'    env_key = "{ENV_VAR}"\n'
+            '    wire_api = "responses"'
+        ),
+    },
+    "grok": {
+        "argv": ["grok"],
+        "env": {"OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": ENV_VAL, ENV_VAR: ENV_VAL},
+    },
+}
+
+
+def _cli_targets() -> dict[str, dict]:
+    """Ship defaults, let the user override them without a release."""
+    targets = {k: dict(v) for k, v in _DEFAULT_CLI_TARGETS.items()}
+    try:
+        p = config.config_dir() / "cli_targets.json"
+        if p.exists():
+            user = json.loads(p.read_text())
+            if isinstance(user, dict):
+                for name, spec in user.items():
+                    if isinstance(spec, dict):
+                        targets[str(name)] = {**targets.get(str(name), {}), **spec}
+    except (json.JSONDecodeError, OSError):
+        pass
+    return targets
+
+
+def _run_cmd(argv: list[str]) -> int:
+    """``openvidia run <cli> [args...]`` — point one process at the proxy.
+
+    Nothing is written. The variables live in this process's child and die
+    with it, so a CLI configured against the proxy today is unmodified
+    tomorrow, and the user's own config keeps whatever they put in it.
+    """
+    targets = _cli_targets()
+    if not argv:
+        print("Usage: openvidia run <cli> [args...]")
+        print(f"Known: {', '.join(sorted(targets))}")
+        print("Anything else is executed as-is with the OpenAI-compatible vars set.")
+        return 2
+
+    name, rest = argv[0], argv[1:]
+    spec = targets.get(name)
+    if spec is None:
+        # Not in the table: still useful — most tools read OPENAI_BASE_URL.
+        spec = {
+            "argv": [name],
+            "env": {"OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": ENV_VAL, ENV_VAR: ENV_VAL},
+        }
+
+    env = {**os.environ, **{str(k): str(v) for k, v in (spec.get("env") or {}).items()}}
+    cmd = list(spec.get("argv") or [name]) + rest
+
+    exe = shutil.which(cmd[0])
+    if exe is None:
+        print(f"✗ {cmd[0]} is not on PATH")
+        return 127
+
+    if not _proxy_is_up(PORT):
+        print(f"⚠ Nothing is serving {ROOT_URL} — start it with `openvidia` first.")
+
+    for k in sorted(spec.get("env") or {}):
+        print(f"  {k}={spec['env'][k]}")
+    if spec.get("note"):
+        print(f"\nℹ {spec['note']}\n")
+    print(f"→ exec {' '.join(cmd)}\n", flush=True)
+
+    try:
+        os.execvpe(exe, cmd, env)
+    except OSError as e:  # pragma: no cover — execvpe only returns on failure
+        print(f"✗ could not exec {cmd[0]}: {e}")
+        return 126
+
+
+def _proxy_is_up(port: int) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 def _setup_cmd():
-    """Full setup: configure every detected CLI (opencode, Codex, Claude Code, Grok)."""
-    print("╔════════════════════════════════════════════╗")
-    print("║   OpenVidia — Setup CLI auto-config        ║")
-    print("╚════════════════════════════════════════════╝")
-    print()
+    """``openvidia setup`` — configure opencode, and only opencode.
 
-    _ensure_env_var()
+    opencode is the one CLI this project treats as first-class, so it is the
+    one place a persistent config edit is worth making. Everything else runs
+    through `openvidia run`, which writes nothing.
+    """
+    print("OpenVidia setup")
     print()
-
     _setup_proxy_config()
     print()
-
     _setup_opencode()
     print()
-
-    _setup_codex()
+    print(f"Proxy:      {BASE_URL}")
+    print(f"Dashboard:  {ROOT_URL}")
     print()
-
-    _setup_claude_code()
-    print()
-
-    _setup_grok()
-    print()
-
-    print("╔════════════════════════════════════════════╗")
-    print("║         Setup complete!                    ║")
-    print("╠════════════════════════════════════════════╣")
-    print(f"║   Proxy:      http://localhost:{PORT}/v1      ║")
-    print(f"║   Dashboard:  http://localhost:{PORT}         ║")
-    print("║                                            ║")
-    print("║   opencode → /model openvidia              ║")
-    print("║   codex    → codex --model openvidia       ║")
-    print("║   claude   → claude --model openvidia      ║")
-    print("║   grok     → grok -m openvidia             ║")
-    print("╚════════════════════════════════════════════╝")
-
+    print("Other CLIs need no setup — run them against the proxy on demand:")
+    for name in sorted(n for n in _cli_targets() if n != "opencode"):
+        print(f"  openvidia run {name}")
     sys.exit(0)
 
 
@@ -433,10 +375,8 @@ async def main_async():
         # diagnose, because the code on disk is not the code answering.
         print(f"  Free it manually:  fuser -k {PORT}/tcp", flush=True)
         sys.exit(1)
-    _setup_opencode()
-    _setup_codex()
-    _setup_claude_code()
-    _setup_grok()
+    # Deliberately no _setup_*() here. Starting a proxy is not consent to
+    # rewrite four other tools' configuration files.
     repaired = config.harden_config_permissions()
     if repaired:
         print(f"  ✓ tightened permissions on {', '.join(repaired)} (was world-readable)")
@@ -693,15 +633,51 @@ def open_desk(port: int) -> None:
         webview.start(debug=False, icon=icon_path)
 
 
+USAGE = f"""OpenVidia — multi-key proxy for NVIDIA NIM
+
+  openvidia                    start the proxy and open the dashboard
+  openvidia foreground         start the proxy in this terminal (logs to stdout)
+  openvidia setup              configure opencode to use the proxy (backs up first)
+  openvidia run <cli> [args]   run another CLI against the proxy, changing no files
+  openvidia --help             this message
+
+Dashboard  {ROOT_URL}
+API base   {BASE_URL}
+Keys       {{keys_path}}
+
+`run` sets the CLI's base-URL variables for that one process only. Override the
+variables per CLI in {{targets_path}}."""
+
+
+def _print_usage() -> None:
+    print(
+        USAGE.format(
+            keys_path=config.config_path(),
+            targets_path=config.config_dir() / "cli_targets.json",
+        )
+    )
+
+
 def main():
     """CLI entrypoint: dispatch on argv[1]."""
     if len(sys.argv) > 1:
-        if sys.argv[1] == "setup":
+        cmd = sys.argv[1]
+        if cmd in ("-h", "--help", "help"):
+            _print_usage()
+            return
+        if cmd == "setup":
             _setup_cmd()
             return
-        if sys.argv[1] == "foreground":
+        if cmd == "run":
+            sys.exit(_run_cmd(sys.argv[2:]) or 0)
+        if cmd == "foreground":
             asyncio.run(main_async())
             return
+        # Unknown arguments used to be ignored silently, which made a typo
+        # look like a successful launch.
+        print(f"✗ unknown command: {cmd}\n")
+        _print_usage()
+        sys.exit(2)
 
     import subprocess as _sp
 
