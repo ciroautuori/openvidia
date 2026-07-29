@@ -13,30 +13,47 @@ on:
 
 jobs:
   deploy:
-    name: Install & Restart
+    name: Update & Restart
     runs-on: [self-hosted, soliso, openvidia]
     if: github.event.workflow_run.conclusion == 'success'
 
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Install / update package
-        run: uv pip install --system --break-system-packages .
-
-      # `|| true` used to swallow every failure here, so this job was green by
-      # construction and told you nothing about whether the deploy worked. A
-      # unit that is not installed on this host is reported and skipped; a
-      # restart that is attempted and fails is a real failure.
-      - name: Restart service
+      # soliso runs the proxy as an editable install out of ~/apps/openvidia,
+      # so the deploy is a fast-forward of that checkout — not a system-wide
+      # install. `uv pip install --system` wrote to /usr/lib/python*/site-packages
+      # as an unprivileged runner and failed with EACCES on every run since the
+      # workflow was added.
+      - name: Update the hub checkout
         run: |
-          if ! systemctl list-unit-files openvidia.service >/dev/null 2>&1; then
-            echo "::notice::openvidia.service is not installed here — nothing to restart"
-            exit 0
-          fi
-          sudo systemctl restart openvidia.service
-          sudo systemctl is-active --quiet openvidia.service
+          cd ~/apps/openvidia
+          git fetch --depth 1 origin "${{ github.event.workflow_run.head_sha }}"
+          git reset --hard FETCH_HEAD
+          git log --oneline -1
+          VIRTUAL_ENV="$HOME/apps/openvidia/.venv" uv pip install -q -e .
+
+      # The unit is a systemd *user* unit. The old step probed it with
+      # `systemctl list-unit-files`, which only sees system units, so it always
+      # reported "not installed here", exited 0 and restarted nothing — a green
+      # deploy that never deployed. `--user` needs XDG_RUNTIME_DIR, which the
+      # runner's non-login shell does not set.
+      - name: Restart the proxy
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          systemctl --user restart openvidia.service
+          systemctl --user is-active --quiet openvidia.service
+
+      # is-active only says the process survived. The proxy binds its socket
+      # after loading the key pool, so a config that kills it on startup still
+      # looks active for a moment — wait for the port to actually answer.
+      - name: Verify it is serving
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS -o /dev/null -m 5 "http://localhost:1919/api/status" \
+               -H "x-openvidia-token: $(cat ~/.config/openvidia/control_token)"; then
+              echo "proxy is serving"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::proxy did not answer on :1919 within 40s"
+          exit 1
