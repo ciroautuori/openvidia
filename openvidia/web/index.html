@@ -50,6 +50,12 @@
               <button class="btn btn-xs effort-btn" data-effort="medium" title="Balanced — thinking on, temp 0.5">med</button>
               <button class="btn btn-xs effort-btn" data-effort="high" title="Deep — thinking on, temp 0.2">high</button>
             </span>
+            <span class="status-meta fallback-row">
+              Fallback
+              <button class="btn btn-xs fallback-btn" data-fallback="off" title="Never failover — return 503 if model is down">off</button>
+              <button class="btn btn-xs fallback-btn" data-fallback="on" title="Always failover to next healthy preset">on</button>
+              <button class="btn btn-xs fallback-btn" data-fallback="auto" title="Failover only when circuit is open">auto</button>
+            </span>
           </div>
           <div class="status-acts">
             <button class="btn btn-sm" id="stopBtn" title="Stop">⏹</button>

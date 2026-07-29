@@ -331,6 +331,44 @@ def attach_webui(app: FastAPI, state: ProxyState, web_dir: Path) -> None:
         state.log_cb(f"◆ reasoning_effort={effort} for {model or 'all models'}")
         return {"ok": True, "model": model, "effort": effort}
 
+    @app.get("/api/fallback")
+    async def api_get_fallback() -> dict:
+        opts = config.model_options()
+        model = state.active_model or ""
+        per = (opts.get("per_model") or {}).get(model, {})
+        return {
+            "model": model,
+            "fallback": per.get("fallback") or opts.get("fallback", "off"),
+            "inherited": "fallback" not in per,
+        }
+
+    @app.post("/api/fallback")
+    async def api_set_fallback(request: Request) -> dict:
+        """Set fallback mode: off (never failover), on (always failover), auto (default behavior)."""
+        body = await request.json()
+        mode = body.get("fallback", "off")
+        if mode not in ("off", "on", "auto"):
+            return {"ok": False, "error": "fallback must be off, on or auto"}
+        opts = config.model_options()
+        model = body.get("model", state.active_model or "")
+        if model:
+            per = dict(opts.get("per_model") or {})
+            entry = dict(per.get(model) or {})
+            if mode == "auto":
+                entry.pop("fallback", None)
+            else:
+                entry["fallback"] = mode
+            if entry:
+                per[model] = entry
+            else:
+                per.pop(model, None)
+            opts["per_model"] = per
+        else:
+            opts["fallback"] = mode
+        config.save_model_options(opts)
+        state.log_cb(f"◆ fallback={mode} for {model or 'all models'}")
+        return {"ok": True, "model": model, "fallback": mode}
+
     @app.get("/api/model-health")
     async def api_model_health() -> dict:
         """What the proxy has learned about each model from real traffic."""

@@ -212,11 +212,14 @@ async def _rotation_phase(
             parameter" ever appears.
     """
 
-    def _record(status=None, body="", deterministic=False):
+    def _record(status=None, body="", deterministic=False, exhausted=False):
         if outcome_box is not None:
             outcome_box["status"] = status
             outcome_box["body"] = body
             outcome_box["deterministic"] = deterministic
+            # The caller must not score a full upstream worker pool against the
+            # model either — see the circuit-breaker note at the send site.
+            outcome_box["exhausted"] = exhausted
 
     attempts = 0
     exhausted_waits = 0
@@ -311,8 +314,19 @@ async def _rotation_phase(
                 error_body_bytes = None
             await resp.aclose()
             state.log_cb(f"  {log_tag}: key[{idx}] HTTP {err_status}")
-            state.record_model_result(_model, status=err_status)
-            _record(status=err_status, body=error_body)
+            # A full worker pool is not the model's fault any more than it is
+            # the key's. Deciding this BEFORE scoring matters: the exemption
+            # below only skipped the key cooldown, while record_model_result had
+            # already run — so one request during an upstream peak spent seven
+            # attempts, booked seven model failures against a three-failure
+            # threshold, and opened the model circuit for two minutes. With
+            # fallback=off that circuit answers every later request with an
+            # instant 503, which reads as the model being dead when upstream was
+            # merely busy.
+            _exhausted = err_status in (429, 503) and is_resource_exhausted(error_body_bytes)
+            if not _exhausted:
+                state.record_model_result(_model, status=err_status)
+            _record(status=err_status, body=error_body, exhausted=_exhausted)
 
             # The request is wrong, not the key. Stop immediately and hand the
             # provider's own explanation back to the caller.
@@ -337,7 +351,7 @@ async def _rotation_phase(
             # the 503 form fall through to the gateway-timeout branch below,
             # which cooled a key down for every request the shared worker pool
             # refused — draining a healthy 31-key pool during an upstream peak.
-            if err_status in (429, 503) and is_resource_exhausted(error_body_bytes):
+            if _exhausted:
                 exhausted_waits += 1
                 if exhausted_waits > _MAX_EXHAUSTED_WAITS:
                     state.log_cb(f"  {log_tag}: upstream workers full — giving up")
@@ -1203,6 +1217,17 @@ async def handle_responses(
     # ── Circuit breaker: skip dead models, auto-failover to next preset ───
     _req_model = chat_payload.get("model", "")
     if _req_model and state.is_model_circuit_open(_req_model):
+        # Respect user's fallback preference: "off" = never failover, return 503
+        _opts = config.model_options()
+        _fallback_mode = _opts.get("fallback", "off")
+        _per = (_opts.get("per_model") or {}).get(_req_model, {})
+        _fallback_mode = _per.get("fallback", _fallback_mode)
+        if _fallback_mode == "off":
+            state.log_cb(f"🔴 {_req_model} circuit OPEN, fallback=off → 503")
+            return JSONResponse(
+                {"error": f"{_req_model} is down (circuit open), fallback disabled"},
+                status_code=503,
+            )
         _presets = config.load_saved_presets()
         _fallback = next(
             (m for m in _presets if m != _req_model and not state.is_model_circuit_open(m)),

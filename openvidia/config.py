@@ -123,6 +123,11 @@ _MODEL_OPTIONS_DEFAULTS = {
         "medium": {"chat_template_kwargs": {"enable_thinking": True}, "temperature": 0.5},
         "high": {"chat_template_kwargs": {"enable_thinking": True}, "temperature": 0.2},
     },
+    # ── Fallback / failover control ───────────────────────────────────────
+    # "auto" = failover when circuit is open (current behavior)
+    # "off"  = never failover, return 503 if model circuit is open
+    # "on"   = always failover to next healthy preset (future use)
+    "fallback": "off",
     # ── Per-model hardcoded optimizations ─────────────────────────────────
     # These are defaults from NVIDIA docs — the dashboard can still override.
     # Key insight:

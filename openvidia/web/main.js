@@ -162,6 +162,7 @@ async function loadModel() {
   try { const r = await api('GET', '/api/model'); activeModel = r.model || ''; $('activeModelDisplay').textContent = activeModel || 'none' } catch (_) {}
   loadThinking()
   loadEffort()
+  loadFallback()
 }
 
 document.querySelectorAll('.think-btn').forEach(b => {
@@ -234,6 +235,38 @@ async function setEffort(effort) {
     reasoningEffort = effort
     renderEffort()
     toast(`Effort: ${effort}${activeModel ? ' — ' + activeModel : ''}`, 'ok')
+  } catch (_) {}
+}
+
+/* ── Fallback toggle ───────────────────────────
+   When a model's circuit is open, the proxy can either failover to the
+   next healthy preset or return 503. off = never failover, on = always. */
+let fallbackMode = 'off'
+
+document.querySelectorAll('.fallback-btn').forEach(b => {
+  b.addEventListener('click', () => setFallback(b.dataset.fallback))
+})
+
+function renderFallback() {
+  document.querySelectorAll('.fallback-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.fallback === fallbackMode)
+  })
+}
+
+async function loadFallback() {
+  try {
+    const r = await api('GET', '/api/fallback')
+    fallbackMode = r.fallback || 'off'
+    renderFallback()
+  } catch (_) {}
+}
+
+async function setFallback(mode) {
+  try {
+    await api('POST', '/api/fallback', { fallback: mode })
+    fallbackMode = mode
+    renderFallback()
+    toast(`Fallback: ${mode}${activeModel ? ' — ' + activeModel : ''}`, 'ok')
   } catch (_) {}
 }
 

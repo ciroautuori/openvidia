@@ -468,6 +468,17 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         # check the circuit and auto-failover to the next healthy preset.
         requested_model = payload.get("model", "") if isinstance(payload, dict) else ""
         if requested_model and state.is_model_circuit_open(requested_model):
+            # Respect user's fallback preference: "off" = never failover, return 503
+            _opts = config.model_options()
+            _fallback_mode = _opts.get("fallback", "off")
+            _per = (_opts.get("per_model") or {}).get(requested_model, {})
+            _fallback_mode = _per.get("fallback", _fallback_mode)
+            if _fallback_mode == "off":
+                state.log_cb(f"🔴 {requested_model} circuit OPEN, fallback=off → 503")
+                return JSONResponse(
+                    {"error": f"{requested_model} is down (circuit open), fallback disabled"},
+                    status_code=503,
+                )
             # Try to failover to the next working preset
             presets = config.load_saved_presets()
             fallback = next(
@@ -578,7 +589,10 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
             last_status = _outcome["status"]
 
         model_name = payload.get("model", "") if isinstance(payload, dict) else ""
-        if model_name:
+        # Same exemption the rotation loop applies: a saturated upstream worker
+        # pool says nothing about this model, and scoring it here would reopen
+        # the circuit the loop just declined to open.
+        if model_name and not _outcome.get("exhausted"):
             state.record_model_result(model_name, status=last_status)
 
         # A request the provider rejected outright keeps its own status: a 400

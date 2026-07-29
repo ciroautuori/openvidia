@@ -324,6 +324,39 @@ async def test_a_bare_503_still_cools_the_key():
     assert sum(state.is_key_on_cooldown(k) for k in state.keys) == 1
 
 
+async def test_worker_full_does_not_open_the_model_circuit():
+    """A busy worker pool is not the model failing, and must not trip its breaker.
+
+    The key exemption ran too late: record_model_result() had already scored the
+    attempt by the time the ResourceExhausted branch decided not to cool the key
+    down. One request during an upstream peak spends up to seven attempts, so it
+    booked seven failures against a three-failure threshold and shut the model
+    off for two minutes — which, with fallback=off, answers every later request
+    with an instant 503.
+    """
+    state = make_state()
+    outcome: dict = {}
+    client = FakeClient([(503, _WORKER_FULL_503)] * 40)
+
+    resp, key, idx = await run(state, client, outcome_box=outcome)
+
+    assert resp is None, "the whole pool was refused, so the phase gives up"
+    assert not state.is_model_circuit_open("test/model")
+    assert outcome["exhausted"] is True, "the caller needs this to skip its own scoring"
+
+
+async def test_a_bare_503_still_opens_the_model_circuit():
+    """The exemption is for ResourceExhausted only — a model that is genuinely
+    down must still trip the breaker rather than be retried for ever."""
+    state = make_state()
+    client = FakeClient([(503, b'{"detail":"upstream unavailable"}')] * 40)
+
+    resp, key, idx = await run(state, client)
+
+    assert resp is None
+    assert state.is_model_circuit_open("test/model")
+
+
 async def test_gateway_timeout_honours_the_short_retry_after():
     """The log said 10s while the pool actually sat out the 30s default."""
     state = make_state()
