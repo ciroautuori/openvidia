@@ -223,6 +223,8 @@ async def _rotation_phase(
 
     attempts = 0
     exhausted_waits = 0
+    network_errors = 0  # consecutive ConnectTimeout/ConnectError across keys
+    _MAX_NETWORK_ERRORS = 3  # if 3+ keys fail to connect, the network is down
     for pass_num in range(3):
         if pass_num > 0:
             await asyncio.sleep(1.0)
@@ -289,6 +291,34 @@ async def _rotation_phase(
                 break
             except httpx.HTTPError as e:
                 err_msg = str(e) or type(e).__name__
+                # ConnectTimeout / ConnectError / NetworkError are NOT key faults:
+                # they mean the network path to NVIDIA is down or slow. Every key
+                # would fail identically, so cooling them down just drains the
+                # pool one key at a time during a transient blip. Instead, pause
+                # briefly and retry the SAME key rather than rotating to the next
+                # victim. Only after repeated network errors on the same key do
+                # we reluctantly cool it down (maybe its credential is bad).
+                is_network = isinstance(e, (httpx.ConnectTimeout, httpx.ConnectError))
+                if is_network:
+                    network_errors += 1
+                    state.log_cb(f"  {log_tag}: key[{idx}] {err_msg} (network — not a key fault)")
+                    state.end_in_flight(k)
+                    released = True
+                    # If 3+ keys fail to connect, the network is down — stop
+                    # rotating (every key would fail identically) and let the
+                    # caller return 503 instead of draining the pool.
+                    if network_errors >= _MAX_NETWORK_ERRORS:
+                        state.log_cb(
+                            f"  {log_tag}: {network_errors} consecutive network errors "
+                            f"— network appears down, stopping rotation"
+                        )
+                        _record(status=503, body="network unreachable", deterministic=False)
+                        return None, None, None
+                    # Don't cool the key. Brief pause so a transient blip
+                    # clears, then let the next candidate try.
+                    await asyncio.sleep(0.5)
+                    _record(status=None, body=err_msg, deterministic=False)
+                    continue
                 state.log_cb(f"  {log_tag}: key[{idx}] {err_msg} (rotating)")
                 state.end_in_flight(k)
                 released = True
@@ -367,11 +397,15 @@ async def _rotation_phase(
             # NVIDIA's edge gave up waiting for it, and every other key would hit
             # the same wall. Cooling keys down for it empties the pool one 504 at
             # a time, which is precisely what a 26-key pool exists to prevent.
+            # Use 30s cooldown (was 10s) and don't burn the attempt budget: the
+            # model is the bottleneck, not the key, so trying another key just
+            # spreads the same 504 across the pool faster.
             if err_status in _GATEWAY_TIMEOUTS:
                 state.log_cb(
-                    f"  {log_tag}: HTTP {err_status} gateway timeout — key[{idx}] 10s cooldown"
+                    f"  {log_tag}: HTTP {err_status} gateway timeout — key[{idx}] 30s cooldown"
                 )
-                state.mark_key_failed(k, status=err_status, retry_after=10)
+                state.mark_key_failed(k, status=err_status, retry_after=30)
+                attempts -= 1  # Don't burn budget on a model-level timeout
                 continue
             state.mark_key_failed(
                 k, status=err_status, error_body=error_body if error_body else None

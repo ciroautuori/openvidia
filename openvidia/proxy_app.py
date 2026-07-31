@@ -98,6 +98,13 @@ async def _health_check_all(
         # Let 429 cooldowns expire on their own schedule.
         if not force and state.cooldown_status(key) == 429:
             continue
+        # A 403/401 means the key is dead (invalid auth). GET /v1/models may
+        # still return 200 for some dead keys (NVIDIA's auth check is
+        # inconsistent across endpoints), so probing would revive a key that
+        # will just 403 again on chat/completions. Let the 3600s cooldown
+        # expire naturally.
+        if not force and state.cooldown_status(key) in (401, 403):
+            continue
         # Skip keys with most of their cooldown left — probe only when nearing expiry.
         if not force and state.cooldown_remaining(key) > 30:
             continue
