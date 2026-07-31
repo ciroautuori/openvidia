@@ -98,10 +98,13 @@ openvidia
 │  │            │            cooldown?   RPM < 28?       │    │
 │  │            │            skip if yes  skip if no     │    │
 │  │            │                                        │    │
-│  │  On 429: read Retry-After → set cooldown → next key │    │
+│  │  On 429: read Retry-After → set cooldown → next key       │    │
 │  │  On 401/403: cooldown 3600s (dead key)              │    │
 │  │  On 400/404: cooldown 60s (deterministic)           │    │
+│  │  On 504: cooldown 30s (model bottleneck, not key)   │    │
 │  │  On 5xx: cooldown 10s (gateway) / 30s (other)       │    │
+│  │  On network error: no cooldown, 0.5s pause           │    │
+│  │  3 consecutive network errors → stop (network down)│    │
 │  └─────────────────────────────────────────────────────┘    │
 │                          │                                  │
 │                   NVIDIA NIM API                            │
@@ -118,8 +121,10 @@ NVIDIA's free NIM tier limits each API key to ~40 RPM. Aggressive bursts trigger
 - **Pools multiple keys** behind a single endpoint
 - **Rotates automatically** on 429/401/403/5xx — zero manual intervention
 - **Per-key cooldown timers** — on real 429s, trusts `Retry-After` exactly (no multiplication); distinguishes transient worker saturation (`ResourceExhausted`) from true RPM limits and never burns key cooldowns for the former
+- **Network-error circuit breaker** — `ConnectTimeout`/`ConnectError` don't trigger key cooldown (the key is fine). After 3 consecutive network errors across different keys, rotation stops entirely and returns 503 (the network is down, no key can help)
+- **504 model timeouts don't burn keys** — gateway timeouts cool the key for 30s but don't consume the attempt budget, since the model (not the key) is the bottleneck
 - **Sliding-window RPM limiting** — keeps each key under 28 RPM (safe margin below 40)
-- **Health checks** — revives keys whose cooldowns have expired
+- **Health checks** — revives keys whose cooldowns have expired, but skips 401/403 invalid keys (dead keys stay dead)
 - **No silent model substitution** — the model you select is the model that answers; if it fails on every key you are told so, never handed output from a different model
 - **Auto-compaction** — summarizes long histories so requests never fail on context overflow ([details](#auto-compaction))
 
@@ -316,8 +321,9 @@ Streaming (SSE) is fully supported — tokens flow through unbuffered.
 | **429** (worker concurrency) | 0 — retried after 0.8s pause | `ResourceExhausted: Worker local total request limit reached` — transient pool saturation, key is healthy |
 | **401 / 403** | 3600s | Dead key — don't waste requests |
 | **400 / 404** | 60s | Deterministic request error — short cooldown, key untouched for rotation. Every key gets the same error, so rotating only burns cooldown budget. |
-| **5xx** | 10s (502/503/504 gateway timeout) / 30s (500 other) | Server error — retry soon |
-| **Network error** | 30s | Transient connectivity issue |
+| **504** (gateway timeout) | 30s | Model is the bottleneck, not the key — longer cooldown, but doesn't burn the attempt budget |
+| **5xx** (other) | 10s (502/503) / 30s (500) | Server error — retry soon |
+| **Network error** (ConnectTimeout/ConnectError) | 0 — 0.5s pause, no cooldown | Network is down, not the key. After 3 consecutive errors across different keys, rotation stops entirely (503). |
 
 > **Retry-After is used as-is.** When NVIDIA provides a `Retry-After` header (e.g. 60s), the cooldown is exactly that value. Earlier versions multiplied it by an adaptive factor (`1.5^N`), which caused a doom loop: at 3 failures a 60s backoff became 135s and all 26 keys locked out longer than the real rate-limit window required.
 >
@@ -339,8 +345,10 @@ Request arrives
     │   │                   → 400/404? set 60s cooldown, next key
     │   │                   → 429 ResourceExhausted? pause 0.8s, retry (key untouched)
     │   │                   → 429 rate-limit? use Retry-After as-is, set cooldown, next key
-    │   │                   → 401? set 3600s cooldown, next key
-    │   │                   → 5xx? set 10s (502/503/504) or 30s (other), next key
+    │   │                   → 401/403? set 3600s cooldown, next key
+    │   │                   → 504? set 30s cooldown, next key (doesn't burn attempt budget)
+    │   │                   → 5xx? set 10s (502/503) or 30s (500), next key
+    │   │                   → network error? 0.5s pause, key untouched (3 consecutive → stop)
     │   └─ (max 5 sends per pass, 3 passes with 1s pause between)
     │
     └─ All candidates exhausted? → 503 naming the model (never a substitute model)
@@ -349,7 +357,7 @@ Request arrives
 ### Health Check
 
 Every 60 seconds:
-1. Finds keys still on cooldown
+1. Finds keys still on cooldown (skips 401/403 invalid keys — they're dead, not temporarily rate-limited)
 2. Sends a lightweight `GET /v1/models` probe
 3. If the key responds OK — clears the cooldown (revived)
 4. If still failing — leaves the cooldown in place
