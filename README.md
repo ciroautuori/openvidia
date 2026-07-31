@@ -98,7 +98,7 @@ openvidia
 │  │            │            cooldown?   RPM < 28?       │    │
 │  │            │            skip if yes  skip if no     │    │
 │  │            │                                        │    │
-│  │  On 429: read Retry-After → set cooldown → next key      │    │
+│  │  On 429: read Retry-After → set cooldown → next key │    │
 │  │  On 401/403: cooldown 3600s (dead key)              │    │
 │  │  On 400/404: cooldown 60s (deterministic)           │    │
 │  │  On 504: cooldown 30s (model bottleneck, not key)   │    │
