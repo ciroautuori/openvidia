@@ -457,3 +457,11 @@ def opencode_config_path() -> Path:
     if xdg:
         return Path(xdg) / "opencode" / "opencode.json"
     return Path.home() / ".config" / "opencode" / "opencode.json"
+
+
+def jcode_config_path() -> Path:
+    """Path to the Jcode config file (~/.jcode/config.toml).
+
+    Jcode uses a fixed location (not XDG), the same on every platform.
+    """
+    return Path.home() / ".jcode" / "config.toml"

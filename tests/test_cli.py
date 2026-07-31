@@ -144,7 +144,7 @@ def test_setup_keeps_a_real_nvidia_provider(opencode_cfg):
 
 
 def test_known_targets_cover_the_documented_clis():
-    assert set(m._cli_targets()) >= {"opencode", "codex", "claude", "grok"}
+    assert set(m._cli_targets()) >= {"opencode", "codex", "claude", "grok", "jcode"}
 
 
 def test_claude_target_uses_the_anthropic_variables():
@@ -154,7 +154,7 @@ def test_claude_target_uses_the_anthropic_variables():
 
 
 def test_openai_compatible_targets_point_at_the_v1_base():
-    for name in ("opencode", "codex", "grok"):
+    for name in ("opencode", "codex", "grok", "jcode"):
         assert m._cli_targets()[name]["env"]["OPENAI_BASE_URL"] == m.BASE_URL
 
 
@@ -238,3 +238,80 @@ def test_codex_target_explains_its_provider_block_instead_of_writing_it():
     note = m._cli_targets()["codex"].get("note", "")
     assert "config.toml" in note
     assert "model_providers.openvidia" in note
+
+
+# --------------------------------------------------------------------------- #
+# Jcode setup: additive, backed up, no clobber
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def jcode_cfg(tmp_path, monkeypatch):
+    """A Jcode config dir + path the setup will find."""
+    jcode_dir = tmp_path / ".jcode"
+    jcode_dir.mkdir()
+    p = jcode_dir / "config.toml"
+    monkeypatch.setattr(m.config, "jcode_config_path", lambda: p)
+    return p
+
+
+def test_jcode_setup_adds_provider_to_empty_config(jcode_cfg):
+    jcode_cfg.write_text("")
+    assert m._setup_jcode() is True
+    import tomlkit
+
+    doc = tomlkit.parse(jcode_cfg.read_text())
+    assert doc["providers"]["openvidia"]["base_url"] == m.BASE_URL
+    assert doc["provider"]["default_provider"] == "openvidia"
+
+
+def test_jcode_setup_does_not_steal_a_provider_the_user_chose(jcode_cfg):
+    jcode_cfg.write_text(
+        '[provider]\ndefault_provider = "anthropic"\ndefault_model = "claude-sonnet-4"\n'
+    )
+    m._setup_jcode()
+    import tomlkit
+
+    doc = tomlkit.parse(jcode_cfg.read_text())
+    assert doc["provider"]["default_provider"] == "anthropic"
+
+
+def test_jcode_setup_backs_up_before_writing(jcode_cfg):
+    jcode_cfg.write_text('[provider]\ndefault_provider = "keep-me"\n')
+    m._setup_jcode()
+    backups = list(jcode_cfg.parent.glob("config_backup_*.toml"))
+    assert backups, "no backup was taken before editing Jcode config"
+
+
+def test_jcode_setup_is_idempotent(jcode_cfg):
+    jcode_cfg.write_text("")
+    m._setup_jcode()
+    first = jcode_cfg.read_text()
+    m._setup_jcode()
+    assert jcode_cfg.read_text() == first
+
+
+def test_jcode_setup_reports_missing_jcode(tmp_path, monkeypatch, capsys):
+    """When ~/.jcode doesn't exist, skip gracefully."""
+    missing = tmp_path / "no-jcode" / "config.toml"
+    monkeypatch.setattr(m.config, "jcode_config_path", lambda: missing)
+    assert m._setup_jcode() is False
+    assert "not found" in capsys.readouterr().out
+
+
+def test_jcode_setup_preserves_existing_comments(jcode_cfg):
+    jcode_cfg.write_text("# My Jcode config\n[display]\nemoji = true\n")
+    m._setup_jcode()
+    content = jcode_cfg.read_text()
+    assert "# My Jcode config" in content
+    assert "emoji = true" in content
+
+
+def test_jcode_target_uses_openai_compatible_vars():
+    env = m._cli_targets()["jcode"]["env"]
+    assert env["OPENAI_BASE_URL"] == m.BASE_URL
+    assert "OPENAI_API_KEY" in env
+
+
+def test_known_targets_now_include_jcode():
+    assert "jcode" in m._cli_targets()

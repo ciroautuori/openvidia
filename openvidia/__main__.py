@@ -7,7 +7,7 @@ Install:
 Usage:
     openvidia                    # start proxy + desktop window
     openvidia foreground         # foreground mode (logs stdout)
-    openvidia setup              # configure opencode (the only persistent edit)
+    openvidia setup              # configure opencode + Jcode (the persistent edits)
     openvidia run <cli> [args]   # run any CLI against the proxy, writing nothing
 
 Dashboard + API at http://localhost:1919
@@ -200,6 +200,110 @@ def _setup_opencode():
     return True
 
 
+def _setup_jcode():
+    """Configure Jcode (~/.jcode/config.toml) to use OpenVidia as a provider.
+
+    Jcode is an open-source coding agent (https://github.com/1jehuang/jcode)
+    that supports OpenAI-compatible providers via TOML config. This adds the
+    ``openvidia`` provider block and sets it as default — but only when no
+    provider is configured yet, so a user who picked another provider keeps it.
+
+    Uses tomlkit to preserve existing comments and formatting.
+    """
+    jc_path = config.jcode_config_path()
+    if not jc_path.parent.exists():
+        print(f"ℹ Jcode not found ({jc_path.parent} does not exist) — skipping")
+        return False
+
+    try:
+        import tomlkit
+    except ImportError:
+        print("ℹ tomlkit not installed — skipping Jcode setup")
+        return False
+
+    # Read existing config (or start fresh)
+    if jc_path.exists():
+        try:
+            from .safe_file import create_backup
+
+            create_backup(jc_path)
+        except OSError as e:
+            print(f"✗ could not back up {jc_path}: {e} — not writing")
+            return False
+        try:
+            doc = tomlkit.parse(jc_path.read_text())
+        except Exception:
+            print(f"✗ Invalid Jcode config at {jc_path} — skipping")
+            return False
+    else:
+        doc = tomlkit.document()
+
+    changed = False
+
+    # ── Provider block: [providers.openvidia] ──────────────────────────
+    providers = doc.get("providers", None)
+    if providers is None:
+        providers = tomlkit.table()
+        doc["providers"] = providers
+        changed = True
+
+    if "openvidia" not in providers:
+        ov = tomlkit.table()
+        ov["type"] = "openai-compatible"
+        ov["base_url"] = BASE_URL
+        ov["auth"] = "none"
+        ov["default_model"] = "openvidia"
+        ov["requires_api_key"] = False
+        ov["model_catalog"] = True
+        ov["stream_idle_timeout_secs"] = 300
+
+        # Model entries
+        models = tomlkit.aot()
+        m1 = tomlkit.table()
+        m1["id"] = "openvidia"
+        m1["context_window"] = 202752
+        models.append(m1)
+        ov["models"] = models
+
+        providers["openvidia"] = ov
+        changed = True
+        print("✓ Added OpenVidia provider to Jcode")
+    else:
+        # Ensure base_url is current (port could have changed)
+        ov = providers["openvidia"]
+        if ov.get("base_url") != BASE_URL:
+            ov["base_url"] = BASE_URL
+            changed = True
+            print("✓ Updated OpenVidia base_url in Jcode")
+
+    # ── Default provider: only when unset ──────────────────────────────
+    provider_section = doc.get("provider", None)
+    if provider_section is None:
+        provider_section = tomlkit.table()
+        doc["provider"] = provider_section
+        changed = True
+
+    current_default = provider_section.get("default_provider")
+    if not current_default:
+        provider_section["default_provider"] = "openvidia"
+        changed = True
+        print("✓ Default provider set to openvidia")
+    elif current_default != "openvidia":
+        print(f"ℹ Leaving your Jcode default provider as {current_default}")
+
+    current_model = provider_section.get("default_model")
+    if not current_model:
+        provider_section["default_model"] = "openvidia"
+        changed = True
+        print("✓ Default model set to openvidia")
+
+    if changed:
+        config.atomic_write(jc_path, tomlkit.dumps(doc), mode=0o644)
+
+    print(f"✓ OpenVidia provider ready in Jcode → {jc_path}")
+    return True
+
+
 def _setup_proxy_config():
     """Ensure ~/.config/openvidia/proxy_config.json exists with default settings."""
     cfg_dir = config.config_dir()
@@ -267,6 +371,10 @@ _DEFAULT_CLI_TARGETS: dict[str, dict] = {
     },
     "grok": {
         "argv": ["grok"],
+        "env": {"OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": ENV_VAL, ENV_VAR: ENV_VAL},
+    },
+    "jcode": {
+        "argv": ["jcode"],
         "env": {"OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": ENV_VAL, ENV_VAR: ENV_VAL},
     },
 }
@@ -346,10 +454,10 @@ def _proxy_is_up(port: int) -> bool:
 
 
 def _setup_cmd():
-    """``openvidia setup`` — configure opencode, and only opencode.
+    """``openvidia setup`` — configure opencode and Jcode.
 
-    opencode is the one CLI this project treats as first-class, so it is the
-    one place a persistent config edit is worth making. Everything else runs
+    opencode and Jcode are the two CLIs this project treats as first-class,
+    so they get a persistent config edit on setup. Everything else runs
     through `openvidia run`, which writes nothing.
     """
     print("OpenVidia setup")
@@ -358,11 +466,13 @@ def _setup_cmd():
     print()
     _setup_opencode()
     print()
+    _setup_jcode()
+    print()
     print(f"Proxy:      {BASE_URL}")
     print(f"Dashboard:  {ROOT_URL}")
     print()
     print("Other CLIs need no setup — run them against the proxy on demand:")
-    for name in sorted(n for n in _cli_targets() if n != "opencode"):
+    for name in sorted(n for n in _cli_targets() if n not in ("opencode", "jcode")):
         print(f"  openvidia run {name}")
     sys.exit(0)
 
@@ -641,7 +751,7 @@ USAGE = f"""OpenVidia — multi-key proxy for NVIDIA NIM
 
   openvidia                    start the proxy and open the dashboard
   openvidia foreground         start the proxy in this terminal (logs to stdout)
-  openvidia setup              configure opencode to use the proxy (backs up first)
+  openvidia setup              configure opencode + Jcode to use the proxy (backs up first)
   openvidia run <cli> [args]   run another CLI against the proxy, changing no files
   openvidia --help             this message
 

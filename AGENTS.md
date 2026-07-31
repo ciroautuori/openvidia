@@ -52,7 +52,7 @@ Client CLI → localhost:1919/v1 → Proxy Engine → integrate.api.nvidia.com/v
 ## CLI setup
 
 ```bash
-openvidia setup    # configura opencode + Codex + Grok automaticamente
+openvidia setup    # configura opencode + Codex + Grok + Jcode automaticamente
 openvidia          # avvia proxy + dashboard desktop
 ```
 

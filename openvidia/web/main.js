@@ -529,13 +529,14 @@ new EventSource(`/api/logs/stream?token=${encodeURIComponent(controlToken)}`).on
   } catch (_) {}
 }
 
-/* ── CLI Setup tab (opencode / Codex / Claude Code / Grok) ──────── */
+/* ── CLI Setup tab (opencode / Codex / Claude Code / Grok / Jcode) ──────── */
 let currentCli = 'opencode'
 const CLI_TABS = [
   { id: 'opencode', label: 'opencode', icon: '⚡' },
   { id: 'codex',    label: 'Codex',    icon: '⬡' },
   { id: 'claude',   label: 'Claude',   icon: '✦' },
   { id: 'grok',     label: 'Grok',     icon: '✸' },
+  { id: 'jcode',    label: 'Jcode',    icon: '◆' },
 ]
 
 function renderCliTabs() {
@@ -619,6 +620,30 @@ base_url = "http://localhost:1919/v1"
 api_backend = "chat_completions"
 context_window = 128000` },
         { label: 'Run', code: `grok -m ${m} "explain this codebase"` },
+      ],
+    },
+    jcode: {
+      title: 'Jcode',
+      steps: [
+        { label: 'Auto-setup (configures ~/.jcode/config.toml)', code: `openvidia setup` },
+        { label: 'Manual — ~/.jcode/config.toml', code: `[provider]
+default_provider = "openvidia"
+default_model = "${m}"
+
+[providers.openvidia]
+type = "openai-compatible"
+base_url = "http://localhost:1919/v1"
+auth = "none"
+default_model = "${m}"
+requires_api_key = false
+model_catalog = true
+stream_idle_timeout_secs = 300
+
+[[providers.openvidia.models]]
+id = "${m}"
+context_window = 202752` },
+        { label: 'Run', code: `jcode` },
+        { label: 'Switch model inside Jcode', code: `/model openvidia` },
       ],
     },
   }

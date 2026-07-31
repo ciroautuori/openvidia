@@ -16,7 +16,7 @@
 
 Pool multiple free-tier API keys behind one endpoint. Automatic rotation, per-key cooldown, sliding-window RPM limiting, and a compact desktop app — no browser needed.
 
-Built for [opencode](https://opencode.ai), [Codex CLI](https://github.com/openai/codex), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Grok](https://x.ai), and any OpenAI-compatible client.
+Built for [opencode](https://opencode.ai), [Codex CLI](https://github.com/openai/codex), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Grok](https://x.ai), [Jcode](https://github.com/1jehuang/jcode), and any OpenAI-compatible client.
 
 ---
 
@@ -147,6 +147,7 @@ Supported clients:
 | **Codex CLI** | OpenAI Responses API | `http://localhost:1919/v1` | ✅ `openvidia setup` |
 | **Claude Code** | Anthropic Messages API | `http://localhost:1919` | ❌ manual env vars |
 | **Grok (xAI)** | OpenAI-compatible | `http://localhost:1919/v1` | ✅ `openvidia setup` |
+| **Jcode** | OpenAI-compatible | `http://localhost:1919/v1` | ✅ `openvidia setup` |
 
 ---
 
@@ -243,6 +244,42 @@ base_url = "http://localhost:1919/v1"
 api_backend = "chat_completions"
 context_window = 128000
 ```
+
+---
+
+### Jcode
+
+```bash
+openvidia setup    # writes ~/.jcode/config.toml automatically
+jcode               # then /model openvidia to switch
+```
+
+Manual (if `setup` didn't find `~/.jcode/`):
+
+```toml
+# ~/.jcode/config.toml
+
+[provider]
+default_provider = "openvidia"
+default_model = "openvidia"
+
+[providers.openvidia]
+type = "openai-compatible"
+base_url = "http://localhost:1919/v1"
+auth = "none"
+default_model = "openvidia"
+requires_api_key = false
+model_catalog = true
+stream_idle_timeout_secs = 300
+
+[[providers.openvidia.models]]
+id = "openvidia"
+context_window = 202752
+```
+
+> `openvidia setup` adds the `[providers.openvidia]` block and sets it as default — but only when no provider is configured yet. If you already use another provider, it leaves your choice alone and you can switch with `/model openvidia` inside Jcode.
+>
+> Jcode is an open-source coding agent: [github.com/1jehuang/jcode](https://github.com/1jehuang/jcode)
 
 ---
 
