@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Runner self-hosted su soliso: i job hosted richiedono minuti GitHub Actions
+    # e l'account è bloccato per billing — il self-hosted ne è immune.
+    runs-on: [self-hosted, soliso, openvidia]
     steps:
       - uses: actions/checkout@v4
         with:
