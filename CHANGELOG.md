@@ -5,7 +5,7 @@ All notable changes to OpenVidia will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.1.0] - 2026-08-01
 
 ### Added
 - **Thinking toggle** — `auto` / `on` / `off` next to the active model. A
@@ -37,6 +37,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CONTRIBUTING.md guide for new contributors
 - SECURITY.md with vulnerability disclosure process
 - Error logging improvements for better debugging
+- **Graph Engine** — `openvidia.graph_engine`: a `Hub` with mailboxes, `run_agent`
+  with `max_iterations` / `budget_tokens` / `timeout_s` caps, spawn-and-kill
+  subagent tools with a depth bound, and `generate_and_verify` generator-verifier
+  loops with explicit rubrics (`APPROVED` / `REJECTED`). 10 regression tests in
+  `tests/test_graph_engine.py`
+- **Per-key × per-model scoring** — `KeyModelHealth` learns a composite score
+  (success rate + median time to first token) from live traffic; candidate
+  selection now prefers the best key for the requested model
+- **Adaptive RPM ceiling** — each key's sliding window learns the real ceiling
+  from `Retry-After` headers on 429s and never spends the full 28 RPM budget
+  against a tighter upstream limit
+- **Multi-endpoint NVIDIA routing** — extra upstream endpoints via
+  `endpoints.json` or `OPENVIDIA_UPSTREAM_ENDPOINTS`; 60s blacklist on ≥500
+  errors, automatic recovery on success
+- **Multi-node sync via Redis (opt-in)** — cooldowns, invalid keys, pool
+  throttling and model circuit breakers shared across instances over pub/sub
+  (`redis_config.json` / `OPENVIDIA_REDIS_URL`, extra `openvidia[redis]`)
+- **Embedding cache** — in-memory cache for `/v1/embeddings` (TTL 300s, SHA-256
+  keyed by model + input); hit/miss counters on `/ops/health`
+- **Free-tier provider fallback** — when every NVIDIA key is exhausted, the
+  catch-all fails over to OpenAI-compatible providers declared in
+  `providers.json` (unresolved keys skip the provider silently)
+- **Ops endpoints** — `/ops/keys` and `/ops/health`, protected by the
+  control-plane token, exposing pool, models, endpoints, embedding cache and
+  Redis state
+- Jcode as a first-class CLI target (`openvidia setup` configures it)
+- **Smart key rotation** — rotation ordered by in-flight cost, per-key RPM and
+  consecutive failures, so concurrent traffic spreads across the pool instead
+  of piling onto key[0]
+- **Network-error circuit breaker** — three consecutive network errors stop
+  rotation (503) instead of burning every key; 504 timeouts cool the key for
+  30s without consuming the attempt budget
 
 ### Changed
 - Compaction serves a cached summary plus every later message verbatim while
@@ -48,6 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Concurrent requests on one conversation share a single summarize
 - Version bumped from 2.0.0 to 1.0.0 (first stable release)
 - Test suite uses pytest with async support
+- Key selection is model-aware: candidates are ordered by a per-key × per-model
+  score learned from live traffic (see Added)
+- The test suite ships 297 regression tests (proxy, shims, compaction, graph
+  engine, delivery features)
 
 ### Removed
 - **The pinned default model.** `DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"`

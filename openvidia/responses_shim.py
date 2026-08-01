@@ -285,6 +285,7 @@ async def _rotation_phase(
                     f"— model too slow, not a key fault"
                 )
                 state.record_model_result(_model, too_slow=True)
+                state.record_key_model_result(k, _model, ok=False)
                 state.end_in_flight(k)
                 released = True
                 _record(status=504, body="model produced no first byte", deterministic=False)
@@ -332,6 +333,7 @@ async def _rotation_phase(
                     state.end_in_flight(k)
             if resp.status_code == 200:
                 state.record_model_result(_model, ok=True, ttft=time.monotonic() - _t0)
+                state.record_key_model_result(k, _model, ok=True, ttft=time.monotonic() - _t0)
                 return resp, k, idx
             err_status = resp.status_code
             # Read error body for detailed logging before closing
@@ -356,6 +358,7 @@ async def _rotation_phase(
             _exhausted = err_status in (429, 503) and is_resource_exhausted(error_body_bytes)
             if not _exhausted:
                 state.record_model_result(_model, status=err_status)
+                state.record_key_model_result(k, _model, ok=False)
             _record(status=err_status, body=error_body, exhausted=_exhausted)
 
             # The request is wrong, not the key. Stop immediately and hand the

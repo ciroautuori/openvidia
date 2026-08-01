@@ -6,7 +6,7 @@
 ![Ruff](https://img.shields.io/badge/Ruff-passed-261230?logo=ruff&logoColor=white)
 ![Stars](https://img.shields.io/github/stars/ciroautuori/openvidia?style=social)
 ![Last Commit](https://img.shields.io/github/last-commit/ciroautuori/openvidia)
-![Version](https://img.shields.io/badge/version-2.0.0-green)
+![Version](https://img.shields.io/badge/version-2.1.0-green)
 
 **Multi-key proxy for NVIDIA NIM with a native desktop dashboard.**
 
@@ -123,10 +123,16 @@ NVIDIA's free NIM tier limits each API key to ~40 RPM. Aggressive bursts trigger
 - **Per-key cooldown timers** — on real 429s, trusts `Retry-After` exactly (no multiplication); distinguishes transient worker saturation (`ResourceExhausted`) from true RPM limits and never burns key cooldowns for the former
 - **Network-error circuit breaker** — `ConnectTimeout`/`ConnectError` don't trigger key cooldown (the key is fine). After 3 consecutive network errors across different keys, rotation stops entirely and returns 503 (the network is down, no key can help)
 - **504 model timeouts don't burn keys** — gateway timeouts cool the key for 30s but don't consume the attempt budget, since the model (not the key) is the bottleneck
-- **Sliding-window RPM limiting** — keeps each key under 28 RPM (safe margin below 40)
+- **Sliding-window RPM limiting** — keeps each key under 28 RPM (safe margin below 40); the ceiling self-tunes down from real `Retry-After` headers, so the pool never spends its full budget against a tighter upstream limit
 - **Health checks** — revives keys whose cooldowns have expired, but skips 401/403 invalid keys (dead keys stay dead)
 - **No silent model substitution** — the model you select is the model that answers; if it fails on every key you are told so, never handed output from a different model
 - **Auto-compaction** — summarizes long histories so requests never fail on context overflow ([details](#auto-compaction))
+- **Per-key × per-model scoring** — rotation is ordered by a composite score (success rate + median time to first token) learned per key and per model from live traffic: the best key for the requested model goes first
+- **Multi-endpoint routing** — extra NVIDIA endpoints (`endpoints.json` or `OPENVIDIA_UPSTREAM_ENDPOINTS`), a 60s blacklist on ≥500 errors, automatic recovery
+- **Multi-node sync via Redis (opt-in)** — cooldowns, invalid keys, pool throttling and model circuit breakers shared across instances ([details](#resilience--scale))
+- **Embedding cache** — `/v1/embeddings` hits are served from memory (TTL 300s) without touching upstream quota
+- **Free-tier provider fallback** — when every NVIDIA key is exhausted, requests fail over to OpenAI-compatible providers declared in `providers.json` ([details](#resilience--scale))
+- **Graph engine** — programmatic multi-agent orchestration (Hub, run_agent, generator-verifier loops) on top of the proxy ([details](#graph-engine))
 
 ---
 
@@ -507,6 +513,9 @@ update-desktop-database ~/.local/share/applications/
 | `timeouts.json` | Upstream timeouts (optional — see [Slow models](#slow-models)) |
 | `model_limits.json` | Context windows the proxy learned by itself — never edit by hand |
 | `model_options.json` | Reasoning toggle + the payload used to express it (see [Thinking](#thinking-reasoning-toggle)) |
+| `endpoints.json` | Extra NVIDIA upstream endpoints (optional — see [Resilience & Scale](#resilience--scale)) |
+| `redis_config.json` | Redis URL for multi-node sync (optional — `OPENVIDIA_REDIS_URL` also works) |
+| `providers.json` | Free-tier fallback providers (optional — name, base URL, env var for the key, model map) |
 
 Add keys via the dashboard (**Keys** section) or edit `keys.json`:
 
@@ -663,6 +672,96 @@ DEFAULT_COOLDOWN = 30.0   # Network errors, unknown 5xx
 | `POST` | `/api/restart` | Zero-downtime restart (spawn new, kill old) |
 | `GET` | `/api/logs/stream` | SSE log stream (real-time) |
 
+### Ops (control plane — token protected)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/ops/keys` | Per-key status: cooldown, RPM + learned ceiling, per-model score, in-flight |
+| `GET` | `/ops/health` | Pool, per-model health, endpoints, embedding cache, Redis sync, recent logs |
+
+---
+
+## Graph Engine
+
+Programmatic multi-agent orchestration on top of the proxy, following the
+[graph-engine coordination patterns](https://www.anthropic.com/engineering/graph-engine-coordination):
+a single `Hub` owns mailboxes and tasks, agents run with hard caps, and workers
+can be spawned, messaged and killed from inside the loop. Runs on any model the
+proxy serves.
+
+```python
+import asyncio
+from openvidia import Hub, Provider, ToolSpec, run_agent
+
+async def add(args, ctx):
+    return str(args["a"] + args["b"])
+
+async def main():
+    hub = Hub(default_provider=Provider())  # http://127.0.0.1:1919/v1 — the proxy above
+    try:
+        result = await run_agent(
+            hub, "math",
+            system="You are a calculator. Always use the add tool.",
+            first_turn="What is 5 + 2?",
+            tools=[ToolSpec(
+                name="add", description="Sum two integers",
+                handler=add,
+                parameters={"type": "object", "properties": {
+                    "a": {"type": "integer"}, "b": {"type": "integer"}},
+                    "required": ["a", "b"]},
+            )],
+        )
+        print(result)
+    finally:
+        await hub.close()
+```
+
+Highlights: `run_agent` caps every run with `max_iterations`, `budget_tokens`
+and `timeout_s`; `graph_tools(hub, worker_factory=...)` provides
+`get_status`, `send_message`, `wait_for_message`, `create_subagents` (depth-bound:
+workers cannot spawn workers) and `kill_subagents`; `generate_and_verify` runs
+generator → verifier loops with explicit rubrics until `APPROVED` or
+`max_rounds`; providers are swappable per worker (a `Provider` or a
+`Callable[[str], Provider]`). 10 regression tests ship in `tests/test_graph_engine.py`.
+
+---
+
+## Resilience & Scale
+
+Beyond the core pool, OpenVidia is built to survive upstream trouble and to
+scale across machines.
+
+- **Multi-endpoint routing** — by default requests go to
+  `integrate.api.nvidia.com`; add endpoints via `endpoints.json` or
+  `OPENVIDIA_UPSTREAM_ENDPOINTS` (comma-separated). A status ≥500 blacklists an
+  endpoint for 60s; a success revives it. Deterministic client errors never
+  retry on another endpoint.
+- **Multi-node sync (Redis, opt-in)** — one proxy per machine, shared state:
+  cooldowns, invalid keys, pool throttling and model circuit breakers propagate
+  over pub/sub so a 429 learned on node A protects node B. Enable with
+  `OPENVIDIA_REDIS_URL` or `redis_config.json` (`{"url": "..."}`); install the
+  extra with `pip install "openvidia[redis]"`.
+- **Embedding cache** — repeated `/v1/embeddings` requests (same model + input)
+  are answered from an in-memory cache (TTL 300s) keyed by SHA-256; hit/miss
+  counters are exposed on `/ops/health`.
+- **Free-tier provider fallback** — when every NVIDIA key is exhausted, the
+  catch-all fails over to OpenAI-compatible providers listed in
+  `providers.json`:
+
+  ```json
+  [
+    {
+      "name": "glm",
+      "base_url": "https://api.example.com/v1",
+      "api_key_env": "GLM_API_KEY",
+      "models": { "deepseek-ai/deepseek-v4-flash": "glm-5" }
+    }
+  ]
+  ```
+
+  A provider without its `api_key_env` set in the environment is skipped
+  silently; model names are rewritten through the `models` map.
+
 ---
 
 ## Tech Stack
@@ -675,6 +774,7 @@ DEFAULT_COOLDOWN = 30.0   # Network errors, unknown 5xx
 - **[tomlkit](https://github.com/sdispater/tomlkit)** — TOML config editing (preserves comments)
 - **Vanilla HTML/CSS/JS** — zero frontend build, no node_modules
 - **Python 3.12+** — single process, no external services
+- **[redis](https://redis.io/)** (optional) — multi-node state sync via `redis-py`
 
 ---
 

@@ -137,15 +137,29 @@ class RpmTracker:
     Per-key adaptive ceiling: when NVIDIA's 429 response or Retry-After hint
     a lower effective RPM than MAX_RPM, the key lowers its own ceiling so the
     scheduler throttles it before a 429 actually occurs instead of after.
+
+    ``observed_ceiling`` is the rate the upstream *explicitly* allowed with a
+    Retry-After header (60/retry_after). It is stricter than the halving rule
+    because it encodes the server's own throughput estimate: a 30s wait means
+    2 RPM, which halving would never reach. ``can_send`` respects it until
+    successful requests earn the ceiling back.
     """
 
-    __slots__ = ("timestamps", "window", "max_rpm")
+    __slots__ = ("timestamps", "window", "max_rpm", "observed_ceiling")
 
     def __init__(self, window: float = RPM_WINDOW, max_rpm: int = 0):
         self.timestamps: deque[float] = deque()
         self.window = window
         # 0 = inherit global MAX_RPM (legacy default).
         self.max_rpm = max_rpm
+        # 0 = no upstream hint received; learn from Retry-After on 429.
+        self.observed_ceiling = 0
+
+    def learn_from_retry_after(self, retry_after_s: float) -> None:
+        """Record the ceiling the server implied with its Retry-After."""
+        implied = max(1, int(60.0 / max(1.0, retry_after_s)))
+        if self.observed_ceiling == 0 or implied < self.observed_ceiling:
+            self.observed_ceiling = implied
 
     def record(self) -> None:
         now = time.time()
@@ -158,6 +172,8 @@ class RpmTracker:
 
     def can_send(self, max_rpm: int = MAX_RPM) -> bool:
         ceiling = self.max_rpm if self.max_rpm and self.max_rpm < max_rpm else max_rpm
+        if self.observed_ceiling:
+            ceiling = min(ceiling, self.observed_ceiling)
         return self.count() < ceiling
 
     def _prune(self, now: float | None = None) -> None:
@@ -180,6 +196,50 @@ class KeyUsage:
         self.failed = 0
         self.last_used = 0.0
         self.last_error = ""
+
+
+class KeyModelHealth:
+    """Per-(key, model) health, measured from real traffic.
+
+    A key that answers a model in 300ms is worth more than one that answers
+    the same model in 30s, and the difference is invisible in the per-key and
+    per-model aggregates — only the cross product sees it. ``score()`` folds
+    success rate and median TTFT into a 0..1 value used to break scheduling
+    ties: keys with a proven record on the requested model are preferred,
+    everything else stays untouched.
+    """
+
+    __slots__ = ("requests", "success", "ttfts", "consecutive_failures")
+
+    def __init__(self):
+        self.requests = 0
+        self.success = 0
+        self.ttfts: deque[float] = deque(maxlen=20)
+        self.consecutive_failures = 0
+
+    def score(self) -> float:
+        """0..1, higher is better. No data yet → neutral 0.5 (no bias)."""
+        if not self.requests:
+            return 0.5
+        success_rate = self.success / self.requests
+        if self.ttfts:
+            # Penalty grows from 0 (instant) to 1 at 30s median TTFT.
+            s = sorted(self.ttfts)
+            median = s[len(s) // 2]
+            latency_penalty = min(1.0, median / 30.0)
+        else:
+            latency_penalty = 0.0
+        return 0.6 * success_rate + 0.4 * (1.0 - latency_penalty)
+
+    def as_dict(self) -> dict:
+        s = sorted(self.ttfts)
+        return {
+            "requests": self.requests,
+            "success": self.success,
+            "median_ttft": round(s[len(s) // 2], 1) if s else None,
+            "consecutive_failures": self.consecutive_failures,
+            "score": round(self.score(), 2),
+        }
 
 
 class ModelHealth:
@@ -308,6 +368,7 @@ class ProxyState:
         stats: ProxyStats,
         log_cb: Callable[[str], None],
         port: int = 1919,
+        redis_sync=None,
     ):
         self._keys: list[str] = list(keys)
         self._key_states: dict[str, KeyState] = {k: KeyState(k) for k in keys}
@@ -330,6 +391,10 @@ class ProxyState:
         self.pool_throttled_until: float = 0.0
         # Per-model health, learned from real traffic (see ModelHealth).
         self.model_health: dict[str, ModelHealth] = {}
+        # Per-(key, model) health, learned from real traffic (KeyModelHealth).
+        self.key_model_health: dict[tuple[str, str], KeyModelHealth] = {}
+        # Optional cross-node synchronisation (Redis). None = single-node.
+        self.redis_sync = redis_sync
 
         try:
             self.loop = asyncio.get_running_loop()
@@ -415,6 +480,13 @@ class ProxyState:
         self.cooldowns[key] = KeyCooldown(
             until=time.time() + duration, reason=reason, status=status
         )
+        self._emit(
+            "cooldown",
+            key=key,
+            until=self.cooldowns[key].until,
+            reason=reason,
+            status=status,
+        )
 
     def cooldown_status(self, key: str) -> int:
         cd = self.cooldowns.get(key)
@@ -440,6 +512,7 @@ class ProxyState:
             return False
 
         self.pool_throttled_until = now + POOL_THROTTLE_PAUSE
+        self._emit("pool_throttle", until=self.pool_throttled_until)
         self.log_cb(
             f"⏸ {len(distinct)} keys rate-limited within {POOL_429_WINDOW:.0f}s — this is an "
             f"account-wide limit, not per-key. Pausing {POOL_THROTTLE_PAUSE:.0f}s instead of "
@@ -492,6 +565,7 @@ class ProxyState:
 
         if status == 429:
             multiplier = None  # set below; None means "compute from adaptive formula"
+            learned_retry_after: float | None = None
             if retry_after:
                 try:
                     # Trust NVIDIA's Retry-After exactly — do NOT apply the
@@ -501,6 +575,7 @@ class ProxyState:
                     # loop where all keys sit locked out longer than needed.
                     base_duration = float(retry_after)
                     multiplier = 1.0  # honour upstream's explicit window
+                    learned_retry_after = base_duration
                 except (ValueError, TypeError):
                     base_duration = COOLDOWN_DURATIONS[429]
                     multiplier = None  # compute adaptively below
@@ -538,6 +613,10 @@ class ProxyState:
                     ADAPTIVE_FLOOR_RPM,
                     int(ceil * ADAPTIVE_429_FACTOR),
                 )
+                # Retry-After is the server's own throughput estimate: a 30s
+                # wait means 2 RPM, which the halving rule would never reach.
+                if learned_retry_after is not None:
+                    tracker.learn_from_retry_after(learned_retry_after)
         elif retry_after:
             # An explicit retry_after is the caller stating how long this key
             # should sit out, and it used to be honoured for 429 only: a 503
@@ -580,6 +659,7 @@ class ProxyState:
             if ks is not None:
                 ks.is_valid = False
                 ks.last_error = error_details
+            self._emit("key_invalid", key=key)
             self.log_cb(f"⚠ key marked INVALID ({error_details})")
         elif status in (400, 404, 429):
             if ks is not None:
@@ -625,6 +705,87 @@ class ProxyState:
 
     # ── RPM API ─────────────────────────────────────────────────────
 
+    def record_key_model_result(
+        self,
+        key: str,
+        model: str,
+        *,
+        ok: bool = False,
+        ttft: float | None = None,
+    ) -> None:
+        """Score one attempt against the (key, model) pair.
+
+        Kept deliberately lean: the per-model circuit breaker and per-key
+        cooldowns already own failure handling; this only feeds the scheduling
+        score that breaks ties in ``get_candidate_keys``.
+        """
+        if not key or not model:
+            return
+        h = self.key_model_health.get((key, model))
+        if h is None:
+            h = KeyModelHealth()
+            self.key_model_health[(key, model)] = h
+        h.requests += 1
+        if ok:
+            h.success += 1
+            if ttft is not None:
+                h.ttfts.append(ttft)
+        else:
+            h.consecutive_failures += 1
+
+    def key_model_score(self, key: str, model: str) -> float:
+        """0..1 scheduling score of ``key`` on ``model``; neutral when unknown."""
+        h = self.key_model_health.get((key, model))
+        return h.score() if h is not None else 0.5
+
+    def apply_remote_event(self, event: dict) -> None:
+        """Apply a cooldown/health event broadcast by another node.
+
+        Deliberately does NOT re-emit: the event already came in through the
+        bus, and re-broadcasting it would loop it around the cluster forever.
+        """
+        kind = event.get("kind")
+        try:
+            if kind == "cooldown":
+                until = float(event.get("until") or 0)
+                if until > time.time():
+                    self.cooldowns[event["key"]] = KeyCooldown(
+                        until=until,
+                        reason=event.get("reason", "remote"),
+                        status=int(event.get("status") or 0),
+                    )
+                    self.log_cb(f"🌐 remote cooldown: key[{event['key'][:6]}…] until {until:.0f}")
+            elif kind == "key_invalid":
+                ks = self._key_states.get(event.get("key", ""))
+                if ks is not None:
+                    ks.is_valid = False
+            elif kind == "pool_throttle":
+                until = float(event.get("until") or 0)
+                if until > self.pool_throttled_until:
+                    self.pool_throttled_until = until
+            elif kind == "model_circuit":
+                model = event.get("model", "")
+                if event.get("opened"):
+                    h = self.model_health.get(model)
+                    if h is None:
+                        h = ModelHealth()
+                        self.model_health[model] = h
+                    h.consecutive_failures = max(h.consecutive_failures, h.CIRCUIT_OPEN_AFTER)
+                    h.circuit_opened_at = time.time()
+                elif model in self.model_health:
+                    self.model_health[model].record_success_reset()
+        except (KeyError, TypeError, ValueError):
+            self.log_cb(f"🌐 dropped malformed remote event: {str(event)[:120]}")
+
+    def _emit(self, kind: str, **data: object) -> None:
+        """Best-effort broadcast of a state change to sibling nodes."""
+        if self.redis_sync is None:
+            return
+        try:
+            self.redis_sync.broadcast({"kind": kind, **data})
+        except Exception:  # noqa: BLE001 — the bus must never break the proxy
+            pass
+
     def record_model_result(
         self,
         model: str,
@@ -650,6 +811,9 @@ class ProxyState:
             return
         # Record failure for circuit breaker
         h.record_failure()
+        if h.consecutive_failures == h.CIRCUIT_OPEN_AFTER:
+            # Sibling nodes should stop spending time on this model too.
+            self._emit("model_circuit", model=model, opened=True)
         if too_slow:
             h.too_slow += 1
         elif status in (502, 503, 504):
@@ -725,13 +889,18 @@ class ProxyState:
             return False
         return not self.is_key_on_cooldown(key)
 
-    def get_candidate_keys(self) -> list[tuple[int, str]]:
+    def get_candidate_keys(self, model: str | None = None) -> list[tuple[int, str]]:
         """
         Return ``(index, key)`` candidates for the current request, ordered by
         **least-loaded-first** (in-flight + recent RPM) instead of naive
         round-robin. Round-robin forced concurrent bursts onto the same
         ``current_index``; with the weighted cost below, N simultaneous
         requests each take a different key (max-min fairness across the pool).
+
+        When ``model`` is given, a small bonus based on the key's proven
+        record on that model breaks ties: among equally-loaded keys, the one
+        that answered this model fast and reliably wins. The bonus (max 3.0,
+        vs in_flight×4) only ever nudges, never overrides load.
 
         The first entry is the best key; the rest is the healthy pool sorted
         by cost, with cooldown keys appended last as a degraded fallback.
@@ -747,6 +916,8 @@ class ProxyState:
                 cooldown.append((idx, key, self.cooldown_remaining(key)))
                 continue
             cost = (ks.in_flight * 4) + self.key_rpm(key) + ks.consecutive_failures * 8
+            if model:
+                cost -= self.key_model_score(key, model) * 3.0
             scored.append((cost, idx, key))
 
         scored.sort(key=lambda x: (x[0], x[1]))

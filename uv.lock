@@ -313,7 +313,7 @@ wheels = [
 
 [[package]]
 name = "openvidia"
-version = "2.0.0"
+version = "2.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -327,6 +327,11 @@ dependencies = [
     { name = "qtpy", marker = "sys_platform == 'linux'" },
     { name = "tomlkit" },
     { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.optional-dependencies]
+redis = [
+    { name = "redis" },
 ]
 
 [package.dev-dependencies]
@@ -348,9 +353,11 @@ requires-dist = [
     { name = "pyqt6-webengine", marker = "sys_platform == 'linux'", specifier = ">=6.5" },
     { name = "pywebview", specifier = ">=5.0" },
     { name = "qtpy", marker = "sys_platform == 'linux'", specifier = ">=2.4" },
+    { name = "redis", marker = "extra == 'redis'", specifier = ">=5.0" },
     { name = "tomlkit", specifier = ">=0.13" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
+provides-extras = ["redis"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -866,6 +873,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/70/01/392eba83c8e47b946b929d7c46e0f04b35e9671f8bb6fc36b6f7945b4de8/qtpy-2.4.3.tar.gz", hash = "sha256:db744f7832e6d3da90568ba6ccbca3ee2b3b4a890c3d6fbbc63142f6e4cdf5bb", size = 66982, upload-time = "2025-02-11T15:09:25.759Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/69/76/37c0ccd5ab968a6a438f9c623aeecc84c202ab2fabc6a8fd927580c15b5a/QtPy-2.4.3-py3-none-any.whl", hash = "sha256:72095afe13673e017946cc258b8d5da43314197b741ed2890e563cf384b51aa1", size = 95045, upload-time = "2025-02-11T15:09:24.162Z" },
+]
+
+[[package]]
+name = "redis"
+version = "8.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a8/99/604f0b666d4c616d891cf77ebb9db6bb21601344c051aebf1b72b9ff915f/redis-8.1.0.tar.gz", hash = "sha256:6e1a19beef9225c83efd689c7e6b7da2d5215b1f42cd13b7fc3714d0a09c7b25", size = 5254356, upload-time = "2026-07-30T08:51:00.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/66/9d/c5731f6e3608663d4d3656fd8d3aecee8b509c3082818f5a13eae925baea/redis-8.1.0-py3-none-any.whl", hash = "sha256:a4fe1aac3d3b3cc791d4b3d5931c5a956045dc951ee74d1c913ee3ac4d2ee9fb", size = 560618, upload-time = "2026-07-30T08:50:58.497Z" },
 ]
 
 [[package]]

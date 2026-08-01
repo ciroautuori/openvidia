@@ -465,3 +465,44 @@ def jcode_config_path() -> Path:
     Jcode uses a fixed location (not XDG), the same on every platform.
     """
     return Path.home() / ".jcode" / "config.toml"
+
+
+def upstream_endpoints() -> list[str]:
+    """Upstream endpoints for the router: env beats file beats default.
+
+    La lista si mantiene ordinata: il primo endpoint è il preferito, gli
+    altri sono fallback per il failover.
+    """
+    env = os.environ.get("OPENVIDIA_UPSTREAM_ENDPOINTS", "").strip()
+    if env:
+        endpoints = [e.strip().rstrip("/") + "/" for e in env.split(",") if e.strip()]
+        if endpoints:
+            return endpoints
+    try:
+        data = json.loads((config_dir() / "endpoints.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+        return [UPSTREAM_BASE]
+    if not isinstance(data, dict):
+        return [UPSTREAM_BASE]
+    raw = data.get("endpoints")
+    if not isinstance(raw, list):
+        return [UPSTREAM_BASE]
+    endpoints = [e for e in raw if isinstance(e, str) and e.strip()]
+    if not endpoints:
+        return [UPSTREAM_BASE]
+    return [e.strip().rstrip("/") + "/" for e in endpoints]
+
+
+def redis_url() -> str:
+    """Redis URL for cross-node sync; empty string means standalone mode."""
+    env = os.environ.get("OPENVIDIA_REDIS_URL", "").strip()
+    if env:
+        return env
+    try:
+        data = json.loads((config_dir() / "redis_config.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    url = data.get("url", "")
+    return url if isinstance(url, str) else ""

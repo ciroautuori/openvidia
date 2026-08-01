@@ -11,14 +11,17 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 
 from . import config
 from .anthropic_shim import handle_anthropic_messages
 from .config import UPSTREAM_BASE
+from .embedding_cache import EmbeddingCache
+from .provider_fallback import load_provider_configs, try_fallback
 from .proxy_state import ProxyState
+from .redis_sync import RedisSync
 from .responses_shim import (
     _MAX_ROTATE_ATTEMPTS,
     _MIN_LIVE_FRACTION,
@@ -29,6 +32,7 @@ from .responses_shim import (
     _upstream_error_message,
     handle_responses,
 )
+from .upstream_router import EndpointRouter
 
 MAX_BODY_BYTES = 64 * 1024 * 1024
 
@@ -49,6 +53,14 @@ def default_model(state: ProxyState | None = None) -> str:
     except Exception:  # noqa: BLE001 — model choice must never break a request
         presets = []
     return presets[0] if presets else ""
+
+
+def _key_model_score(state: ProxyState, key: str) -> float | None:
+    """Media degli score per-modello osservati per questa chiave."""
+    scores = [h.score() for (k, _model), h in state.key_model_health.items() if k == key]
+    if not scores:
+        return None
+    return round(sum(scores) / len(scores), 2)
 
 
 STRIPPED_RESPONSE_HEADERS = {
@@ -249,6 +261,12 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         limits=limits,
         timeout=httpx.Timeout(**config.httpx_timeout_kwargs()),
     )
+    router = EndpointRouter(config.upstream_endpoints())
+    emb_cache = EmbeddingCache()
+    _redis_url = config.redis_url()
+    rs = RedisSync(_redis_url) if _redis_url else None
+    if rs is not None:
+        state.redis_sync = rs
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -261,9 +279,14 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
 
         asyncio.create_task(_pre_warm())
         state.health_task = asyncio.create_task(_background_health_check(state, client))
+        if rs is not None:
+            rs.on_remote = state.apply_remote_event
+            await rs.start()
         yield
         if state.health_task is not None:
             state.health_task.cancel()
+        if rs is not None:
+            await rs.close()
         await client.aclose()
 
     app = FastAPI(lifespan=lifespan)
@@ -321,42 +344,46 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         if not keys:
             return JSONResponse({"error": "no keys"}, status_code=503)
 
-        for key in keys:
-            if not state.is_key_healthy(key) or not state.key_can_send_rpm(key):
-                continue
-            headers = {"Authorization": f"Bearer {key}", "User-Agent": "openvidia/2.0"}
-            try:
-                req = client.build_request("GET", UPSTREAM_BASE + "models", headers=headers)
-                resp = await client.send(req)
-                if resp.is_success:
-                    data = resp.json()
+        # Gli endpoint alternativi sono fallback: si prova in ordine fino al
+        # primo che risponde con la lista modelli.
+        for endpoint in router.healthy_endpoints():
+            for key in keys:
+                if not state.is_key_healthy(key) or not state.key_can_send_rpm(key):
+                    continue
+                headers = {"Authorization": f"Bearer {key}", "User-Agent": "openvidia/2.0"}
+                try:
+                    req = client.build_request("GET", endpoint + "models", headers=headers)
+                    resp = await client.send(req)
+                    if resp.is_success:
+                        router.mark_success(endpoint + "models")
+                        data = resp.json()
+                        await resp.aclose()
+                        # Mantieni entrambe le chiavi: "data" (standard OpenAI,
+                        # usata da Codex) e "models" (usata da altri client).
+                        if "data" in data and "models" not in data:
+                            models = list(data["data"])
+                            for m in models:
+                                m["slug"] = m.get("id", "")
+                                m["display_name"] = m.get("id", "")
+                            data["models"] = models
+                        # Inietta l'alias "openvidia" in cima a entrambe le liste
+                        # così i picker dei CLI (Codex, opencode) lo mostrano come
+                        # opzione selezionabile. Il proxy lo risolve a runtime nel
+                        # modello selezionato nella dashboard.
+                        alias = {
+                            "id": "openvidia",
+                            "object": "model",
+                            "slug": "openvidia",
+                            "display_name": "OpenVidia (dashboard auto-select)",
+                        }
+                        if isinstance(data.get("models"), list):
+                            data["models"].insert(0, alias)
+                        if isinstance(data.get("data"), list):
+                            data["data"].insert(0, dict(alias))
+                        return JSONResponse(data)
                     await resp.aclose()
-                    # Mantieni entrambe le chiavi: "data" (standard OpenAI,
-                    # usata da Codex) e "models" (usata da altri client).
-                    if "data" in data and "models" not in data:
-                        models = list(data["data"])
-                        for m in models:
-                            m["slug"] = m.get("id", "")
-                            m["display_name"] = m.get("id", "")
-                        data["models"] = models
-                    # Inietta l'alias "openvidia" in cima a entrambe le liste
-                    # così i picker dei CLI (Codex, opencode) lo mostrano come
-                    # opzione selezionabile. Il proxy lo risolve a runtime nel
-                    # modello selezionato nella dashboard.
-                    alias = {
-                        "id": "openvidia",
-                        "object": "model",
-                        "slug": "openvidia",
-                        "display_name": "OpenVidia (dashboard auto-select)",
-                    }
-                    if isinstance(data.get("models"), list):
-                        data["models"].insert(0, alias)
-                    if isinstance(data.get("data"), list):
-                        data["data"].insert(0, dict(alias))
-                    return JSONResponse(data)
-                await resp.aclose()
-            except httpx.HTTPError:
-                continue
+                except httpx.HTTPError:
+                    continue
         return JSONResponse({"error": "all keys failed"}, status_code=503)
 
     # ── Internal ops endpoint: not proxied, dashboard-facing ──────────
@@ -383,6 +410,10 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                         "cooldown_reason": state.cooldown_reason(key),
                         "rpm": state.key_rpm(key),
                         "rpm_ceiling": tracker.max_rpm if tracker and tracker.max_rpm else None,
+                        "observed_ceiling": tracker.observed_ceiling
+                        if tracker and tracker.observed_ceiling
+                        else None,
+                        "model_score": _key_model_score(state, key),
                         "in_flight": ks.in_flight if ks else 0,
                         "consecutive_failures": ks.consecutive_failures if ks else 0,
                         "requests": ku.requests if ku else 0,
@@ -398,6 +429,9 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 "n_on_cooldown": sum(1 for k in state.keys if state.is_key_on_cooldown(k)),
                 "aggregate_rpm": sum(state.key_rpm(k) for k in state.keys),
                 "aggregate_rpm_ceiling": len(state.keys) * 28,
+                "aggregate_observed_ceiling": sum(
+                    t.observed_ceiling for t in state.rpm.values() if t.observed_ceiling
+                ),
                 "active_index": state.stats.active_key_index,
             }
         )
@@ -461,6 +495,20 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 payload["messages"] = new_messages
                 body = json.dumps(payload).encode()
 
+        # ── Embedding cache (deterministic, RPM-heavy) ────────────────
+        # I vettori sono deterministici per (modello, input): la cache evita
+        # di bruciare il budget RPM del free tier su richieste identiche
+        # ripetute (i client li ricalcolano a ogni restart).
+        is_embeddings = (
+            isinstance(payload, dict)
+            and isinstance(payload.get("input"), (str, list))
+            and full_path.endswith("embeddings")
+        )
+        if is_embeddings:
+            cached = emb_cache.get(str(payload.get("model", "")), payload["input"])
+            if cached is not None:
+                return Response(content=cached, media_type="application/json")
+
         # ── Key rotation ──────────────────────────────────────────────
         async with state.lock:
             candidates = state.get_candidate_keys()
@@ -505,7 +553,7 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 )
 
         nv_path = full_path[3:] if full_path.startswith("v1/") else full_path
-        url = UPSTREAM_BASE + nv_path
+        endpoint_urls = router.healthy_endpoints() or [UPSTREAM_BASE]
 
         CLIENT_FWD_HEADERS = {"content-type", "accept", "x-request-id", "x-trace-id"}
 
@@ -541,22 +589,44 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 h["Content-Type"] = "application/json"
             return h
 
-        resp, used_key, used_idx = await _rotation_phase(
-            client,
-            url,
-            _payload_for_rotation,
-            _hdr,
-            state,
-            candidates,
-            max_attempts=_MAX_ROTATE_ATTEMPTS,
-            timeout=_ROTATE_SEND_TIMEOUT,
-            stream=True,
-            log_tag="catch-all",
-            outcome_box=_outcome,
-            method=request.method,
-            content=body if body else None,
-            probe_timeout=_MODEL_PROBE_TIMEOUT,
-        )
+        # Multi-endpoint failover: si prova il primo endpoint sano; su 5xx o
+        # timeout l'host è probabilmente in down parziale, si blacklista per
+        # ENDPOINT_RETRY_AFTER e si passa al successivo. Un errore
+        # deterministico (400/401/404) non si ripete diversamente su un altro
+        # host: ci si ferma subito. Un "exhausted" (budget esaurito) NON è un
+        # down dell'host: si prova il prossimo senza blacklist.
+        resp = None
+        used_key = ""
+        used_idx = -1
+        for endpoint in endpoint_urls:
+            url = endpoint + nv_path
+            resp, used_key, used_idx = await _rotation_phase(
+                client,
+                url,
+                _payload_for_rotation,
+                _hdr,
+                state,
+                candidates,
+                max_attempts=_MAX_ROTATE_ATTEMPTS,
+                timeout=_ROTATE_SEND_TIMEOUT,
+                stream=not is_embeddings,
+                log_tag="catch-all",
+                outcome_box=_outcome,
+                method=request.method,
+                content=body if body else None,
+                probe_timeout=_MODEL_PROBE_TIMEOUT,
+            )
+            if resp is not None and resp.status_code == 200:
+                router.mark_success(url)
+                break
+            _endpoint_dead = (resp is not None and resp.status_code >= 500) or (
+                resp is None and (_outcome.get("status") or 0) >= 500
+            )
+            if _endpoint_dead and not _outcome.get("exhausted"):
+                router.mark_failure(url)
+            if _outcome.get("deterministic"):
+                break
+            resp = None
 
         if resp is not None and resp.status_code == 200:
             # CORS is the middleware's job. Setting the headers by hand here
@@ -567,6 +637,17 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
             }
             state.stats.success += 1
             state.stats.record_key_usage(used_key, ok=True)
+            _sent_model = _payload_for_rotation.get("model", "")
+            if used_key and _sent_model:
+                state.record_key_model_result(used_key, _sent_model, ok=True)
+
+            if is_embeddings:
+                emb_body = await resp.aread()
+                await resp.aclose()
+                state.end_in_flight(used_key)
+                if _sent_model:
+                    emb_cache.set(_sent_model, payload["input"], emb_body)
+                return Response(content=emb_body, media_type="application/json")
 
             async def body_iter(resp=resp, key=used_key, orig_idx=used_idx):
                 try:
@@ -601,6 +682,8 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
         # the circuit the loop just declined to open.
         if model_name and not _outcome.get("exhausted"):
             state.record_model_result(model_name, status=last_status)
+            if used_key:
+                state.record_key_model_result(used_key, model_name, ok=False)
 
         # A request the provider rejected outright keeps its own status: a 400
         # reported as 503 tells the client to retry something that cannot work.
@@ -626,6 +709,20 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                 status_code=429,
                 headers={"Retry-After": str(retry_in)},
             )
+
+        # ── Provider free-tier fallback (opt-in via providers.json) ──
+        # Non tocca le chiavi NVIDIA (niente record_key_usage: il successo
+        # non è merito del pool), ma conta come richiesta servita.
+        if isinstance(payload, dict) and full_path.endswith("chat/completions"):
+            for provider in load_provider_configs():
+                fallback_resp = await try_fallback(client, payload, provider)
+                if fallback_resp is None:
+                    continue
+                state.log_cb(f"⇄ fallback → {provider.name}")
+                state.stats.success += 1
+                f_body = await fallback_resp.aread()
+                await fallback_resp.aclose()
+                return Response(content=f_body, media_type="application/json")
 
         msg = "all keys exhausted"
         if model_name:
@@ -677,7 +774,13 @@ def create_app(state: ProxyState, web_dir: Path | None = None) -> FastAPI:
                     "n_on_cooldown": sum(1 for k in state.keys if state.is_key_on_cooldown(k)),
                     "aggregate_rpm": sum(state.key_rpm(k) for k in state.keys),
                     "rpm_ceiling": len(state.keys) * 28,
+                    "aggregate_observed_ceiling": sum(
+                        t.observed_ceiling for t in state.rpm.values() if t.observed_ceiling
+                    ),
                 },
+                "endpoints": router.as_dict(),
+                "embedding_cache": emb_cache.as_dict(),
+                "redis": bool(rs.enabled) if rs is not None else False,
                 "models": models_out,
                 "presets": config.load_saved_presets(),
                 "active_model": state.active_model,

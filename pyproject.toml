@@ -1,6 +1,6 @@
 [project]
 name = "openvidia"
-version = "2.0.0"
+version = "2.1.0"
 description = "NVIDIA NIM multi-key proxy with smart rate limiting, cooldown management, and desktop dashboard"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -38,6 +38,11 @@ dev = [
 
 [project.scripts]
 openvidia = "openvidia.__main__:main"
+
+# Multi-node sync is opt-in: redis-py stays out of the base install so the
+# proxy has zero extra deps for its default standalone mode.
+[project.optional-dependencies]
+redis = ["redis>=5.0"]
 
 [tool.setuptools.packages.find]
 include = ["openvidia*"]

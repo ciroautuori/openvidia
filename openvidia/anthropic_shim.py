@@ -382,6 +382,7 @@ async def _stream_anthropic(
 
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)
+    state.record_key_model_result(used_key, chat_payload.get("model", ""), ok=True)
     if used_idx is not None:
         state.log_cb(f"✔ key[{used_idx}] OK")
 
@@ -701,6 +702,7 @@ async def handle_anthropic_messages(
 
     state.stats.success += 1
     state.stats.record_key_usage(used_key, ok=True)
+    state.record_key_model_result(used_key, chat_payload.get("model", ""), ok=True)
     if used_idx is not None:
         state.log_cb(f"✔ key[{used_idx}] OK")
 
